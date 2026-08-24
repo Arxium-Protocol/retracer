@@ -1,0 +1,16 @@
+[package]
+name = "rest-service"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = { workspace = true }
+tracing = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+storage = { workspace = true }
+ingestion = { workspace = true }
+sqlx = { workspace = true }
+# Already in the tree via tonic, so this costs no extra build.
+axum = "0.8"

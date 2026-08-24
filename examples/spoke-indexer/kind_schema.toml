@@ -1,0 +1,51 @@
+# MintChain's address and projection configuration.
+#
+# Two things live here, both purely declarative — editing this file needs no
+# rebuild, only a restart:
+#
+#   [[kind.roles]]  which payload fields are addresses, and what part they play
+#   [[kind.index]]  which payload fields should be queryable
+#
+# `name` must match the enum variant name exactly, since the indexer derives it
+# from the serialized shape of the payload.
+
+[[kind]]
+name = "MintNft"
+
+  # Makes the new owner findable via
+  # /v1/chains/{chain}/accounts/{address}/actions?role=to
+  # The sender is always indexed automatically and never needs an entry here.
+  [[kind.roles]]
+  path = "$.recipient"
+  role = "to"
+
+[[kind]]
+name = "TransferNft"
+
+  [[kind.roles]]
+  path = "$.to"
+  role = "to"
+
+[[kind]]
+name = "ListForSale"
+
+  # No addresses in this payload — only the seller, who is the sender.
+  #
+  # But price is worth filtering on, so project it into an index. This becomes
+  # a partial Postgres expression index over ((payload->>'price')::BIGINT)
+  # scoped to kind = 'ListForSale', created at startup.
+  #
+  # type is one of: text | numeric | bigint
+  [[kind.index]]
+  path = "$.price"
+  type = "bigint"
+
+[[kind]]
+name = "Delist"
+# Nothing to configure: no payload addresses, nothing worth indexing. Kinds with
+# no entry at all behave identically — listing it is just documentation.
+
+# Airdrop is deliberately absent. Its recipients are an array, and a dotted path
+# can't index into a list, so it's handled in Rust by `AirdropRecipients` in
+# src/lib.rs. A Tier B impl owns its kind outright — an entry here would be
+# ignored rather than merged.

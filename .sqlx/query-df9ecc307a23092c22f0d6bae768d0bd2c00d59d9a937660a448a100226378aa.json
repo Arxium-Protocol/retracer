@@ -1,0 +1,53 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT action_hash, block_height, index_in_block, kind, from_address, payload as \"payload!\"\n           FROM actions WHERE chain_id = $1 AND action_hash = $2",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "action_hash",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 1,
+        "name": "block_height",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 2,
+        "name": "index_in_block",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 3,
+        "name": "kind",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 4,
+        "name": "from_address",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 5,
+        "name": "payload!",
+        "type_info": "Jsonb"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "df9ecc307a23092c22f0d6bae768d0bd2c00d59d9a937660a448a100226378aa"
+}

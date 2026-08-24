@@ -1,0 +1,30 @@
+# Default Tier A address-extraction schema for Arxium's own CoreChain
+# circuits (see Retracer_AddressExtraction_Plan.md §2). Field/kind names
+# are taken directly from `arxd/node/src/payload.rs::ActionPayload`.
+#
+# A builder running their own chain ships their own copy of this file
+# alongside the `retracerd` binary (--kind-schema) — no code, no fork.
+
+[[kind]]
+name = "Transfer"
+
+  [[kind.roles]]
+  path = "$.to"
+  role = "to"
+
+[[kind]]
+name = "Stake"
+
+  [[kind.roles]]
+  path = "$.validator"
+  role = "validator_subject"
+
+[[kind]]
+name = "Unstake"
+
+  [[kind.roles]]
+  path = "$.validator"
+  role = "validator_subject"
+
+# JoinValidator / LeaveValidator have no address-bearing payload fields —
+# the sender (already indexed via actions.from_address) is the only party.

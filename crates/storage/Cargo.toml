@@ -1,0 +1,24 @@
+[package]
+name = "storage"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = { workspace = true }
+tracing = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+xc-primitives = { workspace = true, optional = true }
+sqlx = { workspace = true }
+toml = "0.8"
+
+[dev-dependencies]
+tokio = { workspace = true }
+
+[features]
+# On by default so every Arxium chain gets the `IndexableBlock`/`IndexableAction`
+# impls for `xc_primitives::Block`/`Action` for free. Turn it off and `storage`
+# builds with no Arxium dependency at all — for a chain supplying its own
+# block/action types.
+default = ["xc-primitives"]
+xc-primitives = ["dep:xc-primitives"]

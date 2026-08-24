@@ -1,0 +1,39 @@
+[workspace]
+members = [
+    "crates/ingestion",
+    "crates/storage",
+    "crates/grpc-service",
+    "crates/rest-service",
+    "crates/retracer-core",
+    "crates/retracerd",
+    "examples/spoke-indexer",
+]
+resolver = "2"
+default-members = ["crates/retracerd"]
+
+[workspace.dependencies]
+ingestion = { path = "crates/ingestion" }
+storage = { path = "crates/storage" }
+grpc-service = { path = "crates/grpc-service" }
+rest-service = { path = "crates/rest-service" }
+retracer-core = { path = "crates/retracer-core" }
+
+anyhow = "1.0"
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+bincode = { version = "2", features = ["serde"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "sync"] }
+libp2p = { version = "0.56.0", features = ["tcp", "quic", "noise", "yamux", "tokio", "macros", "gossipsub", "request-response", "cbor", "dns"] }
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "tls-rustls", "postgres", "migrate", "macros", "json"] }
+
+# Pinned to a tagged Arxium commit (not a path dep on a sibling checkout) so
+# wire types (Action<P>/Block<P>) stay byte-compatible with what arxd actually
+# gossips. xc-primitives is the same crate a third-party indexer would need —
+# bump the tag when Arxium cuts a new xc-primitives/xc-wire release.
+xc-primitives = { git = "https://github.com/Arxium-Protocol/Arxium", tag = "xc-primitives-v0.1.0" }
+# The sync protocol's wire shapes, shared with the node rather than copied.
+# Before this crate existed these were hand-vendored here, and bincode carries
+# no version tag — a field added node-side decoded as garbage with no error.
+xc-wire = { git = "https://github.com/Arxium-Protocol/Arxium", tag = "xc-primitives-v0.1.0" }

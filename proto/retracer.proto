@@ -1,0 +1,242 @@
+syntax = "proto3";
+
+package retracer;
+
+// Every RPC is scoped to one chain. Which chain is selected by the
+// `x-chain-id` request metadata header, *not* by a field on each message:
+// the chain is a tenant selector like an API key, not part of the question
+// being asked, and keeping it out of the messages means adding multi-chain
+// support broke no existing consumer. Omit the header and the request is
+// served by the process's default chain, which is the only chain in a
+// single-chain deployment. Call ListChains to discover what's available.
+service Retracer {
+  rpc ListChains(ListChainsRequest) returns (ListChainsResponse);
+  rpc GetBlock(GetBlockRequest) returns (Block);
+  rpc GetAccountActions(GetAccountActionsRequest) returns (GetAccountActionsResponse);
+  rpc GetAction(GetActionRequest) returns (Action);
+  rpc Search(SearchRequest) returns (SearchResponse);
+  rpc GetStatus(GetStatusRequest) returns (GetStatusResponse);
+  rpc GetStats(GetStatsRequest) returns (GetStatsResponse);
+  rpc ListBlocks(ListBlocksRequest) returns (ListBlocksResponse);
+  rpc ListActions(ListActionsRequest) returns (ListActionsResponse);
+  rpc ListProposers(ListProposersRequest) returns (ListProposersResponse);
+
+  rpc SubscribeBlocks(SubscribeBlocksRequest) returns (stream Block);
+  // Notifies on any action where `address` holds a Tier A role — sender
+  // (`from_address`) or a kind_schema.toml-resolved role such as a Transfer's
+  // recipient. Live tail only, no historical replay (unlike SubscribeBlocks'
+  // `from_height`).
+  rpc SubscribeAccountActions(SubscribeAccountActionsRequest) returns (stream Action);
+}
+
+message Block {
+  uint64 height = 1;
+  string hash = 2;
+  string parent_hash = 3;
+  int64 timestamp = 4;
+  // Empty on a ListBlocks response — see that message for why. Use
+  // `action_count` for "how many", and GetBlock when the actions are wanted.
+  repeated Action actions = 5;
+  // Always populated, on every response carrying a Block. Added because a
+  // consumer counting `actions.length` gets the right answer from GetBlock and
+  // a silent zero from ListBlocks, which is the kind of difference nobody
+  // notices until a list claims every block is empty.
+  uint32 action_count = 6;
+  // Absent for genesis, which is unsigned, for a block from a non-validator
+  // solo node, and for any block indexed before migration 0003 — the field was
+  // discarded at ingestion time and the block body is not retained, so those
+  // rows cannot be repaired.
+  optional string proposer = 7;
+}
+
+message ListProposersRequest {}
+
+// Who signed the blocks this indexer holds.
+//
+// Chain-agnostic, despite being what an explorer draws its validators page
+// from. Every chain has block proposers, and answering this needs no knowledge
+// of what any payload means. It is deliberately *not* the validator set:
+// membership — who is currently entitled to propose — is derived by replaying
+// chain-specific dispatch logic that this service does not and should not hold.
+// A validator that has joined but not yet had a turn does not appear here, and
+// one that has left still does.
+message ListProposersResponse {
+  repeated Proposer proposers = 1;
+}
+
+message Proposer {
+  string address = 1;
+  uint64 blocks_proposed = 2;
+  uint64 first_proposed_height = 3;
+  uint64 last_proposed_height = 4;
+}
+
+message Action {
+  string action_hash = 1;
+  uint64 block_height = 2;
+  uint32 index_in_block = 3;
+  string kind = 4;
+  string from_address = 5;
+  // JSON-encoded payload — see plan.md §7 on why `kind`/`payload` stay
+  // generic instead of one message per chain-specific variant.
+  string payload_json = 6;
+}
+
+message GetBlockRequest {
+  oneof by {
+    uint64 height = 1;
+    string hash = 2;
+  }
+}
+
+message GetActionRequest {
+  string action_hash = 1;
+}
+
+message GetAccountActionsRequest {
+  string address = 1;
+  uint32 limit = 2;
+  // Cursor pair, newest-first pagination — same shape as ListActionsRequest.
+  // One address can have several actions in the same block, so height alone
+  // can land mid-block; both fields are sent together or not at all.
+  optional uint64 before_height = 3;
+  optional uint32 before_index = 5;
+  // "from" (default, sender history) or a Tier A role from kind_schema.toml
+  // (e.g. "to") — see Retracer_AddressExtraction_Plan.md §6.
+  optional string role = 4;
+}
+
+message GetAccountActionsResponse {
+  repeated Action actions = 1;
+}
+
+message SearchRequest {
+  string query = 1;
+}
+
+message SearchResponse {
+  oneof result {
+    uint64 block_height = 1;
+    string account_address = 2;
+    string action_hash = 3;
+  }
+}
+
+message ListChainsRequest {}
+
+message ListChainsResponse {
+  repeated Chain chains = 1;
+}
+
+// One chain this process follows. `chain_id` is the value to send back in the
+// `x-chain-id` header.
+message Chain {
+  string chain_id = 1;
+  optional string display_name = 2;
+  // The gossip topic and sync protocol this chain's node publishes on. Exposed
+  // because they identify the upstream network, which the chain_id alone does
+  // not — two deployments can share a chain_id label and follow different nets.
+  string blocks_topic = 3;
+  string sync_protocol = 4;
+  // Deepest reorg the indexer will un-index for this chain. Zero means the
+  // chain is declared fork-free.
+  uint64 finality_depth = 5;
+  // True for the chain that serves requests arriving without an `x-chain-id`.
+  bool is_default = 6;
+}
+
+message GetStatusRequest {}
+
+// How far this indexer has got, so a consumer can report sync lag without
+// polling GetBlock and guessing at heights.
+message GetStatusResponse {
+  // The indexer-assigned label for the upstream chain. Not read off the wire;
+  // one retracerd process is one chain_id.
+  string chain_id = 1;
+  // Highest height fully written. Absent, not zero, when nothing has been
+  // indexed yet — height 0 is genesis and is a real block, so a zero here
+  // would be indistinguishable from "I have genesis and nothing else".
+  optional uint64 indexed_height = 2;
+  // The chain's own tip, as reported by the node over the sync protocol, and
+  // how far behind it we are. Both absent when no peer has answered yet —
+  // which is itself information, meaning "not connected", distinct from
+  // "connected and caught up" (blocks_behind = 0).
+  optional uint64 node_tip_height = 4;
+  optional uint64 blocks_behind = 5;
+
+  // Unix seconds off the block at `indexed_height`.
+  //
+  // This is the field that reveals a stalled chain, and it is why the response
+  // does not simply carry a `lag` number: lag goes to *zero* when the node
+  // stops producing, because the indexer has faithfully caught up to a chain
+  // that is no longer moving. Age keeps climbing.
+  optional int64 tip_timestamp = 3;
+}
+
+// Newest-first page of blocks. The feed behind an explorer's block list, which
+// GetBlock cannot serve because it answers for exactly one height.
+message ListBlocksRequest {
+  // Capped server-side at MAX_PAGE_SIZE. Zero means "give me the cap".
+  uint32 limit = 1;
+  // Only blocks strictly below this height, for newest-first pagination.
+  // Height is a complete cursor here, unlike the action feeds: heights are
+  // unique, so a page boundary cannot fall inside a group of equal keys.
+  optional uint64 before = 2;
+}
+
+message GetStatsRequest {}
+
+// Aggregates over everything this indexer holds. Counted on demand rather than
+// maintained as running totals: the counts are only as true as the index is,
+// and a stored counter that drifts from the rows it claims to describe is
+// worse than a query that takes a few milliseconds.
+message GetStatsResponse {
+  string chain_id = 1;
+  uint64 total_blocks = 2;
+  uint64 total_actions = 3;
+  // Distinct addresses seen in any indexed action, in any role. This is
+  // "addresses that have appeared on chain", not "accounts that exist" — an
+  // account funded at genesis and never touched since has no action to be
+  // counted from, and this service does not hold chain state to ask.
+  uint64 total_accounts = 4;
+  uint64 actions_24h = 5;
+  // Mean seconds between blocks over a recent window, not the whole chain, so
+  // a backfill does not drag the figure down permanently. Zero when there are
+  // too few blocks to measure a gap.
+  double avg_block_time_secs = 6;
+  optional uint64 tip_height = 7;
+}
+
+// Newest-first feed of actions across every sender. GetAccountActions covers
+// one address at a time, which is the history case and not this one.
+message ListActionsRequest {
+  uint32 limit = 1;
+  // Cursor. Height alone is not enough here, unlike ListBlocks: a block holds
+  // many actions, so a page boundary can fall inside one block. Both fields
+  // are sent together or not at all, and the pair is compared as a whole.
+  optional uint64 before_height = 2;
+  optional uint32 before_index = 3;
+}
+
+message ListActionsResponse {
+  repeated Action actions = 1;
+}
+
+message ListBlocksResponse {
+  // Actions are deliberately not loaded. A 100-block page would mean 100 extra
+  // queries to fill lists no caller renders — a block list shows how many
+  // actions a block holds, not what they were. `action_count` carries that.
+  repeated Block blocks = 1;
+}
+
+// Omit `from_height` for the old live-tail-only behavior. Set it to resume
+// after a reconnect: the server replays persisted blocks from `from_height`
+// through its current tip before switching to the live broadcast, so no
+// block is missed or duplicated across the reconnect.
+message SubscribeBlocksRequest {
+  optional uint64 from_height = 1;
+}
+
+message SubscribeAccountActionsRequest {
+  string address = 1;
+}

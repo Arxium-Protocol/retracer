@@ -1,0 +1,26 @@
+# A worked example of integrating Retracer for your own chain. Laid out as a
+# standalone crate rather than a `cargo` example file, because that's what your
+# repository will actually look like: your own binary, depending on
+# retracer-core, supplying your payload type.
+#
+# It's a workspace member so `cargo build --workspace` compiles it — an example
+# that stops compiling is worse than no example.
+[package]
+name = "spoke-indexer"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+anyhow = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing-subscriber = { workspace = true }
+xc-primitives = { workspace = true }
+
+retracer-core = { workspace = true }
+storage = { workspace = true }
+# Only needed by the multi-chain example, which follows CoreChain alongside the
+# spoke and therefore needs CoreChain's payload type.
+ingestion = { workspace = true }
