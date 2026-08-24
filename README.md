@@ -16,13 +16,15 @@ hit node RPC or replay chain logic themselves.
 
 ## Quickstart
 
-Requires Rust (2024 edition) and Docker.
+Requires Rust (2024 edition) and a Postgres database — bring your own; Retracer
+doesn't run one for you.
 
 ```bash
-./scripts/setup.sh            # checks tools, starts Postgres, builds
+./scripts/setup.sh            # checks tools, builds
 
 cargo run -p retracerd -- \
-  --bootnodes /ip4/127.0.0.1/tcp/30334/p2p/<peer-id>
+  --bootnodes /ip4/127.0.0.1/tcp/30334/p2p/<peer-id> \
+  --database-url postgres://user:pass@host:5432/dbname
 ```
 
 Migrations run automatically on startup. You now have:
@@ -60,7 +62,7 @@ All flags are optional; the defaults match a local devnet.
 | `--bootnodes` | none | Comma-separated multiaddrs to dial |
 | `--port` | `0` | P2P listen port (`0` picks a free one) |
 | `--chain-id` | `corechain-devnet` | Label for this chain's rows. Not read off the wire |
-| `--database-url` | see `docker-compose.yml` | Postgres connection string |
+| `--database-url` | `postgres://retracer:retracer@localhost:5433/retracer` | Postgres connection string |
 | `--rest-port` | `8080` | HTTP API port; `0` disables it |
 | `--grpc-port` | `50051` | gRPC API port |
 | `--kind-schema` | `kind_schema.toml` | Payload field configuration |

@@ -1,8 +1,8 @@
 #!/bin/bash
-# One command to get from a fresh clone to a running indexer: check the tools
-# are present, bring up Postgres, wait until it actually accepts connections,
-# and build. Everything here is idempotent — re-running it is the intended way
-# to recover a half-set-up machine.
+# One command to get from a fresh clone to a buildable indexer: check the
+# tools are present and build. Postgres is bring-your-own — point
+# --database-url (or RETRACER_TEST_DATABASE_URL for tests) at whatever
+# instance you already run.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -15,30 +15,17 @@ die() { printf '\033[1;31merror:\033[0m %s\n' "$1" >&2; exit 1; }
 
 say "Checking prerequisites"
 command -v cargo >/dev/null || die "cargo not found — install Rust from https://rustup.rs"
-command -v docker >/dev/null || die "docker not found — install Docker Desktop"
-docker info >/dev/null 2>&1 || die "docker is installed but not running — start Docker Desktop"
 echo "    rust   $(rustc --version | cut -d' ' -f2)"
-echo "    docker $(docker --version | cut -d' ' -f3 | tr -d ,)"
 
-# The indexer needs the sibling Arxium checkout for xc-primitives (the wire
-# types). Failing here with an explanation beats a wall of cargo path errors.
-[ -d "$ROOT/../arxium/core/primitives" ] \
-  || die "sibling Arxium checkout not found at $(cd "$ROOT/.." && pwd)/arxium
-       Retracer depends on xc-primitives by path; clone Arxium alongside this repo."
-
-say "Starting Postgres"
-docker compose up -d
-
-say "Waiting for Postgres to accept connections"
-for _ in $(seq 1 60); do
-  if docker compose exec -T postgres pg_isready -U retracer -d retracer >/dev/null 2>&1; then
-    echo "    ready"
-    break
+if command -v pg_isready >/dev/null; then
+  if pg_isready -d "$DB_URL" >/dev/null 2>&1; then
+    echo "    postgres  reachable at $DB_URL"
+  else
+    printf '\033[1;33mwarning:\033[0m no Postgres reachable at %s yet — point --database-url at your own instance before running retracerd.\n' "$DB_URL"
   fi
-  sleep 1
-done
-docker compose exec -T postgres pg_isready -U retracer -d retracer >/dev/null 2>&1 \
-  || die "Postgres did not come up within 60s — check 'docker compose logs postgres'"
+else
+  echo "    postgres  (pg_isready not installed — skipping reachability check)"
+fi
 
 say "Building the workspace"
 cargo build --workspace
@@ -47,8 +34,8 @@ cat <<DONE
 
 Setup complete.
 
-  Database   $DB_URL
-  Run        cargo run -p retracerd -- --bootnodes <multiaddr>
+  Database   $DB_URL (override with --database-url or RETRACER_TEST_DATABASE_URL)
+  Run        cargo run -p retracerd -- --bootnodes <multiaddr> --database-url <your-postgres-url>
   Test       ./scripts/test.sh
   Reset DB   ./scripts/reset-db.sh
 

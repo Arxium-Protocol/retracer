@@ -11,13 +11,15 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
+DB_URL="${RETRACER_TEST_DATABASE_URL:-postgres://retracer:retracer@localhost:5433/retracer}"
+
 if [ "${1:-}" != "--yes" ]; then
-  printf '\033[1;33mThis deletes all indexed data in the local database.\033[0m\n'
+  printf '\033[1;33mThis deletes all indexed data in %s.\033[0m\n' "$DB_URL"
   read -r -p "Continue? [y/N] " reply
   [ "$reply" = "y" ] || [ "$reply" = "Y" ] || { echo "Aborted."; exit 1; }
 fi
 
-docker compose exec -T postgres psql -U retracer -d retracer -q <<'SQL'
+psql "$DB_URL" -q <<'SQL'
 DROP SCHEMA public CASCADE;
 CREATE SCHEMA public;
 SQL
