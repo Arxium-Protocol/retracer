@@ -10,3 +10,4 @@ tokio = { workspace = true }
 retracer-core = { workspace = true }
 ingestion = { workspace = true }
 xc-primitives = { workspace = true }
+dotenvy = { workspace = true }

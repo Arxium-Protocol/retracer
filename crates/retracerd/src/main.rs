@@ -5,6 +5,10 @@ use xc_primitives::Block;
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Missing .env is fine — flags and the hardcoded defaults still work; this
+    // only saves builders from retyping --database-url/--bootnodes every run.
+    dotenvy::dotenv().ok();
+
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
     tracing_subscriber::fmt().with_env_filter(filter).with_target(false).init();
 

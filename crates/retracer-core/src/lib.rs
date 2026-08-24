@@ -94,9 +94,18 @@ pub struct Args {
 /// [`ChainConfig`]s themselves and drive a [`Runner`], because each chain needs
 /// its own Rust block type and that can't come from a flag.
 pub fn parse_args() -> Result<Args> {
+    // RETRACER_BOOTNODES/RETRACER_DATABASE_URL seed the same defaults a flag
+    // would override, so a builder can put them in .env once instead of
+    // retyping --bootnodes/--database-url on every run. Precedence is flag >
+    // env > hardcoded default.
     let mut bootnodes = Vec::new();
+    if let Ok(value) = std::env::var("RETRACER_BOOTNODES") {
+        for addr in value.split(',').filter(|s| !s.is_empty()) {
+            bootnodes.push(addr.parse().with_context(|| format!("invalid multiaddr: {addr}"))?);
+        }
+    }
     let mut port = 0u16;
-    let mut database_url = DEFAULT_DATABASE_URL.to_string();
+    let mut database_url = std::env::var("RETRACER_DATABASE_URL").unwrap_or_else(|_| DEFAULT_DATABASE_URL.to_string());
     let mut chain_id = DEFAULT_CHAIN_ID.to_string();
     let mut grpc_port = DEFAULT_GRPC_PORT;
     let mut rest_port = Some(DEFAULT_REST_PORT);
@@ -112,6 +121,7 @@ pub fn parse_args() -> Result<Args> {
         match flag.as_str() {
             "--bootnodes" => {
                 let value = args.next().context("--bootnodes requires a value")?;
+                bootnodes.clear();
                 for addr in value.split(',').filter(|s| !s.is_empty()) {
                     bootnodes.push(addr.parse().with_context(|| format!("invalid multiaddr: {addr}"))?);
                 }

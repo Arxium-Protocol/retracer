@@ -21,19 +21,26 @@ doesn't run one for you.
 
 ```bash
 ./scripts/setup.sh            # checks tools, builds
+cp .env.example .env          # fill in RETRACER_DATABASE_URL/RETRACER_BOOTNODES
 
-cargo run -p retracerd -- \
-  --bootnodes /ip4/127.0.0.1/tcp/30334/p2p/<peer-id> \
-  --database-url postgres://user:pass@host:5432/dbname
+cargo run -p retracerd
 ```
 
-Migrations run automatically on startup. You now have:
+Or skip `.env` and pass flags directly:
+
+```bash
+cargo run -p retracerd -- \
+  --bootnodes /ip4/127.0.0.1/tcp/30334/p2p/<peer-id> \
+  --database-url postgres://retracer:retracer@localhost:5433/retracer
+```
+
+Migrations run automatically on startup against whatever database you pointed
+`--database-url` at. You now have:
 
 | | |
 | --- | --- |
 | HTTP API | `http://localhost:8080` |
 | gRPC API | `localhost:50051` |
-| Postgres | `localhost:5433` |
 
 ```bash
 curl localhost:8080/v1/chains
@@ -55,7 +62,10 @@ answers — "not connected" and "caught up" are different states.
 
 ## Configuration
 
-All flags are optional; the defaults match a local devnet.
+All flags are optional; the defaults match a local devnet. `--bootnodes` and
+`--database-url` can also come from a `.env` file (copy `.env.example`) via
+`RETRACER_BOOTNODES`/`RETRACER_DATABASE_URL` — a flag always overrides the
+env value.
 
 | Flag | Default | Description |
 | --- | --- | --- |
@@ -237,7 +247,7 @@ Reasoning for each is in [Design notes](../Retracer_Design.md#boundary-rules).
 ## Development
 
 ```bash
-./scripts/setup.sh      # first time: check tools, start Postgres, build
+./scripts/setup.sh      # first time: check tools, build
 ./scripts/test.sh       # full suite including the Postgres integration tests
 ./scripts/reset-db.sh   # wipe the local database
 ```
@@ -250,10 +260,10 @@ cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
 ```
 
-Database-backed tests are opt-in behind `RETRACER_TEST_DATABASE_URL`, because
-CI runs `cargo test --workspace` in an image builder with no database. A plain
-`cargo test` silently skips 11 of them; `./scripts/test.sh` sets the variable and
-warns if Postgres isn't reachable.
+Database-backed tests are opt-in behind `RETRACER_TEST_DATABASE_URL`, since
+Postgres isn't guaranteed to be reachable wherever `cargo test --workspace`
+runs. A plain `cargo test` silently skips 11 of them; `./scripts/test.sh` sets
+the variable and warns if Postgres isn't reachable.
 
 Layout:
 
@@ -271,8 +281,8 @@ Only `retracer-core` depends on the others; the service crates never depend
 on each other.
 
 `.sqlx/` holds cached query metadata so the four `sqlx::query!` macros in
-`storage` can be type-checked without a live database — that's what lets the
-Docker build (`SQLX_OFFLINE=true`) compile with no Postgres in the image. Run
+`storage` can be type-checked without a live database — that's what lets
+`SQLX_OFFLINE=true cargo build` compile with no Postgres reachable at all. Run
 `cargo sqlx prepare --workspace` against a migrated database and commit the
 result whenever you add, change or remove one of those macros; the build fails
 loudly if the cache is missing an entry, but a *stale* entry for a query that no

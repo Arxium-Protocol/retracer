@@ -2998,6 +2998,7 @@ name = "retracerd"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "dotenvy",
  "ingestion",
  "retracer-core",
  "tokio",
