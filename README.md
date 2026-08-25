@@ -62,10 +62,12 @@ answers — "not connected" and "caught up" are different states.
 
 ## Configuration
 
-All flags are optional; the defaults match a local devnet. `--bootnodes` and
-`--database-url` can also come from a `.env` file (copy `.env.example`) via
-`RETRACER_BOOTNODES`/`RETRACER_DATABASE_URL` — a flag always overrides the
-env value.
+All flags are optional; the defaults match a local devnet. `--bootnodes`,
+`--database-url`, `--node-rpc-url`, `--auth-token`, and `--rate-limit-rps`
+can also come from a `.env` file (copy `.env.example`) via
+`RETRACER_BOOTNODES`/`RETRACER_DATABASE_URL`/`RETRACER_NODE_RPC_URL`/
+`RETRACER_AUTH_TOKEN`/`RETRACER_RATE_LIMIT_RPS` — a flag always overrides
+the env value.
 
 | Flag | Default | Description |
 | --- | --- | --- |
@@ -73,6 +75,7 @@ env value.
 | `--port` | `0` | P2P listen port (`0` picks a free one) |
 | `--chain-id` | `corechain-devnet` | Label for this chain's rows. Not read off the wire |
 | `--database-url` | `postgres://retracer:retracer@localhost:5433/retracer` | Postgres connection string |
+| `--node-rpc-url` | none | This chain's node HTTP RPC base URL, e.g. `http://127.0.0.1:8081`. Only used for the validator-uptime endpoint; leave unset to disable it |
 | `--rest-port` | `8080` | HTTP API port; `0` disables it |
 | `--grpc-port` | `50051` | gRPC API port |
 | `--kind-schema` | `kind_schema.toml` | Payload field configuration |
@@ -82,6 +85,8 @@ env value.
 | `--max-pending-blocks` | `4096` | Gap-fill buffer cap |
 | `--write-pool-size` | `4` | Postgres connections for the writer |
 | `--read-pool-size` | `16` | Postgres connections for reads |
+| `--auth-token` | none | Shared secret required as `Authorization: Bearer <token>` on both surfaces (`/health` stays open). Unset = both surfaces stay open, same as today |
+| `--rate-limit-rps` | none | Per-IP request budget, both surfaces. Unset = no rate limiting |
 
 `--blocks-topic` and `--sync-protocol` are a wire agreement with the node you're
 following, so they must match what *it* publishes — they're not derived from
@@ -236,9 +241,21 @@ and `ingestion::HasHeight` for your own block type — see
 - **Account balances and nonces.** Not derivable from indexed actions; ask the
   node directly.
 - **Validator set membership.** Live membership comes from the node's
-  `/validators`. Retracer reports who has actually *proposed* blocks.
+  `/validators`. Retracer reports who has actually *proposed* blocks — and,
+  since 2026-08-25, who *should have*: `GET
+  /v1/chains/{chain_id}/validators/uptime?from=&to=` backfills turns owed
+  (the primary round-robin designee per height, a pure function of the
+  node's own `/validators?height=N` — not a replay of chain-specific
+  dispatch logic) against turns actually proposed. One node call per height,
+  so it's a bounded on-demand backfill (`MAX_UPTIME_RANGE`), not a live
+  figure. Needs `--node-rpc-url`/`RETRACER_NODE_RPC_URL` configured per
+  chain; without it the route 400s rather than guessing an address.
 - **Mempool / pending actions.** Confirmed blocks only.
-- **Auth or rate limiting.** Assumes trusted consumers today.
+- **Auth or rate limiting.** Off by default (unchanged trusted-consumer
+  behavior), now opt-in via `--auth-token`/`RETRACER_AUTH_TOKEN` (a shared
+  `Authorization: Bearer` secret) and `--rate-limit-rps`/
+  `RETRACER_RATE_LIMIT_RPS` (per-IP), enforced identically on both the gRPC
+  and REST surfaces. `/health` stays open for liveness probes either way.
 
 Reasoning for each is in [Design notes](../Retracer_Design.md#boundary-rules).
 

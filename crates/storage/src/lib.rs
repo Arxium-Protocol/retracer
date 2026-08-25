@@ -316,6 +316,34 @@ pub struct ProposerRow {
     pub last_proposed_height: i64,
 }
 
+/// Blocks actually proposed per address within `[from_height, to_height]`,
+/// keyed by address. Companion to [`list_proposers`], scoped to a height
+/// range instead of the whole chain — the numerator side of validator
+/// uptime, where the denominator (turns *owed*) comes from the node's own
+/// `GET /validators?height=N` (see `rest-service::get_validator_uptime`;
+/// see also `Retracer_Design.md`'s boundary rules on why that computation
+/// doesn't live here).
+pub async fn count_proposers_in_range(
+    pool: &PgPool,
+    chain_id: &str,
+    from_height: i64,
+    to_height: i64,
+) -> Result<std::collections::HashMap<String, i64>> {
+    let rows: Vec<(String, i64)> = sqlx::query_as(
+        "SELECT proposer, COUNT(*)
+         FROM blocks
+         WHERE chain_id = $1 AND proposer IS NOT NULL AND height BETWEEN $2 AND $3
+         GROUP BY proposer",
+    )
+    .bind(chain_id)
+    .bind(from_height)
+    .bind(to_height)
+    .fetch_all(pool)
+    .await?;
+
+    Ok(rows.into_iter().collect())
+}
+
 /// A block without its actions. Separate from `BlockRow` on purpose: the two
 /// carry different things, and letting `BlockRow` hold an empty action list
 /// would mean a caller could not tell "this block has no actions" from "this
@@ -1036,8 +1064,8 @@ mod tests {
             blocks_behind: None,
         };
 
-        assert_eq!(status.clone().with_network_tip(Some(42)).blocks_behind, Some(32));
-        assert_eq!(status.clone().with_network_tip(Some(10)).blocks_behind, Some(0));
+        assert_eq!(status.with_network_tip(Some(42)).blocks_behind, Some(32));
+        assert_eq!(status.with_network_tip(Some(10)).blocks_behind, Some(0));
     }
 
     /// A node that has just rolled back can report a tip below ours for a

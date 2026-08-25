@@ -26,6 +26,10 @@ serde_json = "1"
 bincode = { version = "2", features = ["serde"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "sync"] }
 dotenvy = "0.15"
+# Constant-time bearer-token comparison — same crate/pattern Arxium's own
+# core/rpc already uses for its `Authorization: Bearer` guard.
+subtle = "2"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 libp2p = { version = "0.56.0", features = ["tcp", "quic", "noise", "yamux", "tokio", "macros", "gossipsub", "request-response", "cbor", "dns"] }
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "tls-rustls", "postgres", "migrate", "macros", "json"] }
 

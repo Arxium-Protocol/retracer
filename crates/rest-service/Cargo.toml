@@ -14,3 +14,7 @@ ingestion = { workspace = true }
 sqlx = { workspace = true }
 # Already in the tree via tonic, so this costs no extra build.
 axum = "0.8"
+# Calls the node's own public `GET /validators?height=N` for uptime — same
+# category of call ArxPlusApi's NodeProxy already makes, not a privileged one.
+reqwest = { workspace = true }
+futures = "0.3"

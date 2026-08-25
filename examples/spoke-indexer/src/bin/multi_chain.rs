@@ -59,6 +59,7 @@ async fn main() -> Result<()> {
                 // budget nothing will ever spend.
                 finality_depth: 0,
                 kind_schema: "kind_schema.toml".into(),
+                node_rpc_url: None,
             },
             ChainHooks {
                 address_validator: Some(Arc::new(ingestion::is_corechain_address)),
@@ -84,6 +85,7 @@ async fn main() -> Result<()> {
                 max_pending_blocks: ingestion::DEFAULT_MAX_PENDING_BLOCKS,
                 finality_depth: 32,
                 kind_schema: "examples/spoke-indexer/kind_schema.toml".into(),
+                node_rpc_url: None,
             },
             ChainHooks {
                 tier_b: vec![Box::new(spoke_indexer::AirdropRecipients)],

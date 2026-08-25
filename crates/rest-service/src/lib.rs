@@ -12,21 +12,33 @@
 //! a REST path is the discoverable place for it, and a URL that names its chain
 //! can be pasted into a browser or a bug report and still mean one thing.
 
+use anyhow::Context;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Json, Router};
+use futures::stream::{self, StreamExt};
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::time::Duration;
 use storage::AddressValidator;
 
 /// Same cap the gRPC surface and the node's own RPC use. Kept identical on
 /// purpose: two surfaces over one dataset disagreeing about page size is a
 /// difference a client discovers the hard way, halfway through pagination.
 const MAX_PAGE_SIZE: i64 = 100;
+
+/// Caps how many `GET /validators?height=N` calls one uptime request can
+/// fan out to the node — this is an on-demand backfill computation (one
+/// node call per height), not a cached live figure, so an unbounded range
+/// would let one caller hammer the node. Raise if a real caller needs more;
+/// add caching before raising it much further.
+const MAX_UPTIME_RANGE: u64 = 5_000;
+const MAX_UPTIME_CONCURRENCY: usize = 16;
+const NODE_RPC_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// What the REST layer needs to know about a chain. A subset of
 /// `grpc_service::ChainRuntime` — no broadcast channel, because this surface
@@ -40,6 +52,10 @@ pub struct RestChain {
     pub finality_depth: u64,
     pub address_validator: Option<AddressValidator>,
     pub network_view: tokio::sync::watch::Receiver<ingestion::NetworkView>,
+    /// Base URL of this chain's node HTTP RPC, for `GET /validators?height=N`
+    /// — used only by [`get_validator_uptime`]. `None` disables that route
+    /// with a 400 rather than guessing an address.
+    pub node_rpc_url: Option<String>,
 }
 
 #[derive(Clone)]
@@ -47,6 +63,7 @@ struct AppState {
     pool: PgPool,
     chains: Arc<Vec<RestChain>>,
     known: Arc<HashSet<String>>,
+    http: reqwest::Client,
 }
 
 impl AppState {
@@ -66,7 +83,11 @@ impl AppState {
 
 pub fn router(pool: PgPool, chains: Vec<RestChain>) -> Router {
     let known = chains.iter().map(|c| c.chain_id.clone()).collect();
-    let state = AppState { pool, chains: Arc::new(chains), known: Arc::new(known) };
+    let http = reqwest::Client::builder()
+        .timeout(NODE_RPC_TIMEOUT)
+        .build()
+        .expect("reqwest client with only a timeout set never fails to build");
+    let state = AppState { pool, chains: Arc::new(chains), known: Arc::new(known), http };
 
     Router::new()
         .route("/v1/chains", get(list_chains))
@@ -78,6 +99,7 @@ pub fn router(pool: PgPool, chains: Vec<RestChain>) -> Router {
         .route("/v1/chains/{chain_id}/actions/{action_hash}", get(get_action))
         .route("/v1/chains/{chain_id}/accounts/{address}/actions", get(get_account_actions))
         .route("/v1/chains/{chain_id}/proposers", get(list_proposers))
+        .route("/v1/chains/{chain_id}/validators/uptime", get(get_validator_uptime))
         .route("/v1/chains/{chain_id}/search", get(search))
         .route("/health", get(health))
         .with_state(state)
@@ -282,6 +304,119 @@ async fn list_proposers(
 }
 
 #[derive(Deserialize)]
+struct UptimeQuery {
+    from: u64,
+    to: u64,
+}
+
+#[derive(Serialize)]
+struct ValidatorUptime {
+    address: String,
+    /// Heights where this address was the primary round-robin designee
+    /// (`sorted(validator_set_at_height)[height % len]`, the same formula
+    /// `core/primitives::consensus::expected_proposer` uses) — a pure
+    /// function of on-chain-public data, not a replay of chain-specific
+    /// dispatch logic, so this stays on the right side of the boundary
+    /// rules even though `GetValidatorSet` itself is deliberately absent.
+    /// Backup-proposer takeover (a validator's turn passing to the next
+    /// one after a silent slot) is not counted here — that needs the
+    /// chain's `SLOT_DURATION` constant, which isn't part of any public
+    /// API, so this is "was it your turn," not "were you eligible."
+    turns_owed: u64,
+    turns_proposed: i64,
+    /// `None` when this address was never the primary designee in range —
+    /// dividing by zero owed turns isn't a 0% uptime, it's "not this
+    /// validator's turn to be measured here."
+    uptime: Option<f64>,
+}
+
+/// Backfills validator uptime over `[from, to]` by calling the node's own
+/// `GET /validators?height=N` once per height (see `Retracer_Design.md`'s
+/// boundary rules on why the validator set isn't derived locally) and
+/// comparing the primary round-robin designee at each height against who
+/// actually proposed it (`storage::count_proposers_in_range`, already-local
+/// data). One node call per height is deliberate here — this is an
+/// on-demand backfill, not a live figure; a live/continuously-updated
+/// version would need caching this doesn't do (see `MAX_UPTIME_RANGE`).
+async fn get_validator_uptime(
+    State(state): State<AppState>,
+    Path(chain_id): Path<String>,
+    Query(query): Query<UptimeQuery>,
+) -> ApiResult<Vec<ValidatorUptime>> {
+    let chain = state.chain(&chain_id)?;
+    let Some(node_rpc_url) = chain.node_rpc_url.clone() else {
+        return Err(ApiError::BadRequest(format!(
+            "chain {chain_id:?} has no node RPC URL configured; validator uptime is unavailable"
+        )));
+    };
+    if query.from > query.to {
+        return Err(ApiError::BadRequest("from must be <= to".to_string()));
+    }
+    if query.to - query.from + 1 > MAX_UPTIME_RANGE {
+        return Err(ApiError::BadRequest(format!("range too large; at most {MAX_UPTIME_RANGE} heights per request")));
+    }
+
+    let proposed = storage::count_proposers_in_range(&state.pool, &chain_id, query.from as i64, query.to as i64).await?;
+
+    let http = state.http.clone();
+    let sets: Vec<anyhow::Result<(u64, Vec<String>)>> = stream::iter(query.from..=query.to)
+        .map(|height| {
+            let http = http.clone();
+            let node_rpc_url = node_rpc_url.clone();
+            async move {
+                let mut set = fetch_validator_set(&http, &node_rpc_url, height).await?;
+                set.sort();
+                Ok((height, set))
+            }
+        })
+        .buffer_unordered(MAX_UPTIME_CONCURRENCY)
+        .collect()
+        .await;
+
+    let mut owed: HashMap<String, u64> = HashMap::new();
+    for result in sets {
+        let (height, set) = result?;
+        if let Some(designee) = primary_designee(&set, height) {
+            *owed.entry(designee.to_string()).or_insert(0) += 1;
+        }
+    }
+
+    Ok(Json(compute_uptime(owed, proposed)))
+}
+
+/// The primary round-robin designee for `height`, given the validator set
+/// already sorted the way `core/primitives::consensus::expected_proposer`
+/// sorts it (lexicographically). `None` for an empty set.
+fn primary_designee(sorted_validators: &[String], height: u64) -> Option<&str> {
+    if sorted_validators.is_empty() {
+        return None;
+    }
+    Some(sorted_validators[(height as usize) % sorted_validators.len()].as_str())
+}
+
+fn compute_uptime(owed: HashMap<String, u64>, proposed: HashMap<String, i64>) -> Vec<ValidatorUptime> {
+    let mut rows: Vec<ValidatorUptime> = owed
+        .into_iter()
+        .map(|(address, turns_owed)| {
+            let turns_proposed = proposed.get(&address).copied().unwrap_or(0);
+            let uptime = (turns_owed > 0).then(|| turns_proposed as f64 / turns_owed as f64);
+            ValidatorUptime { address, turns_owed, turns_proposed, uptime }
+        })
+        .collect();
+    rows.sort_by(|a, b| a.address.cmp(&b.address));
+    rows
+}
+
+async fn fetch_validator_set(http: &reqwest::Client, node_rpc_url: &str, height: u64) -> anyhow::Result<Vec<String>> {
+    let url = format!("{node_rpc_url}/validators?height={height}");
+    let response = http.get(&url).send().await.with_context(|| format!("GET {url}"))?;
+    if !response.status().is_success() {
+        anyhow::bail!("GET {url} returned {}", response.status());
+    }
+    response.json().await.with_context(|| format!("decoding response body from {url}"))
+}
+
+#[derive(Deserialize)]
 struct SearchQuery {
     q: String,
 }
@@ -369,5 +504,37 @@ mod tests {
         let half =
             ActionPage { limit: None, before_height: Some(5), before_index: None, role: None };
         assert!(half.cursor().is_err());
+    }
+
+    #[test]
+    fn primary_designee_rotates_lexicographically_by_height_modulo_set_size() {
+        let validators = vec!["arx1b".to_string(), "arx1a".to_string(), "arx1c".to_string()];
+        // Sorted order is a, b, c regardless of input order — matches the
+        // node's own `sorted.sort()` before indexing by `height % len`.
+        let mut sorted = validators.clone();
+        sorted.sort();
+        assert_eq!(primary_designee(&sorted, 0), Some("arx1a"));
+        assert_eq!(primary_designee(&sorted, 1), Some("arx1b"));
+        assert_eq!(primary_designee(&sorted, 2), Some("arx1c"));
+        assert_eq!(primary_designee(&sorted, 3), Some("arx1a"), "wraps around");
+        assert_eq!(primary_designee(&[], 0), None);
+    }
+
+    #[test]
+    fn uptime_divides_proposed_by_owed_and_treats_never_owed_as_unmeasured() {
+        let owed = HashMap::from([("a".to_string(), 4u64), ("b".to_string(), 2u64)]);
+        let proposed = HashMap::from([("a".to_string(), 3i64)]);
+        let mut rows = compute_uptime(owed, proposed);
+        rows.sort_by(|a, b| a.address.cmp(&b.address));
+
+        assert_eq!(rows[0].address, "a");
+        assert_eq!(rows[0].turns_owed, 4);
+        assert_eq!(rows[0].turns_proposed, 3);
+        assert_eq!(rows[0].uptime, Some(0.75));
+
+        assert_eq!(rows[1].address, "b");
+        assert_eq!(rows[1].turns_owed, 2);
+        assert_eq!(rows[1].turns_proposed, 0, "no proposed-count row means zero, not missing");
+        assert_eq!(rows[1].uptime, Some(0.0));
     }
 }

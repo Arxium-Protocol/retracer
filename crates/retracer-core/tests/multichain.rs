@@ -37,6 +37,7 @@ fn config(chain_id: &str, name: &str) -> ChainConfig {
         max_pending_blocks: 128,
         finality_depth: 12,
         kind_schema: "does-not-exist.toml".to_string(),
+        node_rpc_url: None,
     }
 }
 

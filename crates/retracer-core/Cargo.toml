@@ -17,6 +17,7 @@ futures = "0.3"
 axum = "0.8"
 sqlx = { workspace = true }
 serde = { workspace = true }
+subtle = { workspace = true }
 
 [dev-dependencies]
 xc-primitives = { workspace = true }

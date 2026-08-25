@@ -15,6 +15,7 @@
 //!   all of them. Each chain is added with its own block type, so a Hub and its
 //!   Spokes can be followed together even though their payloads differ.
 
+pub mod auth;
 pub mod tip;
 
 use anyhow::{Context, Result};
@@ -75,6 +76,13 @@ pub struct ChainConfig {
     /// the chain fork-free.
     pub finality_depth: u64,
     pub kind_schema: String,
+    /// Base URL of this chain's own node HTTP RPC (e.g.
+    /// `http://127.0.0.1:8081`), used only for `GET /validators?height=N` —
+    /// the same public endpoint any external participant could call, not a
+    /// privileged one (see `Retracer_Design.md`'s boundary rules). `None`
+    /// disables the validator-uptime endpoint; there's no safe default to
+    /// guess since it's a different address than the p2p bootnodes.
+    pub node_rpc_url: Option<String>,
 }
 
 /// Process-level configuration, plus the single chain the CLI describes.
@@ -87,6 +95,13 @@ pub struct Args {
     pub write_pool_size: u32,
     pub read_pool_size: u32,
     pub chain: ChainConfig,
+    /// Shared secret every request on both surfaces must present as
+    /// `Authorization: Bearer <token>`. `None` (the default) leaves both
+    /// surfaces open, matching today's trusted-consumer behavior.
+    pub auth_token: Option<String>,
+    /// Per-IP request budget, in requests/second, on both surfaces. `None`
+    /// (the default) disables rate limiting entirely.
+    pub rate_limit_rps: Option<u32>,
 }
 
 /// Minimal manual flag parsing — a handful of flags, not worth a clap
@@ -116,6 +131,16 @@ pub fn parse_args() -> Result<Args> {
     let mut write_pool_size = DEFAULT_WRITE_POOL_SIZE;
     let mut read_pool_size = DEFAULT_READ_POOL_SIZE;
     let mut finality_depth = DEFAULT_FINALITY_DEPTH;
+    // Empty string (an unfilled `.env.example` var left in place) is treated
+    // the same as unset, not as "auth token is the empty string" — the
+    // latter would silently lock every caller out, since no real
+    // `Authorization` header value equals "Bearer " with nothing after it.
+    let mut node_rpc_url = std::env::var("RETRACER_NODE_RPC_URL").ok().filter(|v| !v.is_empty());
+    let mut auth_token = std::env::var("RETRACER_AUTH_TOKEN").ok().filter(|v| !v.is_empty());
+    let mut rate_limit_rps: Option<u32> = match std::env::var("RETRACER_RATE_LIMIT_RPS") {
+        Ok(value) if !value.is_empty() => Some(value.parse().context("RETRACER_RATE_LIMIT_RPS must be a u32")?),
+        _ => None,
+    };
     let mut args = std::env::args().skip(1);
     while let Some(flag) = args.next() {
         match flag.as_str() {
@@ -179,6 +204,16 @@ pub fn parse_args() -> Result<Args> {
                 let value = args.next().context("--finality-depth requires a value")?;
                 finality_depth = value.parse().context("--finality-depth must be a u64")?;
             }
+            "--node-rpc-url" => {
+                node_rpc_url = Some(args.next().context("--node-rpc-url requires a value")?);
+            }
+            "--auth-token" => {
+                auth_token = Some(args.next().context("--auth-token requires a value")?);
+            }
+            "--rate-limit-rps" => {
+                let value = args.next().context("--rate-limit-rps requires a value")?;
+                rate_limit_rps = Some(value.parse().context("--rate-limit-rps must be a u32")?);
+            }
             other => anyhow::bail!("unknown flag: {other}"),
         }
     }
@@ -198,7 +233,10 @@ pub fn parse_args() -> Result<Args> {
             max_pending_blocks,
             finality_depth,
             kind_schema,
+            node_rpc_url,
         },
+        auth_token,
+        rate_limit_rps,
     })
 }
 
@@ -230,7 +268,9 @@ where
         args.grpc_port,
     )
     .await?
-    .with_rest_port(args.rest_port);
+    .with_rest_port(args.rest_port)
+    .with_auth_token(args.auth_token)
+    .with_rate_limit_rps(args.rate_limit_rps);
     runner.add_chain::<B>(args.chain, hooks).await?;
     runner.run().await
 }
@@ -250,6 +290,8 @@ pub struct Runner {
     read_pool: PgPool,
     grpc_port: u16,
     rest_port: Option<u16>,
+    auth_token: Option<String>,
+    rate_limit_rps: Option<u32>,
     runtimes: Vec<grpc_service::ChainRuntime>,
     rest_chains: Vec<rest_service::RestChain>,
     tasks: Vec<JoinHandle<Result<()>>>,
@@ -279,6 +321,8 @@ impl Runner {
             read_pool,
             grpc_port,
             rest_port: None,
+            auth_token: None,
+            rate_limit_rps: None,
             runtimes: Vec::new(),
             rest_chains: Vec::new(),
             tasks: Vec::new(),
@@ -288,6 +332,20 @@ impl Runner {
     /// Serve the HTTP/JSON surface too. `None` leaves it off.
     pub fn with_rest_port(mut self, port: Option<u16>) -> Self {
         self.rest_port = port;
+        self
+    }
+
+    /// Require `Authorization: Bearer <token>` on every request, both
+    /// surfaces. `None` (the default) leaves both open.
+    pub fn with_auth_token(mut self, token: Option<String>) -> Self {
+        self.auth_token = token;
+        self
+    }
+
+    /// Per-IP request budget in requests/second, both surfaces. `None` (the
+    /// default) disables rate limiting.
+    pub fn with_rate_limit_rps(mut self, rps: Option<u32>) -> Self {
+        self.rate_limit_rps = rps;
         self
     }
 
@@ -403,6 +461,7 @@ impl Runner {
             finality_depth: config.finality_depth,
             address_validator: hooks.address_validator.clone(),
             network_view: network_view.clone(),
+            node_rpc_url: config.node_rpc_url.clone(),
         });
         self.runtimes.push(grpc_service::ChainRuntime {
             chain_id: config.chain_id,
@@ -430,8 +489,19 @@ impl Runner {
         let chain_ids: Vec<&str> = self.runtimes.iter().map(|r| r.chain_id.as_str()).collect();
         info!(chains = ?chain_ids, default = %chain_ids[0], "serving");
 
+        let guard = auth::GuardConfig::new(self.auth_token, self.rate_limit_rps);
+        if guard.is_active() {
+            info!(
+                auth = guard.token.is_some(),
+                rate_limit = guard.rate_limiter.is_some(),
+                "request guard active on both surfaces"
+            );
+        }
+
         let grpc_addr = format!("0.0.0.0:{}", self.grpc_port).parse().context("invalid gRPC port")?;
         let grpc_service = grpc_service::server(self.read_pool.clone(), self.runtimes);
+        let grpc_service =
+            tonic::service::interceptor::InterceptedService::new(grpc_service, auth::GrpcGuard(guard.clone()));
         tokio::spawn(async move {
             info!(%grpc_addr, "gRPC listening");
             if let Err(err) = tonic::transport::Server::builder()
@@ -444,13 +514,15 @@ impl Runner {
         });
 
         if let Some(rest_port) = self.rest_port {
-            let router = rest_service::router(self.read_pool.clone(), self.rest_chains);
+            let router = rest_service::router(self.read_pool.clone(), self.rest_chains)
+                .layer(axum::middleware::from_fn_with_state(guard, auth::rest_guard));
             tokio::spawn(async move {
                 let addr = format!("0.0.0.0:{rest_port}");
                 match tokio::net::TcpListener::bind(&addr).await {
                     Ok(listener) => {
                         info!(%addr, "REST listening");
-                        if let Err(err) = axum::serve(listener, router).await {
+                        let service = router.into_make_service_with_connect_info::<std::net::SocketAddr>();
+                        if let Err(err) = axum::serve(listener, service).await {
                             warn!("REST server exited: {err}");
                         }
                     }
