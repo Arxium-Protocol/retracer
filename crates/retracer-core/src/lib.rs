@@ -565,7 +565,20 @@ where
     // actually extends the chain again.
     let mut rewound_from: Option<i64> = None;
 
-    while let Some(block) = block_rx.recv().await {
+    // Blocks that classified as `Extend`, waiting to be committed together.
+    // Only backfill fills this: `recv_many` returns as soon as the channel has
+    // anything, so a live chain producing a block every couple of seconds
+    // still commits one at a time and gains no latency.
+    let mut batch: Vec<B> = Vec::with_capacity(storage::INSERT_BATCH_BLOCKS);
+    let mut inbox: Vec<B> = Vec::with_capacity(storage::INSERT_BATCH_BLOCKS);
+
+    loop {
+        inbox.clear();
+        if block_rx.recv_many(&mut inbox, storage::INSERT_BATCH_BLOCKS).await == 0 {
+            break; // channel closed
+        }
+
+        for block in inbox.drain(..) {
         let height = storage::IndexableBlock::height(&block) as i64;
         let parent_hash = block.parent_hash();
 
@@ -597,6 +610,11 @@ where
                 );
             }
             TipAction::Fork { rollback_to } => {
+                // Commit what's pending before rolling back: `rollback_to`
+                // deletes committed rows, and blocks still in the batch would
+                // survive it and reappear above the rewind point.
+                let _ = flush_batch(&write_pool, &chain_id, &mut batch, &address_extractor, &blocks_tx)
+                    .await;
                 let from = rewound_from.unwrap_or(height - 1);
                 warn!(
                     %chain_id,
@@ -624,6 +642,10 @@ where
                 continue;
             }
             TipAction::ForkBelowFinalized { would_rollback_to, finalized_height } => {
+                // Ingestion stalls here; make what was already accepted
+                // durable rather than losing it with the batch.
+                let _ = flush_batch(&write_pool, &chain_id, &mut batch, &address_extractor, &blocks_tx)
+                    .await;
                 error!(
                     %chain_id,
                     height,
@@ -635,6 +657,8 @@ where
                 continue;
             }
             TipAction::ForkTooDeep { would_rollback_to, depth } => {
+                let _ = flush_batch(&write_pool, &chain_id, &mut batch, &address_extractor, &blocks_tx)
+                    .await;
                 // Deliberately not fatal and deliberately not obeyed. Refusing
                 // leaves the index intact and stalled rather than letting a
                 // peer with a bogus chain walk us back to genesis — a human
@@ -653,19 +677,91 @@ where
         }
 
         let hash = block.hash();
-        match storage::insert_block(&write_pool, &chain_id, &block, &address_extractor).await {
-            Ok(()) => {
-                info!(%chain_id, height, hash = %hash, actions = block.actions().len(), "indexed block");
-                tip = Some(Tip { height, hash });
-                rewound_from = None;
-                // Only fails when there are no subscribers connected — fine,
-                // nothing is listening.
-                if let Ok(row) = storage::block_row_from_wire(&block) {
+        // Tip advances optimistically so the next block in this same batch
+        // classifies against it. `flush_batch` restores it from the database
+        // if the commit fails, so a failed batch cannot leave the tip claiming
+        // heights that were never written.
+        tip = Some(Tip { height, hash });
+        rewound_from = None;
+        batch.push(block);
+
+        if batch.len() >= storage::INSERT_BATCH_BLOCKS {
+            flush_batch(&write_pool, &chain_id, &mut batch, &address_extractor, &blocks_tx).await;
+        }
+        }
+
+        // Channel drained — commit what this chunk accumulated. Once caught
+        // up this runs per block, so batching costs no latency when live.
+        if !flush_batch(&write_pool, &chain_id, &mut batch, &address_extractor, &blocks_tx).await {
+            tip = durable_tip(&write_pool, &chain_id).await;
+        }
+    }
+
+    let _ = flush_batch(&write_pool, &chain_id, &mut batch, &address_extractor, &blocks_tx).await;
+    Ok(())
+}
+
+/// Commits a batch and broadcasts its blocks, leaving `batch` empty.
+///
+/// Broadcast happens only after the commit succeeds, so a `SubscribeBlocks`
+/// subscriber never sees a block that failed to land. A failed batch is logged
+/// and dropped: every write is idempotent and the cursor advances inside the
+/// same transaction, so the next sync request re-fetches from the last
+/// committed height and re-applies.
+async fn flush_batch<B>(
+    pool: &sqlx::PgPool,
+    chain_id: &str,
+    batch: &mut Vec<B>,
+    address_extractor: &storage::AddressExtractor,
+    blocks_tx: &tokio::sync::broadcast::Sender<storage::BlockRow>,
+) -> bool
+where
+    B: storage::IndexableBlock,
+{
+    if batch.is_empty() {
+        return true;
+    }
+    let first = storage::IndexableBlock::height(&batch[0]);
+    let last = storage::IndexableBlock::height(&batch[batch.len() - 1]);
+    let actions: usize = batch.iter().map(|b| b.actions().len()).sum();
+
+    match storage::insert_blocks(pool, chain_id, batch, address_extractor).await {
+        Ok(()) => {
+            // One line per batch, not per block: backfilling 207k heights
+            // previously emitted 207k log lines, which is its own cost and
+            // buries everything else in the journal.
+            info!(
+                %chain_id, first_height = first, last_height = last,
+                blocks = batch.len(), actions, "indexed blocks"
+            );
+            for block in batch.iter() {
+                if let Ok(row) = storage::block_row_from_wire(block) {
                     let _ = blocks_tx.send(row);
                 }
             }
-            Err(err) => warn!(%chain_id, height, "failed to index block: {err}"),
+        }
+        Err(err) => {
+            warn!(
+                %chain_id, first_height = first, last_height = last,
+                "failed to index blocks: {err}"
+            );
+            batch.clear();
+            return false;
         }
     }
-    Ok(())
+    batch.clear();
+    true
+}
+
+/// The tip as the database actually has it.
+///
+/// Called after a failed flush, because the loop advances `tip` optimistically
+/// while filling a batch so that consecutive blocks classify against each
+/// other. If the commit fails those heights were never written, and leaving
+/// `tip` pointing at them would make every subsequent block classify against a
+/// tip that does not exist — spurious gaps and forks.
+async fn durable_tip(pool: &sqlx::PgPool, chain_id: &str) -> Option<Tip> {
+    let height = storage::get_cursor(pool, chain_id).await.ok().flatten()?;
+    let hash = storage::get_block_hash(pool, chain_id, height).await.ok().flatten()?;
+    Some(Tip { height, hash })
 }

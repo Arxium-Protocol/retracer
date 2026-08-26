@@ -593,16 +593,65 @@ impl BlockWrites {
     }
 }
 
+/// How many blocks one catch-up transaction covers.
+///
+/// Backfilling a chain committed one transaction per block, so indexing
+/// 207,594 heights meant 207,594 commits — and a Postgres commit is an fsync.
+/// The statements inside were already batched; the commits were the cost.
+/// Mirrors what the node itself does for its own catch-up (batching WAL
+/// fsyncs per sync page rather than per block).
+///
+/// Only affects backfill: a live chain producing one block every couple of
+/// seconds flushes each block as it arrives, because the batch closes as soon
+/// as the channel is empty.
+pub const INSERT_BATCH_BLOCKS: usize = 200;
+
+/// One block, in its own transaction. Live-path entry point.
 pub async fn insert_block<B: IndexableBlock>(
     pool: &PgPool,
     chain_id: &str,
     block: &B,
     address_extractor: &AddressExtractor,
 ) -> Result<()> {
+    insert_blocks(pool, chain_id, std::slice::from_ref(block), address_extractor).await
+}
+
+/// Several blocks in a single transaction — the catch-up entry point.
+///
+/// All-or-nothing: on failure nothing in the batch lands, including the
+/// cursor advance, so a restart re-requests from the last committed height and
+/// re-applies. Every write is idempotent (`ON CONFLICT DO NOTHING`, and a
+/// cursor upsert guarded by `last_height <` ), so replaying a partially
+/// re-delivered range is safe.
+///
+/// Callers must pass blocks in ascending height order and must have already
+/// classified them as extending the tip — fork and gap handling stays in
+/// `retracer_core`, one block at a time, and never batches.
+pub async fn insert_blocks<B: IndexableBlock>(
+    pool: &PgPool,
+    chain_id: &str,
+    blocks: &[B],
+    address_extractor: &AddressExtractor,
+) -> Result<()> {
+    if blocks.is_empty() {
+        return Ok(());
+    }
+    let mut tx = pool.begin().await?;
+    for block in blocks {
+        insert_block_in_tx(&mut tx, chain_id, block, address_extractor).await?;
+    }
+    tx.commit().await?;
+    Ok(())
+}
+
+async fn insert_block_in_tx<B: IndexableBlock>(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    chain_id: &str,
+    block: &B,
+    address_extractor: &AddressExtractor,
+) -> Result<()> {
     let height = block.height() as i64;
     let hash = block.hash();
-
-    let mut tx = pool.begin().await?;
 
     let result = sqlx::query(
         "INSERT INTO blocks (chain_id, height, hash, parent_hash, timestamp, proposer)
@@ -617,7 +666,7 @@ pub async fn insert_block<B: IndexableBlock>(
     // None for genesis, which is unsigned, and for a block from a
     // non-validator solo node. Both are real absences rather than gaps.
     .bind(block.proposer())
-    .execute(&mut *tx)
+    .execute(&mut **tx)
     .await?;
 
     // A height already occupied by a *different* hash should be impossible:
@@ -632,7 +681,7 @@ pub async fn insert_block<B: IndexableBlock>(
             sqlx::query_as("SELECT hash FROM blocks WHERE chain_id = $1 AND height = $2")
                 .bind(chain_id)
                 .bind(height)
-                .fetch_optional(&mut *tx)
+                .fetch_optional(&mut **tx)
                 .await?;
         if existing.map(|(h,)| h).as_deref() != Some(hash.as_str()) {
             tracing::error!(
@@ -671,7 +720,7 @@ pub async fn insert_block<B: IndexableBlock>(
         .bind(&writes.kind[..])
         .bind(&writes.from_address[..])
         .bind(&writes.payload[..])
-        .execute(&mut *tx)
+        .execute(&mut **tx)
         .await?;
 
         // Sender rows reuse the `actions` vectors verbatim — `account_actions`
@@ -687,7 +736,7 @@ pub async fn insert_block<B: IndexableBlock>(
         .bind(height)
         .bind(&writes.from_address[..])
         .bind(&writes.action_hash[..])
-        .execute(&mut *tx)
+        .execute(&mut **tx)
         .await?;
     }
 
@@ -703,7 +752,7 @@ pub async fn insert_block<B: IndexableBlock>(
         .bind(&writes.addr_action_hash[..])
         .bind(&writes.addr_address[..])
         .bind(&writes.addr_role[..])
-        .execute(&mut *tx)
+        .execute(&mut **tx)
         .await?;
     }
 
@@ -716,10 +765,9 @@ pub async fn insert_block<B: IndexableBlock>(
     )
     .bind(chain_id)
     .bind(height)
-    .execute(&mut *tx)
+    .execute(&mut **tx)
     .await?;
 
-    tx.commit().await?;
     Ok(())
 }
 
