@@ -2,7 +2,7 @@ pub mod proto {
     tonic::include_proto!("retracer");
 }
 
-use futures::StreamExt;
+use futures::{StreamExt, TryStreamExt};
 use proto::get_block_request::By;
 use proto::retracer_server::{Retracer, RetracerServer};
 use proto::search_response::Result as SearchResult;
@@ -435,19 +435,50 @@ impl Retracer for Service {
         // than falling in the gap between replay and live.
         let live_rx = chain.blocks_tx.subscribe();
 
-        let mut replay = Vec::new();
-        if let Some(from) = from_height {
-            let tip = storage::get_cursor(&self.pool, &chain.chain_id)
+        // Replay up to the tip as it stood when the stream opened. Paged
+        // lazily rather than collected: a resume from genesis on this chain is
+        // 207k heights, and materializing all of them held the whole range in
+        // memory and emitted nothing until the last row landed.
+        let tip = match from_height {
+            Some(from) => storage::get_cursor(&self.pool, &chain.chain_id)
                 .await
                 .map_err(|err| Status::internal(err.to_string()))?
-                .unwrap_or(from as i64 - 1);
-            replay = storage::get_blocks_in_range(&self.pool, &chain.chain_id, from as i64, tip)
+                .unwrap_or(from as i64 - 1),
+            None => -1,
+        };
+        // The ceiling is the tip we intend to replay through, not the last row
+        // of some page — paging must not reopen the replay/live gap that
+        // subscribing before the tip read was designed to close.
+        let replay_ceiling = replay_ceiling(from_height, from_height.map(|_| tip));
+
+        let pool = self.pool.clone();
+        let chain_id = chain.chain_id.clone();
+        let start = from_height.map(|f| f as i64).unwrap_or(tip + 1);
+        let replay_stream = futures::stream::try_unfold(start, move |next| {
+            let pool = pool.clone();
+            let chain_id = chain_id.clone();
+            async move {
+                if next > tip {
+                    return Ok::<_, Status>(None);
+                }
+                let page = storage::get_blocks_in_range(
+                    &pool,
+                    &chain_id,
+                    next,
+                    tip,
+                    storage::BLOCK_PAGE,
+                )
                 .await
                 .map_err(|err| Status::internal(err.to_string()))?;
-        }
-        let replay_ceiling = replay_ceiling(from_height, replay.last().map(|b| b.height));
-
-        let replay_stream = futures::stream::iter(replay.into_iter().map(|row| Ok(Block::from(row))));
+                // Empty page before the tip means the range has holes rather
+                // than more rows — stop instead of looping on the same height.
+                let Some(last) = page.last().map(|b| b.height) else {
+                    return Ok::<_, Status>(None);
+                };
+                Ok(Some((futures::stream::iter(page.into_iter().map(|row| Ok(Block::from(row)))), last + 1)))
+            }
+        })
+        .try_flatten();
         let live_stream = BroadcastStream::new(live_rx).filter_map(move |item| async move {
             match item {
                 Ok(row) if row.height > replay_ceiling => Some(Ok(Block::from(row))),
@@ -515,8 +546,13 @@ fn action_matches_address(address_extractor: &AddressExtractor, action: &ActionR
 /// when `from_height` is unset, nothing was replayed and every live block
 /// qualifies) — used to filter the live stream so a block is never sent
 /// twice across the replay/live handoff.
-fn replay_ceiling(from_height: Option<u64>, last_replayed_height: Option<i64>) -> i64 {
-    last_replayed_height.unwrap_or_else(|| from_height.map_or(-1, |f| f as i64 - 1))
+///
+/// `replayed_through` is the tip the replay covers, **not** the height of the
+/// last row any one page returned — the replay is paged, and a per-page
+/// ceiling would reopen exactly the replay/live gap that subscribing before
+/// the tip read exists to close.
+fn replay_ceiling(from_height: Option<u64>, replayed_through: Option<i64>) -> i64 {
+    replayed_through.unwrap_or_else(|| from_height.map_or(-1, |f| f as i64 - 1))
 }
 
 #[cfg(test)]
@@ -601,6 +637,24 @@ mod tests {
     #[test]
     fn from_height_with_replayed_blocks_filters_up_to_the_last_one_sent() {
         assert_eq!(replay_ceiling(Some(5), Some(10)), 10);
+    }
+
+    /// The replay streams in pages, so the ceiling must be the tip it replays
+    /// through rather than whatever height a page happened to end on. A
+    /// per-page ceiling would let the live filter drop every block between the
+    /// last page and the live handoff.
+    #[test]
+    fn replay_ceiling_is_the_tip_not_a_page_boundary() {
+        let tip = 207_594i64;
+        assert_eq!(replay_ceiling(Some(1), Some(tip)), tip);
+
+        // A page ending at 500 must not become the ceiling — blocks 501..=tip
+        // would then be filtered out of the live stream and lost.
+        assert_ne!(replay_ceiling(Some(1), Some(tip)), 500);
+
+        // Nothing to replay: the cursor sits below `from`, so the ceiling is
+        // still just below `from` and every live block qualifies.
+        assert_eq!(replay_ceiling(Some(9), Some(8)), 8);
     }
 
     fn schema_with_transfer_to_role() -> KindSchema {

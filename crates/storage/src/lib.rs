@@ -929,19 +929,82 @@ pub async fn get_account_actions(
 /// block count per request is expected to stay small (a resume gap, not a
 /// full-history export), so N point lookups reusing `get_block_by_height`
 /// is simpler than a second JOIN query to maintain.
+/// How many blocks one `get_blocks_in_range` page returns.
+///
+/// Bounds both the memory a single call holds and how long a `SubscribeBlocks`
+/// resume waits before its first message. 500 blocks is ~17 minutes of chain at
+/// a 2s interval, and two queries' worth of rows.
+pub const BLOCK_PAGE: i64 = 500;
+
+/// Blocks in `[from, to]`, ordered by height, at most `limit` of them.
+///
+/// Two queries total — one for the block rows, one for every action across the
+/// page — rather than per block. The previous implementation looped
+/// `from..=to` calling `get_block_by_height`, which is itself two queries, so a
+/// `SubscribeBlocks` resume from genesis against a 207k-height chain issued
+/// **~415,000 round trips serially** and accumulated every row in memory before
+/// emitting its first message. That is the wallet's slow reconnect: not the
+/// number of blocks, but an N+1 on the resume path.
+///
+/// Returning fewer than `limit` rows means the range is exhausted; callers
+/// page by advancing `from` past the last height returned.
 pub async fn get_blocks_in_range(
     pool: &PgPool,
     chain_id: &str,
     from: i64,
     to: i64,
+    limit: i64,
 ) -> Result<Vec<BlockRow>> {
-    let mut blocks = Vec::new();
-    for height in from..=to {
-        if let Some(block) = get_block_by_height(pool, chain_id, height).await? {
-            blocks.push(block);
-        }
+    let rows: Vec<(i64, String, String, i64, Option<String>)> = sqlx::query_as(
+        "SELECT height, hash, parent_hash, timestamp, proposer
+           FROM blocks
+          WHERE chain_id = $1 AND height >= $2 AND height <= $3
+          ORDER BY height
+          LIMIT $4",
+    )
+    .bind(chain_id)
+    .bind(from)
+    .bind(to)
+    .bind(limit)
+    .fetch_all(pool)
+    .await?;
+
+    let (Some(lo), Some(hi)) = (rows.first().map(|r| r.0), rows.last().map(|r| r.0)) else {
+        return Ok(Vec::new());
+    };
+
+    // One query for the whole page's actions. On this chain that is usually
+    // zero rows — 8 actions across 207k heights — so the page cost is
+    // dominated by the block rows, not the actions.
+    let actions: Vec<ActionRow> = sqlx::query_as(
+        "SELECT action_hash, block_height, index_in_block, kind, from_address, payload
+           FROM actions
+          WHERE chain_id = $1 AND block_height >= $2 AND block_height <= $3
+          ORDER BY block_height, index_in_block",
+    )
+    .bind(chain_id)
+    .bind(lo)
+    .bind(hi)
+    .fetch_all(pool)
+    .await?;
+
+    let mut by_height: std::collections::HashMap<i64, Vec<ActionRow>> =
+        std::collections::HashMap::new();
+    for action in actions {
+        by_height.entry(action.block_height).or_default().push(action);
     }
-    Ok(blocks)
+
+    Ok(rows
+        .into_iter()
+        .map(|(height, hash, parent_hash, timestamp, proposer)| BlockRow {
+            actions: by_height.remove(&height).unwrap_or_default(),
+            height,
+            hash,
+            parent_hash,
+            timestamp,
+            proposer,
+        })
+        .collect())
 }
 
 pub async fn block_height_by_hash(
