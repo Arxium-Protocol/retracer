@@ -1,0 +1,100 @@
+name: Version CI and Release
+
+on:
+  push:
+    tags:
+      - 'v[0-9]+.[0-9]+.[0-9]+'
+
+permissions:
+  contents: read
+
+env:
+  SQLX_OFFLINE: 'true'
+
+jobs:
+  test:
+    name: Test the workspace
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+
+    steps:
+      - name: Check out Retracer
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - name: Install protoc
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends protobuf-compiler
+
+      - name: Show the Rust toolchain
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          rustc --version
+          cargo --version
+
+      - name: Test the workspace
+        shell: bash
+        run: cargo test --workspace --locked
+
+  release:
+    name: Build and publish release
+    needs: test
+    permissions:
+      contents: write
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+
+    steps:
+      - name: Check out Retracer
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - name: Install protoc
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends protobuf-compiler
+
+      - name: Build retracerd (release)
+        shell: bash
+        run: cargo build --release --locked -p retracerd
+
+      - name: Package binary
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          tag="${GITHUB_REF_NAME}"
+          out="retracerd-${tag}-x86_64-linux-gnu"
+          mkdir -p "dist/${out}"
+          cp target/release/retracerd "dist/${out}/"
+          cp kind_schema.toml "dist/${out}/"
+          tar -C dist -czf "dist/${out}.tar.gz" "${out}"
+          rm -rf "dist/${out}"
+
+      # scripts/install.sh verifies the release archive against this file.
+      - name: Generate checksums
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          cd dist
+          sha256sum *.tar.gz > SHA256SUMS
+          grep -Eq "^[0-9a-f]{64}  retracerd-${GITHUB_REF_NAME}-x86_64-linux-gnu[.]tar[.]gz$" SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Publish GitHub release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -Eeuo pipefail
+          gh release create "${GITHUB_REF_NAME}" dist/*.tar.gz dist/SHA256SUMS \
+            --repo "${GITHUB_REPOSITORY}" \
+            --title "${GITHUB_REF_NAME}" \
+            --generate-notes

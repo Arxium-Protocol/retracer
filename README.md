@@ -16,8 +16,32 @@ hit node RPC or replay chain logic themselves.
 
 ## Quickstart
 
-Requires Rust (2024 edition) and a Postgres database — bring your own; Retracer
-doesn't run one for you.
+A Postgres database is required either way — bring your own; Retracer doesn't
+run one for you.
+
+### From a release (no Rust toolchain, no Docker)
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Arxium-Protocol/retracer/main/scripts/install.sh | bash
+```
+
+Downloads the latest `retracerd` release (checksum-verified), prompts for
+your bootnodes/database URL/auth token, and offers to install it as a
+systemd service. Read it before piping to `bash` if you'd rather:
+
+```bash
+curl -fsSL .../install.sh -o install.sh && less install.sh && bash install.sh
+```
+
+Non-interactive install with defaults: `install.sh --yes`. See
+`install.sh --help` for `--version`/`--base-path`/`--dry-run`.
+
+Releases only ship `x86_64-linux-gnu` binaries today — everywhere else, build
+from source below.
+
+### From source
+
+Requires Rust (2024 edition).
 
 ```bash
 ./scripts/setup.sh            # checks tools, builds
