@@ -8,7 +8,7 @@
 //! registered against one Runner, which is the claim the type signature makes
 //! and the reason multi-chain isn't expressible as a config file.
 
-use retracer_core::{ChainConfig, ChainHooks, Runner};
+use retracer_core::{ChainConfig, ChainHooks, NodeRpcToken, Runner};
 use serde::{Deserialize, Serialize};
 use sqlx::Row;
 use xc_primitives::Block;
@@ -38,7 +38,24 @@ fn config(chain_id: &str, name: &str) -> ChainConfig {
         finality_depth: 12,
         kind_schema: "does-not-exist.toml".to_string(),
         node_rpc_url: None,
+        node_rpc_token: None,
     }
+}
+
+#[test]
+fn node_rpc_token_is_available_through_the_multichain_api() {
+    let mut hub = config("secured-hub", "Secured Hub");
+    let mut spoke = config("secured-spoke", "Secured Spoke");
+    hub.node_rpc_token = Some(NodeRpcToken::new("hub-secret".into()).unwrap());
+    spoke.node_rpc_token = Some(NodeRpcToken::new("spoke-secret".into()).unwrap());
+
+    assert_ne!(hub.node_rpc_token, spoke.node_rpc_token);
+    let hub_debug = format!("{:?}", hub.node_rpc_token.as_ref().unwrap());
+    let spoke_debug = format!("{:?}", spoke.node_rpc_token.as_ref().unwrap());
+    assert_eq!(hub_debug, "NodeRpcToken([REDACTED])");
+    assert_eq!(spoke_debug, "NodeRpcToken([REDACTED])");
+    assert!(!hub_debug.contains("hub-secret"));
+    assert!(!spoke_debug.contains("spoke-secret"));
 }
 
 macro_rules! runner_or_skip {

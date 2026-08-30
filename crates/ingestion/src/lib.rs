@@ -8,11 +8,20 @@ use libp2p::request_response::{self, ProtocolSupport, cbor};
 use libp2p::swarm::dial_opts::DialOpts;
 use libp2p::swarm::{ConnectionId, NetworkBehaviour, SwarmEvent};
 use libp2p::{Multiaddr, PeerId, StreamProtocol, gossipsub, noise, tcp, yamux};
-use std::collections::{BTreeMap, HashMap};
-use std::time::Duration;
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::time::{Duration, Instant};
 use tokio::sync::mpsc::{Sender, UnboundedSender};
 use tracing::{info, warn};
 use xc_primitives::Block;
+
+fn decode_exact<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> Result<T> {
+    let (value, consumed) = bincode::serde::decode_from_slice(bytes, bincode::config::standard())?;
+    anyhow::ensure!(
+        consumed == bytes.len(),
+        "trailing bytes after bincode value"
+    );
+    Ok(value)
+}
 
 /// The only thing this crate needs to know about a block: where it sits in the
 /// sequence, so gossip and sync backfill can be merged into one ascending
@@ -36,6 +45,7 @@ impl<P> HasHeight for Block<P> {
 /// this cadence; we poll it on the same one, so the tip we report is never more
 /// than one interval stale.
 const STATUS_POLL_INTERVAL: Duration = Duration::from_secs(5);
+const STATUS_FRESHNESS_TIMEOUT: Duration = Duration::from_secs(15);
 
 const RECONNECT_INITIAL_BACKOFF: Duration = Duration::from_secs(1);
 const RECONNECT_MAX_BACKOFF: Duration = Duration::from_secs(30);
@@ -90,16 +100,78 @@ use xc_wire::{SyncRequest, SyncResponse};
 
 /// What the network says about itself, refreshed on every status poll.
 ///
-/// Both fields come from the node rather than being inferred here, which is the
-/// point: `tip_height` makes sync lag reportable, and `finalized_height` turns
-/// reorg safety from a configured guess into the chain's own answer.
+/// The heights come from the node rather than being inferred here. The status
+/// timestamp prevents a disconnected or stalled peer's last answer from being
+/// mistaken for current network visibility.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct NetworkView {
+    /// Peers with at least one currently open connection.
+    pub active_peer_count: usize,
+    /// Currently connected peers that have answered a status request.
+    pub status_peer_count: usize,
     /// Highest tip any connected peer reports. `None` until one answers.
     pub tip_height: Option<u64>,
     /// Highest height a peer holds a finality certificate for. `None` on a
     /// chain that doesn't run finality voting, or before any peer answers.
     pub finalized_height: Option<u64>,
+    /// Most recent status answer from a currently connected peer.
+    pub last_status_at: Option<Instant>,
+}
+
+impl NetworkView {
+    pub fn has_fresh_status(&self) -> bool {
+        self.active_peer_count > 0
+            && self.status_peer_count > 0
+            && self.tip_height.is_some()
+            && self
+                .last_status_at
+                .is_some_and(|seen| seen.elapsed() <= STATUS_FRESHNESS_TIMEOUT)
+    }
+}
+
+fn publish_network_view(
+    network_tx: &tokio::sync::watch::Sender<NetworkView>,
+    active_peers: &HashSet<PeerId>,
+    peer_tips: &HashMap<PeerId, u64>,
+    finalized_by_peer: &HashMap<PeerId, Option<u64>>,
+    status_seen_at: &HashMap<PeerId, Instant>,
+) {
+    let has_fresh_status = |peer: &PeerId| {
+        active_peers.contains(peer)
+            && status_seen_at
+                .get(peer)
+                .is_some_and(|seen_at| seen_at.elapsed() <= STATUS_FRESHNESS_TIMEOUT)
+    };
+    let next = NetworkView {
+        active_peer_count: active_peers.len(),
+        status_peer_count: peer_tips
+            .keys()
+            .filter(|peer| active_peers.contains(peer))
+            .count(),
+        tip_height: peer_tips
+            .iter()
+            .filter(|(peer, _)| has_fresh_status(peer))
+            .map(|(_, height)| *height)
+            .max(),
+        finalized_height: finalized_by_peer
+            .iter()
+            .filter(|(peer, _)| has_fresh_status(peer))
+            .filter_map(|(_, height)| *height)
+            .max(),
+        last_status_at: status_seen_at
+            .iter()
+            .filter(|(peer, _)| active_peers.contains(peer))
+            .map(|(_, seen_at)| *seen_at)
+            .max(),
+    };
+    network_tx.send_if_modified(|view| {
+        if *view == next {
+            false
+        } else {
+            *view = next;
+            true
+        }
+    });
 }
 
 #[derive(NetworkBehaviour)]
@@ -130,8 +202,15 @@ fn dial_bootnode(
 /// uses: start at `RECONNECT_INITIAL_BACKOFF`, double each consecutive
 /// failure, cap at `RECONNECT_MAX_BACKOFF`; reset on the next successful
 /// connect via `backoffs.remove` in the `ConnectionEstablished` handler).
-fn schedule_redial(redial_tx: &UnboundedSender<Multiaddr>, addr: Multiaddr, backoffs: &mut HashMap<Multiaddr, Duration>) {
-    let delay = backoffs.get(&addr).copied().unwrap_or(RECONNECT_INITIAL_BACKOFF);
+fn schedule_redial(
+    redial_tx: &UnboundedSender<Multiaddr>,
+    addr: Multiaddr,
+    backoffs: &mut HashMap<Multiaddr, Duration>,
+) {
+    let delay = backoffs
+        .get(&addr)
+        .copied()
+        .unwrap_or(RECONNECT_INITIAL_BACKOFF);
     backoffs.insert(addr.clone(), (delay * 2).min(RECONNECT_MAX_BACKOFF));
 
     let redial_tx = redial_tx.clone();
@@ -240,15 +319,25 @@ pub async fn run<B>(
 where
     B: HasHeight + serde::de::DeserializeOwned + Send + 'static,
 {
-    let Config { bootnodes, listen_port, resume_from, blocks_topic, sync_protocol, max_pending_blocks } =
-        config;
+    let Config {
+        bootnodes,
+        listen_port,
+        resume_from,
+        blocks_topic,
+        sync_protocol,
+        max_pending_blocks,
+    } = config;
     let keypair = libp2p::identity::Keypair::generate_ed25519();
     let peer_id = PeerId::from(keypair.public());
     info!("retracer p2p identity: {peer_id}");
 
     let mut swarm = libp2p::SwarmBuilder::with_existing_identity(keypair)
         .with_tokio()
-        .with_tcp(tcp::Config::default(), noise::Config::new, yamux::Config::default)?
+        .with_tcp(
+            tcp::Config::default(),
+            noise::Config::new,
+            yamux::Config::default,
+        )?
         .with_quic()
         // Lets a bootnode be given as `/dns4/host/tcp/30334/p2p/...` and not
         // only as a literal `/ip4/`. Without it such an address is not an
@@ -308,6 +397,8 @@ where
     // whether to ask for another page (mirrors `arxd/network`).
     let mut peer_tips: HashMap<PeerId, u64> = HashMap::new();
     let mut finalized_by_peer: HashMap<PeerId, Option<u64>> = HashMap::new();
+    let mut status_seen_at: HashMap<PeerId, Instant> = HashMap::new();
+    let mut active_peers: HashSet<PeerId> = HashSet::new();
     // Blocks that arrived ahead of `next_expected` (a gossiped block while a
     // gap-filling sync request is still in flight) — held here instead of
     // being forwarded immediately, so the *earlier* blocks a sync response
@@ -362,8 +453,20 @@ where
             SwarmEvent::NewListenAddr { address, .. } => {
                 info!("p2p listening on {address}");
             }
-            SwarmEvent::ConnectionEstablished { peer_id, connection_id, .. } => {
+            SwarmEvent::ConnectionEstablished {
+                peer_id,
+                connection_id,
+                ..
+            } => {
                 info!("connected to peer {peer_id}");
+                active_peers.insert(peer_id);
+                publish_network_view(
+                    &network_tx,
+                    &active_peers,
+                    &peer_tips,
+                    &finalized_by_peer,
+                    &status_seen_at,
+                );
                 if let Some(addr) = pending_dials.remove(&connection_id) {
                     backoffs.remove(&addr);
                     bootnode_peers.insert(peer_id, addr);
@@ -374,16 +477,38 @@ where
                     send_sync_request(&mut swarm, &peer_id, &SyncRequest::Status);
                 }
             }
-            SwarmEvent::OutgoingConnectionError { connection_id, error, .. } => {
+            SwarmEvent::OutgoingConnectionError {
+                connection_id,
+                error,
+                ..
+            } => {
                 if let Some(addr) = pending_dials.remove(&connection_id) {
                     warn!("failed to dial bootnode {addr}: {error}");
                     schedule_redial(&redial_tx, addr, &mut backoffs);
                 }
             }
-            SwarmEvent::ConnectionClosed { peer_id, cause, .. } => {
-                if let Some(addr) = bootnode_peers.remove(&peer_id) {
-                    warn!("lost connection to bootnode {addr} (peer {peer_id}): {cause:?}");
-                    schedule_redial(&redial_tx, addr, &mut backoffs);
+            SwarmEvent::ConnectionClosed {
+                peer_id,
+                cause,
+                num_established,
+                ..
+            } => {
+                if num_established == 0 {
+                    active_peers.remove(&peer_id);
+                    peer_tips.remove(&peer_id);
+                    finalized_by_peer.remove(&peer_id);
+                    status_seen_at.remove(&peer_id);
+                    publish_network_view(
+                        &network_tx,
+                        &active_peers,
+                        &peer_tips,
+                        &finalized_by_peer,
+                        &status_seen_at,
+                    );
+                    if let Some(addr) = bootnode_peers.remove(&peer_id) {
+                        warn!("lost connection to bootnode {addr} (peer {peer_id}): {cause:?}");
+                        schedule_redial(&redial_tx, addr, &mut backoffs);
+                    }
                 }
             }
             SwarmEvent::Behaviour(BehaviourEvent::Gossipsub(gossipsub::Event::Message {
@@ -391,11 +516,8 @@ where
                 message,
                 ..
             })) if message.topic == blocks_topic.hash() => {
-                match bincode::serde::decode_from_slice::<B, _>(
-                    &message.data,
-                    bincode::config::standard(),
-                ) {
-                    Ok((block, _)) => {
+                match decode_exact::<B>(&message.data) {
+                    Ok(block) => {
                         // A gap here means a gossiped block was dropped
                         // somewhere between it and us — ask the same peer to
                         // fill in what we're missing. The gossiped block
@@ -414,7 +536,15 @@ where
                                 &SyncRequest::Blocks { from: expected },
                             );
                         }
-                        if !insert_and_drain(block, &mut next_expected, &mut pending, &block_tx, max_pending_blocks).await {
+                        if !insert_and_drain(
+                            block,
+                            &mut next_expected,
+                            &mut pending,
+                            &block_tx,
+                            max_pending_blocks,
+                        )
+                        .await
+                        {
                             return Ok(());
                         }
                     }
@@ -428,11 +558,8 @@ where
                 message: request_response::Message::Response { response, .. },
                 ..
             })) => {
-                let sync_response: SyncResponse<B> = match bincode::serde::decode_from_slice(
-                    &response,
-                    bincode::config::standard(),
-                ) {
-                    Ok((resp, _)) => resp,
+                let sync_response: SyncResponse<B> = match decode_exact(&response) {
+                    Ok(resp) => resp,
                     Err(err) => {
                         warn!("failed to decode sync response from {peer}: {err}");
                         continue;
@@ -441,18 +568,14 @@ where
                 match sync_response {
                     SyncResponse::Status { tip_height } => {
                         peer_tips.insert(peer, tip_height);
-                        // Highest tip any peer claims. Max rather than the most
-                        // recent responder: a peer that is itself behind must
-                        // not make the network look like it stopped moving.
-                        let network_tip = peer_tips.values().copied().max();
-                        network_tx.send_if_modified(|view| {
-                            if view.tip_height != network_tip {
-                                view.tip_height = network_tip;
-                                true
-                            } else {
-                                false
-                            }
-                        });
+                        status_seen_at.insert(peer, Instant::now());
+                        publish_network_view(
+                            &network_tx,
+                            &active_peers,
+                            &peer_tips,
+                            &finalized_by_peer,
+                            &status_seen_at,
+                        );
                         let from = next_expected.unwrap_or(1);
                         if tip_height >= from {
                             send_sync_request(&mut swarm, &peer, &SyncRequest::Blocks { from });
@@ -468,21 +591,15 @@ where
                             );
                         }
                         peer_tips.insert(peer, info.tip_height);
-                        // Max across peers, same reasoning as the tip: one peer
-                        // lagging on finality must not drag the network's
-                        // reported finalized height backwards.
                         finalized_by_peer.insert(peer, info.finalized_height);
-                        let finalized = finalized_by_peer.values().copied().flatten().max();
-                        let tip = peer_tips.values().copied().max();
-                        network_tx.send_if_modified(|view| {
-                            let next = NetworkView { tip_height: tip, finalized_height: finalized };
-                            if *view != next {
-                                *view = next;
-                                true
-                            } else {
-                                false
-                            }
-                        });
+                        status_seen_at.insert(peer, Instant::now());
+                        publish_network_view(
+                            &network_tx,
+                            &active_peers,
+                            &peer_tips,
+                            &finalized_by_peer,
+                            &status_seen_at,
+                        );
                     }
                     SyncResponse::Hashes(hashes) => {
                         // Requested only by fork resolution, which this crate
@@ -494,7 +611,15 @@ where
                     SyncResponse::Blocks(mut blocks) => {
                         blocks.sort_by_key(|b| b.height());
                         for block in blocks {
-                            if !insert_and_drain(block, &mut next_expected, &mut pending, &block_tx, max_pending_blocks).await {
+                            if !insert_and_drain(
+                                block,
+                                &mut next_expected,
+                                &mut pending,
+                                &block_tx,
+                                max_pending_blocks,
+                            )
+                            .await
+                            {
                                 return Ok(());
                             }
                         }
@@ -508,11 +633,9 @@ where
                     }
                 }
             }
-            SwarmEvent::Behaviour(BehaviourEvent::Sync(request_response::Event::OutboundFailure {
-                peer,
-                error,
-                ..
-            })) => {
+            SwarmEvent::Behaviour(BehaviourEvent::Sync(
+                request_response::Event::OutboundFailure { peer, error, .. },
+            )) => {
                 warn!("sync request to {peer} failed: {error}");
             }
             _ => {}
@@ -528,7 +651,97 @@ mod tests {
     const CAP: usize = 8;
 
     fn block(height: u64) -> Block<ActionPayload> {
-        Block { height, parent_hash: String::new(), timestamp: 0, actions: vec![], proposer: None, signature: None }
+        Block {
+            height,
+            parent_hash: String::new(),
+            timestamp: 0,
+            actions: vec![],
+            proposer: None,
+            signature: None,
+            state_root: String::new(),
+        }
+    }
+
+    #[test]
+    fn status_is_fresh_only_when_it_belongs_to_an_active_peer() {
+        let mut view = NetworkView {
+            active_peer_count: 0,
+            status_peer_count: 1,
+            tip_height: Some(42),
+            finalized_height: Some(40),
+            last_status_at: Some(Instant::now()),
+        };
+        assert!(!view.has_fresh_status());
+
+        view.active_peer_count = 1;
+        assert!(view.has_fresh_status());
+    }
+
+    #[test]
+    fn stale_high_tip_cannot_borrow_another_peers_freshness() {
+        let stale_peer = PeerId::random();
+        let fresh_peer = PeerId::random();
+        let active_peers = HashSet::from([stale_peer, fresh_peer]);
+        let peer_tips = HashMap::from([(stale_peer, 100), (fresh_peer, 42)]);
+        let finalized_by_peer = HashMap::from([(stale_peer, Some(99)), (fresh_peer, Some(40))]);
+        let status_seen_at = HashMap::from([
+            (
+                stale_peer,
+                Instant::now() - STATUS_FRESHNESS_TIMEOUT - Duration::from_secs(1),
+            ),
+            (fresh_peer, Instant::now()),
+        ]);
+        let (network_tx, network_rx) = tokio::sync::watch::channel(NetworkView::default());
+
+        publish_network_view(
+            &network_tx,
+            &active_peers,
+            &peer_tips,
+            &finalized_by_peer,
+            &status_seen_at,
+        );
+
+        let view = *network_rx.borrow();
+        assert!(view.has_fresh_status());
+        assert_eq!(view.tip_height, Some(42));
+        assert_eq!(view.finalized_height, Some(40));
+    }
+
+    /// Produced from the sibling Arxium checkout at exact commit
+    /// d88b9199a416a438e14ff4430d05970f8323e4ba with
+    /// `node::payload::ActionPayload` and bincode's standard config. The fixture
+    /// is a full block containing JoinValidator and a nonempty state root, so it
+    /// catches drift in the actual type Retracer decodes from gossip and sync.
+    #[test]
+    fn decodes_arxium_join_validator_block_fixture() {
+        let bytes = include_bytes!("arxium_join_validator_block.bin");
+
+        let block: Block<ActionPayload> = decode_exact(bytes).expect("Arxium fixture must decode");
+        assert_eq!(block.height, 42);
+        assert_eq!(
+            block.state_root,
+            "0xfixture-state-root-d88b9199a416a438e14ff4430d05970f8323e4ba"
+        );
+        assert_eq!(block.actions.len(), 1);
+        match &block.actions[0].payload {
+            ActionPayload::JoinValidator {
+                stake, bls_pubkey, ..
+            } => {
+                assert_eq!(*stake, 123_456_789_012_345_678_901);
+                assert_eq!(bls_pubkey, &(0u8..48).collect::<Vec<_>>());
+            }
+            other => panic!("expected JoinValidator, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn exact_decoder_rejects_trailing_and_incomplete_bytes() {
+        let encoded = bincode::serde::encode_to_vec(block(7), bincode::config::standard()).unwrap();
+
+        let mut trailing = encoded.clone();
+        trailing.push(0);
+        assert!(decode_exact::<Block<ActionPayload>>(&trailing).is_err());
+        assert!(decode_exact::<Block<ActionPayload>>(&encoded[..encoded.len() - 1]).is_err());
     }
 
     /// Reproduces the gap-fill race this fix closes: a gossiped block
@@ -550,7 +763,11 @@ mod tests {
         // The sync response backfilling the gap arrives afterward.
         assert!(insert_and_drain(block(1), &mut next_expected, &mut pending, &tx, CAP).await);
         assert!(insert_and_drain(block(2), &mut next_expected, &mut pending, &tx, CAP).await);
-        assert_eq!(next_expected, Some(4), "draining the gap should also release the buffered block 3");
+        assert_eq!(
+            next_expected,
+            Some(4),
+            "draining the gap should also release the buffered block 3"
+        );
 
         let mut heights = vec![];
         while let Ok(b) = rx.try_recv() {
@@ -567,8 +784,14 @@ mod tests {
 
         assert!(insert_and_drain(block(3), &mut next_expected, &mut pending, &tx, CAP).await);
 
-        assert!(rx.try_recv().is_err(), "a block below next_expected must not be forwarded");
-        assert!(pending.is_empty(), "a stale block must not be buffered either");
+        assert!(
+            rx.try_recv().is_err(),
+            "a block below next_expected must not be forwarded"
+        );
+        assert!(
+            pending.is_empty(),
+            "a stale block must not be buffered either"
+        );
     }
 
     /// A stalled/lying gap-fill peer means `expected` never arrives; without
@@ -580,7 +803,9 @@ mod tests {
         let mut pending = BTreeMap::new();
 
         for height in 2..2 + CAP as u64 + 10 {
-            assert!(insert_and_drain(block(height), &mut next_expected, &mut pending, &tx, CAP).await);
+            assert!(
+                insert_and_drain(block(height), &mut next_expected, &mut pending, &tx, CAP).await
+            );
         }
 
         assert_eq!(pending.len(), CAP, "buffer must not grow past the cap");

@@ -146,14 +146,16 @@ pub async fn list_blocks(
 
     Ok(rows
         .into_iter()
-        .map(|(height, hash, parent_hash, timestamp, proposer, action_count)| BlockSummary {
-            height,
-            hash,
-            parent_hash,
-            timestamp,
-            proposer,
-            action_count,
-        })
+        .map(
+            |(height, hash, parent_hash, timestamp, proposer, action_count)| BlockSummary {
+                height,
+                hash,
+                parent_hash,
+                timestamp,
+                proposer,
+                action_count,
+            },
+        )
         .collect())
 }
 
@@ -200,11 +202,10 @@ pub async fn list_actions(
 /// wrong in any way a reader could perceive, and holding a snapshot open for a
 /// dashboard would be a real cost for an imaginary gain.
 pub async fn get_stats(pool: &PgPool, chain_id: &str) -> Result<Stats> {
-    let (total_blocks,): (i64,) =
-        sqlx::query_as("SELECT COUNT(*) FROM blocks WHERE chain_id = $1")
-            .bind(chain_id)
-            .fetch_one(pool)
-            .await?;
+    let (total_blocks,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM blocks WHERE chain_id = $1")
+        .bind(chain_id)
+        .fetch_one(pool)
+        .await?;
 
     let (total_actions,): (i64,) =
         sqlx::query_as("SELECT COUNT(*) FROM actions WHERE chain_id = $1")
@@ -261,7 +262,13 @@ pub async fn get_stats(pool: &PgPool, chain_id: &str) -> Result<Stats> {
         _ => 0.0,
     };
 
-    Ok(Stats { total_blocks, total_actions, total_accounts, actions_24h, avg_block_time_secs })
+    Ok(Stats {
+        total_blocks,
+        total_actions,
+        total_accounts,
+        actions_24h,
+        avg_block_time_secs,
+    })
 }
 
 #[derive(Debug, Clone, Copy, serde::Serialize)]
@@ -299,12 +306,14 @@ pub async fn list_proposers(pool: &PgPool, chain_id: &str) -> Result<Vec<Propose
 
     Ok(rows
         .into_iter()
-        .map(|(address, blocks_proposed, first_height, last_height)| ProposerRow {
-            address,
-            blocks_proposed,
-            first_proposed_height: first_height,
-            last_proposed_height: last_height,
-        })
+        .map(
+            |(address, blocks_proposed, first_height, last_height)| ProposerRow {
+                address,
+                blocks_proposed,
+                first_proposed_height: first_height,
+                last_proposed_height: last_height,
+            },
+        )
         .collect())
 }
 
@@ -413,9 +422,10 @@ pub async fn create_projection_indexes(pool: &PgPool, schema: &KindSchema) -> Re
             accessor = projection.json_accessor(),
             cast = projection.ty.sql_cast(),
         );
-        sqlx::query(&sql).execute(pool).await.with_context(|| {
-            format!("creating projection index for kind {:?}", projection.kind)
-        })?;
+        sqlx::query(&sql)
+            .execute(pool)
+            .await
+            .with_context(|| format!("creating projection index for kind {:?}", projection.kind))?;
         tracing::info!(
             kind = %projection.kind,
             path = %projection.segments.join("."),
@@ -482,7 +492,11 @@ pub async fn rollback_to(pool: &PgPool, chain_id: &str, height: i64) -> Result<u
         "DELETE FROM account_actions WHERE chain_id = $1 AND block_height > $2",
         "DELETE FROM actions WHERE chain_id = $1 AND block_height > $2",
     ] {
-        sqlx::query(sql).bind(chain_id).bind(height).execute(&mut *tx).await?;
+        sqlx::query(sql)
+            .bind(chain_id)
+            .bind(height)
+            .execute(&mut *tx)
+            .await?;
     }
 
     let blocks_removed = sqlx::query("DELETE FROM blocks WHERE chain_id = $1 AND height > $2")
@@ -613,7 +627,13 @@ pub async fn insert_block<B: IndexableBlock>(
     block: &B,
     address_extractor: &AddressExtractor,
 ) -> Result<()> {
-    insert_blocks(pool, chain_id, std::slice::from_ref(block), address_extractor).await
+    insert_blocks(
+        pool,
+        chain_id,
+        std::slice::from_ref(block),
+        address_extractor,
+    )
+    .await
 }
 
 /// Several blocks in a single transaction — the catch-up entry point.
@@ -789,7 +809,9 @@ pub fn block_row_from_wire<B: IndexableBlock>(block: &B) -> Result<BlockRow> {
         .map(|(index, action)| -> Result<ActionRow> {
             let (kind, payload) = split_kind(action.payload_json()?);
             Ok(ActionRow {
-                action_hash: action.identity().unwrap_or_else(|| format!("{height}:{index}")),
+                action_hash: action
+                    .identity()
+                    .unwrap_or_else(|| format!("{height}:{index}")),
                 block_height: height,
                 index_in_block: index as i32,
                 kind,
@@ -1039,19 +1061,24 @@ pub async fn get_blocks_in_range(
     let mut by_height: std::collections::HashMap<i64, Vec<ActionRow>> =
         std::collections::HashMap::new();
     for action in actions {
-        by_height.entry(action.block_height).or_default().push(action);
+        by_height
+            .entry(action.block_height)
+            .or_default()
+            .push(action);
     }
 
     Ok(rows
         .into_iter()
-        .map(|(height, hash, parent_hash, timestamp, proposer)| BlockRow {
-            actions: by_height.remove(&height).unwrap_or_default(),
-            height,
-            hash,
-            parent_hash,
-            timestamp,
-            proposer,
-        })
+        .map(
+            |(height, hash, parent_hash, timestamp, proposer)| BlockRow {
+                actions: by_height.remove(&height).unwrap_or_default(),
+                height,
+                hash,
+                parent_hash,
+                timestamp,
+                proposer,
+            },
+        )
         .collect())
 }
 
@@ -1121,6 +1148,7 @@ mod tests {
             actions,
             proposer: None,
             signature: None,
+            state_root: String::new(),
         }
     }
 
@@ -1136,7 +1164,10 @@ mod tests {
 
         let hashes: Vec<&str> = row.actions.iter().map(|a| a.action_hash.as_str()).collect();
         assert_eq!(hashes, vec!["9:0", "9:1", "9:2"]);
-        assert!(!hashes.iter().any(|h| h.is_empty()), "no action may key on an empty identity");
+        assert!(
+            !hashes.iter().any(|h| h.is_empty()),
+            "no action may key on an empty identity"
+        );
     }
 
     /// An empty-string signature is an absent one, not an identity — otherwise
@@ -1192,7 +1223,11 @@ mod tests {
         .with_network_tip(Some(7));
 
         assert_eq!(status.blocks_behind, Some(0));
-        assert_eq!(status.node_tip_height, Some(7), "the tip itself is still reported honestly");
+        assert_eq!(
+            status.node_tip_height,
+            Some(7),
+            "the tip itself is still reported honestly"
+        );
     }
 
     /// Nothing indexed but a known tip means every block including genesis is
@@ -1233,7 +1268,11 @@ mod tests {
         let w = BlockWrites::build(&block, 9, &extractor).expect("payload serializes");
 
         assert_eq!(w.action_hash, vec!["aa", "9:1", "cc"]);
-        assert_eq!(w.index_in_block, vec![0, 1, 2], "position must follow source order");
+        assert_eq!(
+            w.index_in_block,
+            vec![0, 1, 2],
+            "position must follow source order"
+        );
         let n = w.action_hash.len();
         for (label, len) in [
             ("index_in_block", w.index_in_block.len()),
@@ -1265,8 +1304,7 @@ mod tests {
             }
         }
 
-        let extractor =
-            AddressExtractor::new(KindSchema::empty(), vec![Box::new(TwoRecipients)]);
+        let extractor = AddressExtractor::new(KindSchema::empty(), vec![Box::new(TwoRecipients)]);
         let block = block_with(vec![action(Some("aa")), action(None)]);
 
         let w = BlockWrites::build(&block, 9, &extractor).expect("payload serializes");
@@ -1288,6 +1326,10 @@ mod tests {
         let w = BlockWrites::build(&block, 9, &extractor).expect("payload serializes");
 
         assert!(w.addr_action_hash.is_empty());
-        assert_eq!(w.action_hash, vec!["9:0", "bb"], "action rows are unaffected");
+        assert_eq!(
+            w.action_hash,
+            vec!["9:0", "bb"],
+            "action rows are unaffected"
+        );
     }
 }

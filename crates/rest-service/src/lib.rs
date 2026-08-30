@@ -22,9 +22,30 @@ use futures::stream::{self, StreamExt};
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 use std::collections::{HashMap, HashSet};
+use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 use storage::AddressValidator;
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct NodeRpcToken(String);
+
+impl NodeRpcToken {
+    pub fn new(token: String) -> anyhow::Result<Self> {
+        anyhow::ensure!(!token.is_empty(), "node RPC token must not be empty");
+        Ok(Self(token))
+    }
+
+    fn expose(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for NodeRpcToken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("NodeRpcToken([REDACTED])")
+    }
+}
 
 /// Same cap the gRPC surface and the node's own RPC use. Kept identical on
 /// purpose: two surfaces over one dataset disagreeing about page size is a
@@ -39,6 +60,7 @@ const MAX_PAGE_SIZE: i64 = 100;
 const MAX_UPTIME_RANGE: u64 = 5_000;
 const MAX_UPTIME_CONCURRENCY: usize = 16;
 const NODE_RPC_TIMEOUT: Duration = Duration::from_secs(5);
+const READINESS_DB_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// What the REST layer needs to know about a chain. A subset of
 /// `grpc_service::ChainRuntime` — no broadcast channel, because this surface
@@ -56,6 +78,9 @@ pub struct RestChain {
     /// — used only by [`get_validator_uptime`]. `None` disables that route
     /// with a 400 rather than guessing an address.
     pub node_rpc_url: Option<String>,
+    /// Optional bearer credential sent on every HTTP request to this chain's
+    /// node RPC. Kept separate per chain because chains can use different nodes.
+    pub node_rpc_token: Option<NodeRpcToken>,
 }
 
 #[derive(Clone)]
@@ -77,7 +102,11 @@ impl AppState {
                 "unknown chain {chain_id:?}; GET /v1/chains lists the ones this indexer serves"
             )));
         }
-        Ok(self.chains.iter().find(|c| c.chain_id == chain_id).expect("membership just checked"))
+        Ok(self
+            .chains
+            .iter()
+            .find(|c| c.chain_id == chain_id)
+            .expect("membership just checked"))
     }
 }
 
@@ -87,7 +116,12 @@ pub fn router(pool: PgPool, chains: Vec<RestChain>) -> Router {
         .timeout(NODE_RPC_TIMEOUT)
         .build()
         .expect("reqwest client with only a timeout set never fails to build");
-    let state = AppState { pool, chains: Arc::new(chains), known: Arc::new(known), http };
+    let state = AppState {
+        pool,
+        chains: Arc::new(chains),
+        known: Arc::new(known),
+        http,
+    };
 
     Router::new()
         .route("/v1/chains", get(list_chains))
@@ -96,12 +130,22 @@ pub fn router(pool: PgPool, chains: Vec<RestChain>) -> Router {
         .route("/v1/chains/{chain_id}/blocks", get(list_blocks))
         .route("/v1/chains/{chain_id}/blocks/{height}", get(get_block))
         .route("/v1/chains/{chain_id}/actions", get(list_actions))
-        .route("/v1/chains/{chain_id}/actions/{action_hash}", get(get_action))
-        .route("/v1/chains/{chain_id}/accounts/{address}/actions", get(get_account_actions))
+        .route(
+            "/v1/chains/{chain_id}/actions/{action_hash}",
+            get(get_action),
+        )
+        .route(
+            "/v1/chains/{chain_id}/accounts/{address}/actions",
+            get(get_account_actions),
+        )
         .route("/v1/chains/{chain_id}/proposers", get(list_proposers))
-        .route("/v1/chains/{chain_id}/validators/uptime", get(get_validator_uptime))
+        .route(
+            "/v1/chains/{chain_id}/validators/uptime",
+            get(get_validator_uptime),
+        )
         .route("/v1/chains/{chain_id}/search", get(search))
         .route("/health", get(health))
+        .route("/ready", get(readiness))
         .with_state(state)
 }
 
@@ -134,7 +178,10 @@ impl IntoResponse for ApiError {
             // broke here" but not on our query text.
             ApiError::Internal(err) => {
                 tracing::error!("rest request failed: {err:#}");
-                (StatusCode::INTERNAL_SERVER_ERROR, "internal error".to_string())
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "internal error".to_string(),
+                )
             }
         };
         (status, Json(ErrorBody { error: message })).into_response()
@@ -147,6 +194,128 @@ type ApiResult<T> = Result<Json<T>, ApiError>;
 
 async fn health() -> &'static str {
     "ok"
+}
+
+#[derive(Debug, Serialize)]
+struct ChainReadiness {
+    chain_id: String,
+    network_visible: bool,
+    network_fresh: bool,
+    node_tip_height: Option<u64>,
+    indexed_height: Option<i64>,
+    caught_up: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct Readiness {
+    ready: bool,
+    postgres: bool,
+    chains: Vec<ChainReadiness>,
+}
+
+fn readiness_report(
+    postgres: bool,
+    chains: &[RestChain],
+    statuses: &HashMap<String, storage::IndexStatus>,
+) -> Readiness {
+    let chains: Vec<_> = chains
+        .iter()
+        .map(|chain| {
+            let network = *chain.network_view.borrow();
+            let network_fresh = network.has_fresh_status();
+            let fresh_tip = if network_fresh {
+                network.tip_height
+            } else {
+                None
+            };
+            let status = statuses
+                .get(&chain.chain_id)
+                .copied()
+                .map(|status| status.with_network_tip(fresh_tip));
+            ChainReadiness {
+                chain_id: chain.chain_id.clone(),
+                network_visible: network.tip_height.is_some(),
+                network_fresh,
+                node_tip_height: network.tip_height,
+                indexed_height: status.and_then(|status| status.indexed_height),
+                caught_up: network_fresh
+                    && status.is_some_and(|status| {
+                        status.indexed_height.is_some()
+                            && status.indexed_height == status.node_tip_height
+                    }),
+            }
+        })
+        .collect();
+    let ready = postgres
+        && chains
+            .iter()
+            .all(|chain| chain.network_fresh && chain.caught_up);
+    Readiness {
+        ready,
+        postgres,
+        chains,
+    }
+}
+
+enum DbCheck<T> {
+    Ready(T),
+    Failed(anyhow::Error),
+    TimedOut,
+}
+
+async fn bounded_db_check<T>(
+    timeout: Duration,
+    check: impl Future<Output = anyhow::Result<T>>,
+) -> DbCheck<T> {
+    match tokio::time::timeout(timeout, check).await {
+        Ok(Ok(value)) => DbCheck::Ready(value),
+        Ok(Err(error)) => DbCheck::Failed(error),
+        Err(_) => DbCheck::TimedOut,
+    }
+}
+
+async fn load_index_statuses(
+    pool: &PgPool,
+    chains: &[RestChain],
+) -> anyhow::Result<HashMap<String, storage::IndexStatus>> {
+    sqlx::query("SELECT 1").execute(pool).await?;
+    let mut statuses = HashMap::with_capacity(chains.len());
+    for chain in chains {
+        statuses.insert(
+            chain.chain_id.clone(),
+            storage::get_status(pool, &chain.chain_id).await?,
+        );
+    }
+    Ok(statuses)
+}
+
+async fn readiness(State(state): State<AppState>) -> Response {
+    let report = match bounded_db_check(
+        READINESS_DB_TIMEOUT,
+        load_index_statuses(&state.pool, &state.chains),
+    )
+    .await
+    {
+        DbCheck::Ready(statuses) => readiness_report(true, &state.chains, &statuses),
+        DbCheck::Failed(error) => {
+            tracing::error!("readiness database check failed: {error:#}");
+            readiness_report(false, &state.chains, &HashMap::new())
+        }
+        DbCheck::TimedOut => {
+            tracing::warn!("readiness database check timed out");
+            readiness_report(false, &state.chains, &HashMap::new())
+        }
+    };
+    let status = readiness_status(&report);
+    (status, Json(report)).into_response()
+}
+
+fn readiness_status(report: &Readiness) -> StatusCode {
+    if report.ready {
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    }
 }
 
 #[derive(Serialize)]
@@ -207,7 +376,9 @@ async fn list_blocks(
 ) -> ApiResult<Vec<storage::BlockSummary>> {
     state.chain(&chain_id)?;
     let limit = clamp_limit(page.limit)?;
-    Ok(Json(storage::list_blocks(&state.pool, &chain_id, limit, page.before).await?))
+    Ok(Json(
+        storage::list_blocks(&state.pool, &chain_id, limit, page.before).await?,
+    ))
 }
 
 /// `{height}` accepts a height or a block hash, the same either/or the gRPC
@@ -223,7 +394,8 @@ async fn get_block(
         Ok(h) => storage::get_block_by_height(&state.pool, &chain_id, h).await?,
         Err(_) => storage::get_block_by_hash(&state.pool, &chain_id, &height).await?,
     };
-    row.map(Json).ok_or_else(|| ApiError::NotFound("block not found".into()))
+    row.map(Json)
+        .ok_or_else(|| ApiError::NotFound("block not found".into()))
 }
 
 #[derive(Deserialize)]
@@ -256,7 +428,9 @@ async fn list_actions(
 ) -> ApiResult<Vec<storage::ActionRow>> {
     state.chain(&chain_id)?;
     let limit = clamp_limit(page.limit)?;
-    Ok(Json(storage::list_actions(&state.pool, &chain_id, limit, page.cursor()?).await?))
+    Ok(Json(
+        storage::list_actions(&state.pool, &chain_id, limit, page.cursor()?).await?,
+    ))
 }
 
 async fn get_action(
@@ -279,7 +453,9 @@ async fn get_account_actions(
     if let Some(valid) = &chain.address_validator
         && !valid(&address)
     {
-        return Err(ApiError::BadRequest("not a valid address for this chain".into()));
+        return Err(ApiError::BadRequest(
+            "not a valid address for this chain".into(),
+        ));
     }
     let limit = clamp_limit(page.limit)?;
     Ok(Json(
@@ -349,22 +525,34 @@ async fn get_validator_uptime(
             "chain {chain_id:?} has no node RPC URL configured; validator uptime is unavailable"
         )));
     };
+    let node_rpc_token = chain.node_rpc_token.clone();
     if query.from > query.to {
         return Err(ApiError::BadRequest("from must be <= to".to_string()));
     }
     if query.to - query.from + 1 > MAX_UPTIME_RANGE {
-        return Err(ApiError::BadRequest(format!("range too large; at most {MAX_UPTIME_RANGE} heights per request")));
+        return Err(ApiError::BadRequest(format!(
+            "range too large; at most {MAX_UPTIME_RANGE} heights per request"
+        )));
     }
 
-    let proposed = storage::count_proposers_in_range(&state.pool, &chain_id, query.from as i64, query.to as i64).await?;
+    let proposed = storage::count_proposers_in_range(
+        &state.pool,
+        &chain_id,
+        query.from as i64,
+        query.to as i64,
+    )
+    .await?;
 
     let http = state.http.clone();
     let sets: Vec<anyhow::Result<(u64, Vec<String>)>> = stream::iter(query.from..=query.to)
         .map(|height| {
             let http = http.clone();
             let node_rpc_url = node_rpc_url.clone();
+            let node_rpc_token = node_rpc_token.clone();
             async move {
-                let mut set = fetch_validator_set(&http, &node_rpc_url, height).await?;
+                let mut set =
+                    fetch_validator_set(&http, &node_rpc_url, node_rpc_token.as_ref(), height)
+                        .await?;
                 set.sort();
                 Ok((height, set))
             }
@@ -394,26 +582,46 @@ fn primary_designee(sorted_validators: &[String], height: u64) -> Option<&str> {
     Some(sorted_validators[(height as usize) % sorted_validators.len()].as_str())
 }
 
-fn compute_uptime(owed: HashMap<String, u64>, proposed: HashMap<String, i64>) -> Vec<ValidatorUptime> {
+fn compute_uptime(
+    owed: HashMap<String, u64>,
+    proposed: HashMap<String, i64>,
+) -> Vec<ValidatorUptime> {
     let mut rows: Vec<ValidatorUptime> = owed
         .into_iter()
         .map(|(address, turns_owed)| {
             let turns_proposed = proposed.get(&address).copied().unwrap_or(0);
             let uptime = (turns_owed > 0).then(|| turns_proposed as f64 / turns_owed as f64);
-            ValidatorUptime { address, turns_owed, turns_proposed, uptime }
+            ValidatorUptime {
+                address,
+                turns_owed,
+                turns_proposed,
+                uptime,
+            }
         })
         .collect();
     rows.sort_by(|a, b| a.address.cmp(&b.address));
     rows
 }
 
-async fn fetch_validator_set(http: &reqwest::Client, node_rpc_url: &str, height: u64) -> anyhow::Result<Vec<String>> {
+async fn fetch_validator_set(
+    http: &reqwest::Client,
+    node_rpc_url: &str,
+    token: Option<&NodeRpcToken>,
+    height: u64,
+) -> anyhow::Result<Vec<String>> {
     let url = format!("{node_rpc_url}/validators?height={height}");
-    let response = http.get(&url).send().await.with_context(|| format!("GET {url}"))?;
+    let mut request = http.get(&url);
+    if let Some(token) = token {
+        request = request.bearer_auth(token.expose());
+    }
+    let response = request.send().await.with_context(|| format!("GET {url}"))?;
     if !response.status().is_success() {
         anyhow::bail!("GET {url} returned {}", response.status());
     }
-    response.json().await.with_context(|| format!("decoding response body from {url}"))
+    response
+        .json()
+        .await
+        .with_context(|| format!("decoding response body from {url}"))
 }
 
 #[derive(Deserialize)]
@@ -446,16 +654,25 @@ async fn search(
     {
         return Ok(Json(SearchHit::BlockHeight { height }));
     }
-    if chain.address_validator.as_ref().is_some_and(|valid| valid(&q)) {
+    if chain
+        .address_validator
+        .as_ref()
+        .is_some_and(|valid| valid(&q))
+    {
         return Ok(Json(SearchHit::AccountAddress { address: q }));
     }
     if let Some(height) = storage::block_height_by_hash(&state.pool, &chain_id, &q).await? {
         return Ok(Json(SearchHit::BlockHeight { height }));
     }
-    if storage::get_action_by_hash(&state.pool, &chain_id, &q).await?.is_some() {
+    if storage::get_action_by_hash(&state.pool, &chain_id, &q)
+        .await?
+        .is_some()
+    {
         return Ok(Json(SearchHit::ActionHash { action_hash: q }));
     }
-    Err(ApiError::NotFound("no block, account, or action matches".into()))
+    Err(ApiError::NotFound(
+        "no block, account, or action matches".into(),
+    ))
 }
 
 /// Absent means the default page; zero or negative is a caller mistake worth
@@ -464,9 +681,9 @@ async fn search(
 fn clamp_limit(limit: Option<i64>) -> Result<i64, ApiError> {
     match limit {
         None => Ok(MAX_PAGE_SIZE),
-        Some(n) if n <= 0 => {
-            Err(ApiError::BadRequest("limit must be greater than zero".into()))
-        }
+        Some(n) if n <= 0 => Err(ApiError::BadRequest(
+            "limit must be greater than zero".into(),
+        )),
         Some(n) => Ok(n.min(MAX_PAGE_SIZE)),
     }
 }
@@ -474,12 +691,87 @@ fn clamp_limit(limit: Option<i64>) -> Result<i64, ApiError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::convert::Infallible;
+    use std::future::pending;
+    use std::time::Instant;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    fn rest_chain(network_view: ingestion::NetworkView) -> RestChain {
+        let (_, network_view) = tokio::sync::watch::channel(network_view);
+        RestChain {
+            chain_id: "test-chain".into(),
+            display_name: None,
+            blocks_topic: "blocks".into(),
+            sync_protocol: "sync".into(),
+            finality_depth: 0,
+            address_validator: None,
+            network_view,
+            node_rpc_url: None,
+            node_rpc_token: None,
+        }
+    }
+
+    fn fresh_network(tip_height: u64) -> ingestion::NetworkView {
+        ingestion::NetworkView {
+            active_peer_count: 1,
+            status_peer_count: 1,
+            tip_height: Some(tip_height),
+            finalized_height: None,
+            last_status_at: Some(Instant::now()),
+        }
+    }
+
+    fn index_status(indexed_height: Option<i64>) -> storage::IndexStatus {
+        storage::IndexStatus {
+            indexed_height,
+            tip_timestamp: indexed_height.map(|_| 1),
+            node_tip_height: None,
+            blocks_behind: None,
+        }
+    }
+
+    fn statuses(indexed_height: Option<i64>) -> HashMap<String, storage::IndexStatus> {
+        HashMap::from([("test-chain".into(), index_status(indexed_height))])
+    }
+
+    async fn mock_validator_server() -> (String, tokio::sync::oneshot::Receiver<String>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (request_tx, request_rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut chunk = [0u8; 1024];
+            loop {
+                let read = stream.read(&mut chunk).await.unwrap();
+                if read == 0 {
+                    break;
+                }
+                request.extend_from_slice(&chunk[..read]);
+                if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let _ = request_tx.send(String::from_utf8(request).unwrap());
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 8\r\nconnection: close\r\n\r\n[\"arx1\"]",
+                )
+                .await
+                .unwrap();
+        });
+        (format!("http://{address}"), request_rx)
+    }
 
     #[test]
     fn limit_defaults_and_caps_but_rejects_nonsense() {
         assert_eq!(clamp_limit(None).ok(), Some(MAX_PAGE_SIZE));
         assert_eq!(clamp_limit(Some(10)).ok(), Some(10));
-        assert_eq!(clamp_limit(Some(10_000)).ok(), Some(MAX_PAGE_SIZE), "must cap, not trust");
+        assert_eq!(
+            clamp_limit(Some(10_000)).ok(),
+            Some(MAX_PAGE_SIZE),
+            "must cap, not trust"
+        );
         assert!(clamp_limit(Some(0)).is_err());
         assert!(clamp_limit(Some(-1)).is_err());
     }
@@ -494,21 +786,33 @@ mod tests {
         };
         assert_eq!(both.cursor().ok().flatten(), Some((5, 2)));
 
-        let neither =
-            ActionPage { limit: None, before_height: None, before_index: None, role: None };
+        let neither = ActionPage {
+            limit: None,
+            before_height: None,
+            before_index: None,
+            role: None,
+        };
         assert_eq!(neither.cursor().ok().flatten(), None);
 
         // Half a cursor must be refused, not completed with a guess — guessing
         // either drops or repeats the boundary block's actions, and both look
         // like ordinary output to the caller.
-        let half =
-            ActionPage { limit: None, before_height: Some(5), before_index: None, role: None };
+        let half = ActionPage {
+            limit: None,
+            before_height: Some(5),
+            before_index: None,
+            role: None,
+        };
         assert!(half.cursor().is_err());
     }
 
     #[test]
     fn primary_designee_rotates_lexicographically_by_height_modulo_set_size() {
-        let validators = vec!["arx1b".to_string(), "arx1a".to_string(), "arx1c".to_string()];
+        let validators = vec![
+            "arx1b".to_string(),
+            "arx1a".to_string(),
+            "arx1c".to_string(),
+        ];
         // Sorted order is a, b, c regardless of input order — matches the
         // node's own `sorted.sort()` before indexing by `height % len`.
         let mut sorted = validators.clone();
@@ -534,7 +838,130 @@ mod tests {
 
         assert_eq!(rows[1].address, "b");
         assert_eq!(rows[1].turns_owed, 2);
-        assert_eq!(rows[1].turns_proposed, 0, "no proposed-count row means zero, not missing");
+        assert_eq!(
+            rows[1].turns_proposed, 0,
+            "no proposed-count row means zero, not missing"
+        );
         assert_eq!(rows[1].uptime, Some(0.0));
+    }
+
+    #[test]
+    fn readiness_rejects_a_chain_that_never_connected() {
+        let chain = rest_chain(ingestion::NetworkView::default());
+        let report = readiness_report(true, &[chain], &statuses(Some(0)));
+
+        assert!(!report.ready);
+        assert!(!report.chains[0].network_visible);
+        assert!(!report.chains[0].network_fresh);
+    }
+
+    #[test]
+    fn readiness_rejects_disconnected_or_stale_status() {
+        let disconnected = rest_chain(ingestion::NetworkView::default());
+        let disconnected_report = readiness_report(true, &[disconnected], &statuses(Some(4)));
+        assert!(!disconnected_report.ready);
+
+        let stale = rest_chain(ingestion::NetworkView {
+            active_peer_count: 1,
+            status_peer_count: 1,
+            tip_height: Some(4),
+            finalized_height: Some(3),
+            last_status_at: Some(Instant::now() - Duration::from_secs(60)),
+        });
+        let stale_report = readiness_report(true, &[stale], &statuses(Some(4)));
+        assert!(!stale_report.ready);
+        assert!(stale_report.chains[0].network_visible);
+        assert!(!stale_report.chains[0].network_fresh);
+        assert!(!stale_report.chains[0].caught_up);
+    }
+
+    #[test]
+    fn readiness_rejects_no_indexed_data_and_lag() {
+        let empty = rest_chain(fresh_network(4));
+        let empty_report = readiness_report(true, &[empty], &statuses(None));
+        assert!(!empty_report.ready);
+        assert_eq!(empty_report.chains[0].indexed_height, None);
+
+        let lagging = rest_chain(fresh_network(4));
+        let lagging_report = readiness_report(true, &[lagging], &statuses(Some(3)));
+        assert!(!lagging_report.ready);
+        assert!(!lagging_report.chains[0].caught_up);
+
+        let ahead = rest_chain(fresh_network(4));
+        let ahead_report = readiness_report(true, &[ahead], &statuses(Some(5)));
+        assert!(!ahead_report.ready);
+        assert!(!ahead_report.chains[0].caught_up);
+    }
+
+    #[test]
+    fn readiness_accepts_only_a_caught_up_chain_with_postgres() {
+        let chain = rest_chain(fresh_network(4));
+        let ready = readiness_report(true, &[chain], &statuses(Some(4)));
+        assert!(ready.ready);
+        assert!(ready.chains[0].caught_up);
+        assert_eq!(readiness_status(&ready), StatusCode::OK);
+
+        let chain = rest_chain(fresh_network(4));
+        let database_down = readiness_report(false, &[chain], &statuses(Some(4)));
+        assert!(!database_down.ready);
+        assert_eq!(
+            readiness_status(&database_down),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+    }
+
+    #[tokio::test]
+    async fn bounded_database_check_reports_success_failure_and_timeout() {
+        assert!(matches!(
+            bounded_db_check(Duration::from_secs(1), async { Ok::<_, anyhow::Error>(7) }).await,
+            DbCheck::Ready(7)
+        ));
+        assert!(matches!(
+            bounded_db_check(Duration::from_secs(1), async {
+                Err::<(), _>(anyhow::anyhow!("database unavailable"))
+            })
+            .await,
+            DbCheck::Failed(_)
+        ));
+        assert!(matches!(
+            bounded_db_check(
+                Duration::from_millis(1),
+                pending::<std::result::Result<Infallible, anyhow::Error>>()
+            )
+            .await,
+            DbCheck::TimedOut
+        ));
+    }
+
+    #[test]
+    fn node_rpc_token_debug_is_redacted() {
+        let token = NodeRpcToken::new("do-not-print-me".into()).unwrap();
+        let debug = format!("{token:?}");
+        assert!(debug.contains("REDACTED"));
+        assert!(!debug.contains("do-not-print-me"));
+    }
+
+    #[tokio::test]
+    async fn node_rpc_sends_bearer_header_when_configured() {
+        let (base_url, request) = mock_validator_server().await;
+        let token = NodeRpcToken::new("node-secret".into()).unwrap();
+        let validators = fetch_validator_set(&reqwest::Client::new(), &base_url, Some(&token), 7)
+            .await
+            .unwrap();
+
+        assert_eq!(validators, vec!["arx1"]);
+        let request = request.await.unwrap().to_ascii_lowercase();
+        assert!(request.contains("authorization: bearer node-secret\r\n"));
+    }
+
+    #[tokio::test]
+    async fn node_rpc_omits_bearer_header_when_unset() {
+        let (base_url, request) = mock_validator_server().await;
+        fetch_validator_set(&reqwest::Client::new(), &base_url, None, 7)
+            .await
+            .unwrap();
+
+        let request = request.await.unwrap().to_ascii_lowercase();
+        assert!(!request.contains("authorization:"));
     }
 }

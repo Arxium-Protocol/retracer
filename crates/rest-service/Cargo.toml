@@ -18,3 +18,6 @@ axum = "0.8"
 # category of call ArxPlusApi's NodeProxy already makes, not a privileged one.
 reqwest = { workspace = true }
 futures = "0.3"
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["io-util", "net"] }

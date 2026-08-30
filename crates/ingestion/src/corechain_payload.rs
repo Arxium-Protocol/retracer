@@ -11,14 +11,39 @@ pub fn is_corechain_address(candidate: &str) -> bool {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum ActionPayload {
-    Transfer { to: Address, amount: u128 },
-    JoinValidator { validator: Address, stake: u128 },
-    LeaveValidator { validator: Address },
-    Stake { validator: Address, amount: u128 },
-    Unstake { validator: Address, amount: u128 },
-    SubmitEquivocationEvidence { block_a: Box<Block<ActionPayload>>, block_b: Box<Block<ActionPayload>> },
-    RegisterBlsKey { validator: Address, pubkey: Vec<u8> },
-    VerifyIdentityCredential { proof: Vec<u8> },
-    AuthorizeOperator { operator: Address },
+    Transfer {
+        to: Address,
+        amount: u128,
+    },
+    JoinValidator {
+        validator: Address,
+        stake: u128,
+        bls_pubkey: Vec<u8>,
+    },
+    LeaveValidator {
+        validator: Address,
+    },
+    Stake {
+        validator: Address,
+        amount: u128,
+    },
+    Unstake {
+        validator: Address,
+        amount: u128,
+    },
+    SubmitEquivocationEvidence {
+        block_a: Box<Block<ActionPayload>>,
+        block_b: Box<Block<ActionPayload>>,
+    },
+    RegisterBlsKey {
+        validator: Address,
+        pubkey: Vec<u8>,
+    },
+    VerifyIdentityCredential {
+        proof: Vec<u8>,
+    },
+    AuthorizeOperator {
+        operator: Address,
+    },
     RevokeOperator,
 }
