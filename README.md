@@ -87,9 +87,9 @@ answers — "not connected" and "caught up" are different states.
 ## Configuration
 
 All flags are optional; the defaults match a local devnet. `--bootnodes`,
-`--database-url`, `--node-rpc-url`, `--auth-token`, and `--rate-limit-rps`
+`--database-url`, `--node-rpc-url`, `--node-rpc-token`, `--auth-token`, and `--rate-limit-rps`
 can also come from a `.env` file (copy `.env.example`) via
-`RETRACER_BOOTNODES`/`RETRACER_DATABASE_URL`/`RETRACER_NODE_RPC_URL`/
+`RETRACER_BOOTNODES`/`RETRACER_DATABASE_URL`/`RETRACER_NODE_RPC_URL`/`RETRACER_NODE_RPC_TOKEN`/
 `RETRACER_AUTH_TOKEN`/`RETRACER_RATE_LIMIT_RPS` — a flag always overrides
 the env value.
 
@@ -100,6 +100,7 @@ the env value.
 | `--chain-id` | `corechain-devnet` | Label for this chain's rows. Not read off the wire |
 | `--database-url` | `postgres://retracer:retracer@localhost:5433/retracer` | Postgres connection string |
 | `--node-rpc-url` | none | This chain's node HTTP RPC base URL, e.g. `http://127.0.0.1:8081`. Only used for the validator-uptime endpoint; leave unset to disable it |
+| `--node-rpc-token` | none | Optional bearer token sent on every HTTP request to this chain's node RPC. Prefer `RETRACER_NODE_RPC_TOKEN` so the value is not visible in process arguments |
 | `--rest-port` | `8080` | HTTP API port; `0` disables it |
 | `--grpc-port` | `50051` | gRPC API port |
 | `--kind-schema` | `kind_schema.toml` | Payload field configuration |
@@ -109,7 +110,7 @@ the env value.
 | `--max-pending-blocks` | `4096` | Gap-fill buffer cap |
 | `--write-pool-size` | `4` | Postgres connections for the writer |
 | `--read-pool-size` | `16` | Postgres connections for reads |
-| `--auth-token` | none | Shared secret required as `Authorization: Bearer <token>` on both surfaces (`/health` stays open). Unset = both surfaces stay open, same as today |
+| `--auth-token` | none | Shared secret required as `Authorization: Bearer <token>` on both surfaces (`/health` and `/ready` stay open). Unset = both surfaces stay open, same as today |
 | `--rate-limit-rps` | none | Per-IP request budget, both surfaces. Unset = no rate limiting |
 
 `--blocks-topic` and `--sync-protocol` are a wire agreement with the node you're
@@ -125,6 +126,7 @@ serves.
 
 ```
 GET  /health
+GET  /ready
 GET  /v1/chains
 
 GET  /v1/chains/{chain}/status
@@ -140,6 +142,13 @@ GET  /v1/chains/{chain}/actions/{action_hash}
 GET  /v1/chains/{chain}/accounts/{address}/actions?limit=&role=
 GET  /v1/chains/{chain}/search?q=
 ```
+
+`/health` is process liveness only. `/ready` returns 200 only when PostgreSQL
+answers and every configured chain has a fresh node tip from a currently
+connected peer plus an indexed cursor caught up to that tip. Its database work
+has a fixed timeout; otherwise it returns 503 with per-chain dependency state.
+Both probes stay open when inbound API authentication is enabled, while
+configured rate limiting still applies to `/ready` (but never `/health`).
 
 Pages are newest-first and cap at 100. Action cursors are a
 `(before_height, before_index)` pair and both halves must be sent together — a
@@ -273,7 +282,11 @@ and `ingestion::HasHeight` for your own block type — see
   dispatch logic) against turns actually proposed. One node call per height,
   so it's a bounded on-demand backfill (`MAX_UPTIME_RANGE`), not a live
   figure. Needs `--node-rpc-url`/`RETRACER_NODE_RPC_URL` configured per
-  chain; without it the route 400s rather than guessing an address.
+    chain; without it the route 400s rather than guessing an address. Protected
+    node RPCs also require `--node-rpc-token`/`RETRACER_NODE_RPC_TOKEN`; the
+    credential is sent as `Authorization: Bearer` and is redacted from Debug output.
+    Send bearer-authenticated requests only over loopback, HTTPS, or the encrypted
+    WireGuard network; ordinary remote HTTP exposes the credential in transit.
 - **Mempool / pending actions.** Confirmed blocks only.
 - **Auth or rate limiting.** Off by default (unchanged trusted-consumer
   behavior), now opt-in via `--auth-token`/`RETRACER_AUTH_TOKEN` (a shared

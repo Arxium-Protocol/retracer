@@ -16,7 +16,7 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use axum::extract::{ConnectInfo, Request, State};
-use axum::http::{header, StatusCode};
+use axum::http::{StatusCode, header};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use std::net::SocketAddr;
@@ -38,7 +38,10 @@ pub struct RateLimiter {
 
 impl RateLimiter {
     pub fn new(max_per_window: u32) -> Self {
-        RateLimiter { max_per_window, hits: Mutex::new(HashMap::new()) }
+        RateLimiter {
+            max_per_window,
+            hits: Mutex::new(HashMap::new()),
+        }
     }
 
     pub fn allow(&self, ip: IpAddr) -> bool {
@@ -62,7 +65,9 @@ impl RateLimiter {
 /// can't be distinguished from a right one by response timing.
 fn token_matches(expected: &str, header_value: Option<&str>) -> bool {
     let expected = format!("Bearer {expected}");
-    header_value.is_some_and(|value| value.len() == expected.len() && value.as_bytes().ct_eq(expected.as_bytes()).into())
+    header_value.is_some_and(|value| {
+        value.len() == expected.len() && value.as_bytes().ct_eq(expected.as_bytes()).into()
+    })
 }
 
 #[derive(Clone)]
@@ -75,7 +80,8 @@ impl GuardConfig {
     pub fn new(token: Option<String>, rate_limit_rps: Option<u32>) -> Self {
         GuardConfig {
             token: token.map(Arc::new),
-            rate_limiter: rate_limit_rps.map(|rps| Arc::new(RateLimiter::new(rps.saturating_mul(60)))),
+            rate_limiter: rate_limit_rps
+                .map(|rps| Arc::new(RateLimiter::new(rps.saturating_mul(60)))),
         }
     }
 
@@ -84,19 +90,33 @@ impl GuardConfig {
     }
 }
 
-/// axum middleware. `/health` stays open unconditionally — it's a liveness
-/// probe target, not part of the data API.
+fn auth_exempt(path: &str) -> bool {
+    matches!(path, "/health" | "/ready")
+}
+
+fn rate_limit_exempt(path: &str) -> bool {
+    path == "/health"
+}
+
+/// axum middleware. Both probes bypass authentication, but only `/health`
+/// bypasses rate limiting; repeated readiness checks still consume capacity.
 pub async fn rest_guard(
     State(guard): State<GuardConfig>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     req: Request,
     next: Next,
 ) -> Response {
-    if req.uri().path() == "/health" {
+    let path = req.uri().path();
+    if rate_limit_exempt(path) {
         return next.run(req).await;
     }
-    if let Some(token) = &guard.token {
-        let header_value = req.headers().get(header::AUTHORIZATION).and_then(|v| v.to_str().ok());
+    if !auth_exempt(path)
+        && let Some(token) = &guard.token
+    {
+        let header_value = req
+            .headers()
+            .get(header::AUTHORIZATION)
+            .and_then(|v| v.to_str().ok());
         if !token_matches(token, header_value) {
             return StatusCode::UNAUTHORIZED.into_response();
         }
@@ -116,9 +136,14 @@ pub struct GrpcGuard(pub GuardConfig);
 impl tonic::service::Interceptor for GrpcGuard {
     fn call(&mut self, req: tonic::Request<()>) -> Result<tonic::Request<()>, tonic::Status> {
         if let Some(token) = &self.0.token {
-            let header_value = req.metadata().get("authorization").and_then(|v| v.to_str().ok());
+            let header_value = req
+                .metadata()
+                .get("authorization")
+                .and_then(|v| v.to_str().ok());
             if !token_matches(token, header_value) {
-                return Err(tonic::Status::unauthenticated("invalid or missing bearer token"));
+                return Err(tonic::Status::unauthenticated(
+                    "invalid or missing bearer token",
+                ));
             }
         }
         if let Some(limiter) = &self.0.rate_limiter
@@ -150,5 +175,15 @@ mod tests {
         assert!(limiter.allow(ip));
         assert!(limiter.allow(ip));
         assert!(!limiter.allow(ip));
+    }
+
+    #[test]
+    fn health_is_unconditional_but_ready_is_still_rate_limited() {
+        assert!(auth_exempt("/health"));
+        assert!(rate_limit_exempt("/health"));
+        assert!(auth_exempt("/ready"));
+        assert!(!rate_limit_exempt("/ready"));
+        assert!(!auth_exempt("/v1/chains"));
+        assert!(!rate_limit_exempt("/v1/chains"));
     }
 }

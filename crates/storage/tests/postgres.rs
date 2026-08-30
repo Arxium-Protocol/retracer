@@ -27,7 +27,9 @@ enum TestPayload {
 /// `None` when the opt-in env var is unset, which every test treats as "skip".
 async fn pool() -> Option<PgPool> {
     let url = std::env::var("RETRACER_TEST_DATABASE_URL").ok()?;
-    let pool = storage::connect(&url, 4).await.expect("connect to test database");
+    let pool = storage::connect(&url, 4)
+        .await
+        .expect("connect to test database");
     storage::migrate(&pool).await.expect("migrations apply");
     Some(pool)
 }
@@ -58,6 +60,7 @@ fn block(height: u64, parent: &str, actions: Vec<Action<TestPayload>>) -> Block<
         actions,
         proposer: Some(addr(9)),
         signature: None,
+        state_root: String::new(),
     }
 }
 
@@ -87,9 +90,18 @@ async fn migrations_are_idempotent() {
     let pool = skip_without_db!();
     // `pool()` already migrated once; a second run must be a no-op rather than
     // an error, since every process start calls it.
-    storage::migrate(&pool).await.expect("second migrate is a no-op");
+    storage::migrate(&pool)
+        .await
+        .expect("second migrate is a no-op");
 
-    for table in ["chains", "blocks", "actions", "account_actions", "action_addresses", "ingestion_cursor"] {
+    for table in [
+        "chains",
+        "blocks",
+        "actions",
+        "account_actions",
+        "action_addresses",
+        "ingestion_cursor",
+    ] {
         let exists: bool = sqlx::query(
             "SELECT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = $1)",
         )
@@ -158,30 +170,46 @@ async fn insert_block_writes_every_table_with_aligned_rows() {
         0,
         "0x0",
         vec![
-            action(1, Some("sig-a"), TestPayload::Transfer { to: "arx1dest".into(), amount: 500 }),
+            action(
+                1,
+                Some("sig-a"),
+                TestPayload::Transfer {
+                    to: "arx1dest".into(),
+                    amount: 500,
+                },
+            ),
             // Unsigned: must key on its position, not collide with the next one.
             action(2, None, TestPayload::Noop),
             action(3, None, TestPayload::Noop),
         ],
     );
-    storage::insert_block(&pool, &chain, &b, &extractor).await.expect("insert_block");
+    storage::insert_block(&pool, &chain, &b, &extractor)
+        .await
+        .expect("insert_block");
 
     assert_eq!(count(&pool, "blocks", &chain).await, 1);
-    assert_eq!(count(&pool, "actions", &chain).await, 3, "no action may be lost to a key collision");
+    assert_eq!(
+        count(&pool, "actions", &chain).await,
+        3,
+        "no action may be lost to a key collision"
+    );
     assert_eq!(count(&pool, "account_actions", &chain).await, 3);
-    assert_eq!(count(&pool, "action_addresses", &chain).await, 1, "only the Transfer resolves a recipient");
+    assert_eq!(
+        count(&pool, "action_addresses", &chain).await,
+        1,
+        "only the Transfer resolves a recipient"
+    );
 
     // Identity: signature where present, position where not.
-    let hashes: Vec<String> = sqlx::query(
-        "SELECT action_hash FROM actions WHERE chain_id = $1 ORDER BY index_in_block",
-    )
-    .bind(&chain)
-    .fetch_all(&pool)
-    .await
-    .expect("hashes")
-    .into_iter()
-    .map(|r| r.get(0))
-    .collect();
+    let hashes: Vec<String> =
+        sqlx::query("SELECT action_hash FROM actions WHERE chain_id = $1 ORDER BY index_in_block")
+            .bind(&chain)
+            .fetch_all(&pool)
+            .await
+            .expect("hashes")
+            .into_iter()
+            .map(|r| r.get(0))
+            .collect();
     assert_eq!(hashes, vec!["sig-a", "0:1", "0:2"]);
 
     // Alignment: each row's payload, kind and sender must belong to the same
@@ -196,22 +224,27 @@ async fn insert_block_writes_every_table_with_aligned_rows() {
     assert_eq!(row.get::<String, _>(0), "Transfer");
     assert_eq!(row.get::<String, _>(1), addr(1).to_string());
     let payload: serde_json::Value = row.get(2);
-    assert_eq!(payload["amount"], 500, "payload must land on its own action");
+    assert_eq!(
+        payload["amount"], 500,
+        "payload must land on its own action"
+    );
     assert_eq!(payload["to"], "arx1dest");
 
     // The resolved recipient is attributed to the Transfer, not another action.
-    let addr_row = sqlx::query(
-        "SELECT action_hash, address, role FROM action_addresses WHERE chain_id = $1",
-    )
-    .bind(&chain)
-    .fetch_one(&pool)
-    .await
-    .expect("address row");
+    let addr_row =
+        sqlx::query("SELECT action_hash, address, role FROM action_addresses WHERE chain_id = $1")
+            .bind(&chain)
+            .fetch_one(&pool)
+            .await
+            .expect("address row");
     assert_eq!(addr_row.get::<String, _>(0), "sig-a");
     assert_eq!(addr_row.get::<String, _>(1), "arx1dest");
     assert_eq!(addr_row.get::<String, _>(2), "to");
 
-    assert_eq!(storage::get_cursor(&pool, &chain).await.expect("cursor"), Some(0));
+    assert_eq!(
+        storage::get_cursor(&pool, &chain).await.expect("cursor"),
+        Some(0)
+    );
 }
 
 #[tokio::test]
@@ -220,11 +253,26 @@ async fn insert_block_is_idempotent_on_redelivery() {
     let chain = chain_id("idempotent");
     let extractor = AddressExtractor::tier_a_only(KindSchema::empty());
 
-    let b = block(0, "0x0", vec![action(1, None, TestPayload::Noop), action(2, None, TestPayload::Noop)]);
-    storage::insert_block(&pool, &chain, &b, &extractor).await.expect("first");
-    storage::insert_block(&pool, &chain, &b, &extractor).await.expect("redelivery must not error");
+    let b = block(
+        0,
+        "0x0",
+        vec![
+            action(1, None, TestPayload::Noop),
+            action(2, None, TestPayload::Noop),
+        ],
+    );
+    storage::insert_block(&pool, &chain, &b, &extractor)
+        .await
+        .expect("first");
+    storage::insert_block(&pool, &chain, &b, &extractor)
+        .await
+        .expect("redelivery must not error");
 
-    assert_eq!(count(&pool, "actions", &chain).await, 2, "redelivery must not duplicate");
+    assert_eq!(
+        count(&pool, "actions", &chain).await,
+        2,
+        "redelivery must not duplicate"
+    );
     assert_eq!(count(&pool, "account_actions", &chain).await, 2);
 }
 
@@ -240,10 +288,19 @@ async fn duplicate_action_within_one_block_is_skipped_not_fatal() {
     let b = block(
         0,
         "0x0",
-        vec![action(1, Some("same"), TestPayload::Noop), action(2, Some("same"), TestPayload::Noop)],
+        vec![
+            action(1, Some("same"), TestPayload::Noop),
+            action(2, Some("same"), TestPayload::Noop),
+        ],
     );
-    storage::insert_block(&pool, &chain, &b, &extractor).await.expect("must not error");
-    assert_eq!(count(&pool, "actions", &chain).await, 1, "second occurrence is skipped");
+    storage::insert_block(&pool, &chain, &b, &extractor)
+        .await
+        .expect("must not error");
+    assert_eq!(
+        count(&pool, "actions", &chain).await,
+        1,
+        "second occurrence is skipped"
+    );
 }
 
 #[tokio::test]
@@ -254,25 +311,45 @@ async fn rollback_removes_rows_above_the_height_and_rewinds_the_cursor() {
 
     let mut parent = "0x0".to_string();
     for height in 0..5u64 {
-        let b = block(height, &parent, vec![action(1, Some(&format!("sig-{height}")), TestPayload::Noop)]);
+        let b = block(
+            height,
+            &parent,
+            vec![action(1, Some(&format!("sig-{height}")), TestPayload::Noop)],
+        );
         parent = b.hash();
-        storage::insert_block(&pool, &chain, &b, &extractor).await.expect("insert");
+        storage::insert_block(&pool, &chain, &b, &extractor)
+            .await
+            .expect("insert");
     }
     assert_eq!(count(&pool, "blocks", &chain).await, 5);
 
-    let removed = storage::rollback_to(&pool, &chain, 2).await.expect("rollback");
+    let removed = storage::rollback_to(&pool, &chain, 2)
+        .await
+        .expect("rollback");
 
     assert_eq!(removed, 2, "heights 3 and 4");
     assert_eq!(count(&pool, "blocks", &chain).await, 3);
     assert_eq!(count(&pool, "actions", &chain).await, 3);
     assert_eq!(count(&pool, "account_actions", &chain).await, 3);
-    assert_eq!(storage::get_cursor(&pool, &chain).await.expect("cursor"), Some(2));
+    assert_eq!(
+        storage::get_cursor(&pool, &chain).await.expect("cursor"),
+        Some(2)
+    );
 
     // Re-indexing the rolled-back heights must work — this is the path a real
     // reorg takes after ingestion rewinds.
-    let tip_hash = storage::get_block_hash(&pool, &chain, 2).await.expect("hash").expect("present");
-    let replacement = block(3, &tip_hash, vec![action(1, Some("sig-3-alt"), TestPayload::Noop)]);
-    storage::insert_block(&pool, &chain, &replacement, &extractor).await.expect("re-index");
+    let tip_hash = storage::get_block_hash(&pool, &chain, 2)
+        .await
+        .expect("hash")
+        .expect("present");
+    let replacement = block(
+        3,
+        &tip_hash,
+        vec![action(1, Some("sig-3-alt"), TestPayload::Noop)],
+    );
+    storage::insert_block(&pool, &chain, &replacement, &extractor)
+        .await
+        .expect("re-index");
     assert_eq!(count(&pool, "blocks", &chain).await, 4);
 }
 
@@ -285,12 +362,19 @@ async fn rollback_below_genesis_clears_the_cursor_entirely() {
     let extractor = AddressExtractor::tier_a_only(KindSchema::empty());
 
     let b = block(0, "0x0", vec![action(1, Some("sig"), TestPayload::Noop)]);
-    storage::insert_block(&pool, &chain, &b, &extractor).await.expect("insert");
+    storage::insert_block(&pool, &chain, &b, &extractor)
+        .await
+        .expect("insert");
 
-    storage::rollback_to(&pool, &chain, -1).await.expect("rollback");
+    storage::rollback_to(&pool, &chain, -1)
+        .await
+        .expect("rollback");
 
     assert_eq!(count(&pool, "blocks", &chain).await, 0);
-    assert_eq!(storage::get_cursor(&pool, &chain).await.expect("cursor"), None);
+    assert_eq!(
+        storage::get_cursor(&pool, &chain).await.expect("cursor"),
+        None
+    );
 }
 
 #[tokio::test]
@@ -312,7 +396,9 @@ async fn projection_indexes_are_created_and_recreating_them_is_safe() {
     let schema = KindSchema::load(&path).expect("load schema");
     let expected = schema.projections()[0].index_name();
 
-    let created = storage::create_projection_indexes(&pool, &schema).await.expect("create");
+    let created = storage::create_projection_indexes(&pool, &schema)
+        .await
+        .expect("create");
     assert_eq!(created, 1);
 
     let exists: bool = sqlx::query("SELECT EXISTS (SELECT 1 FROM pg_indexes WHERE indexname = $1)")
@@ -324,9 +410,14 @@ async fn projection_indexes_are_created_and_recreating_them_is_safe() {
     assert!(exists, "expected index {expected} to exist");
 
     // Every process start runs this, so it has to be safe to repeat.
-    storage::create_projection_indexes(&pool, &schema).await.expect("idempotent");
+    storage::create_projection_indexes(&pool, &schema)
+        .await
+        .expect("idempotent");
 
-    sqlx::query(&format!("DROP INDEX IF EXISTS {expected}")).execute(&pool).await.ok();
+    sqlx::query(&format!("DROP INDEX IF EXISTS {expected}"))
+        .execute(&pool)
+        .await
+        .ok();
     std::fs::remove_file(&path).ok();
 }
 
@@ -341,19 +432,31 @@ async fn read_queries_return_what_was_written() {
 
     let b0 = block(0, "0x0", vec![]);
     let parent = b0.hash();
-    storage::insert_block(&pool, &chain, &b0, &extractor).await.expect("genesis");
+    storage::insert_block(&pool, &chain, &b0, &extractor)
+        .await
+        .expect("genesis");
     let b1 = block(
         1,
         &parent,
-        vec![action(1, Some("x"), TestPayload::Noop), action(2, Some("y"), TestPayload::Noop)],
+        vec![
+            action(1, Some("x"), TestPayload::Noop),
+            action(2, Some("y"), TestPayload::Noop),
+        ],
     );
-    storage::insert_block(&pool, &chain, &b1, &extractor).await.expect("block 1");
+    storage::insert_block(&pool, &chain, &b1, &extractor)
+        .await
+        .expect("block 1");
 
-    let summaries = storage::list_blocks(&pool, &chain, 10, None).await.expect("list_blocks");
+    let summaries = storage::list_blocks(&pool, &chain, 10, None)
+        .await
+        .expect("list_blocks");
     assert_eq!(summaries.len(), 2);
     assert_eq!(summaries[0].height, 1, "newest first");
     assert_eq!(summaries[0].action_count, 2);
-    assert_eq!(summaries[1].action_count, 0, "an empty block counts zero, not NULL");
+    assert_eq!(
+        summaries[1].action_count, 0,
+        "an empty block counts zero, not NULL"
+    );
 
     let full = storage::get_block_by_height(&pool, &chain, 1)
         .await
@@ -361,16 +464,10 @@ async fn read_queries_return_what_was_written() {
         .expect("block 1 present");
     assert_eq!(full.actions.len(), 2);
 
-    let sender_actions = storage::get_account_actions(
-        &pool,
-        &chain,
-        &addr(1).to_string(),
-        10,
-        None,
-        None,
-    )
-    .await
-    .expect("account actions");
+    let sender_actions =
+        storage::get_account_actions(&pool, &chain, &addr(1).to_string(), 10, None, None)
+            .await
+            .expect("account actions");
     assert_eq!(sender_actions.len(), 1);
     assert_eq!(sender_actions[0].action_hash, "x");
 }
@@ -389,25 +486,36 @@ async fn count_proposers_in_range_only_counts_heights_inside_the_bound() {
             actions: vec![],
             proposer: Some(addr(proposer)),
             signature: None,
+            state_root: String::new(),
         }
     };
 
     let b0 = proposed_by(0, "0x0", 1);
     let parent = b0.hash();
-    storage::insert_block(&pool, &chain, &b0, &extractor).await.expect("genesis");
+    storage::insert_block(&pool, &chain, &b0, &extractor)
+        .await
+        .expect("genesis");
     let b1 = proposed_by(1, &parent, 2);
     let parent = b1.hash();
-    storage::insert_block(&pool, &chain, &b1, &extractor).await.expect("block 1");
+    storage::insert_block(&pool, &chain, &b1, &extractor)
+        .await
+        .expect("block 1");
     let b2 = proposed_by(2, &parent, 1);
-    storage::insert_block(&pool, &chain, &b2, &extractor).await.expect("block 2");
+    storage::insert_block(&pool, &chain, &b2, &extractor)
+        .await
+        .expect("block 2");
 
     // Full range: address 1 proposed heights 0 and 2, address 2 proposed height 1.
-    let full = storage::count_proposers_in_range(&pool, &chain, 0, 2).await.expect("full range");
+    let full = storage::count_proposers_in_range(&pool, &chain, 0, 2)
+        .await
+        .expect("full range");
     assert_eq!(full.get(&addr(1).to_string()), Some(&2));
     assert_eq!(full.get(&addr(2).to_string()), Some(&1));
 
     // Narrowed range excludes height 2's contribution.
-    let narrowed = storage::count_proposers_in_range(&pool, &chain, 0, 1).await.expect("narrowed range");
+    let narrowed = storage::count_proposers_in_range(&pool, &chain, 0, 1)
+        .await
+        .expect("narrowed range");
     assert_eq!(narrowed.get(&addr(1).to_string()), Some(&1));
     assert_eq!(narrowed.get(&addr(2).to_string()), Some(&1));
 }

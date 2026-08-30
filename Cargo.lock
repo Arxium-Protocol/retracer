@@ -4764,13 +4764,14 @@ dependencies = [
 [[package]]
 name = "xc-primitives"
 version = "0.1.0"
-source = "git+https://github.com/Arxium-Protocol/Arxium?tag=xc-primitives-v0.1.0#4bbf19d26aaeabae571037c988d1d6e79d417496"
+source = "git+https://github.com/Arxium-Protocol/Arxium?rev=d88b9199a416a438e14ff4430d05970f8323e4ba#d88b9199a416a438e14ff4430d05970f8323e4ba"
 dependencies = [
  "bech32",
  "bincode",
  "ed25519-dalek 3.0.0",
  "hex",
  "serde",
+ "serde_json",
  "sha2 0.11.0",
  "thiserror 2.0.20",
 ]
@@ -4778,7 +4779,7 @@ dependencies = [
 [[package]]
 name = "xc-wire"
 version = "0.1.0"
-source = "git+https://github.com/Arxium-Protocol/Arxium?tag=xc-primitives-v0.1.0#4bbf19d26aaeabae571037c988d1d6e79d417496"
+source = "git+https://github.com/Arxium-Protocol/Arxium?rev=d88b9199a416a438e14ff4430d05970f8323e4ba#d88b9199a416a438e14ff4430d05970f8323e4ba"
 dependencies = [
  "serde",
 ]

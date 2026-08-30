@@ -18,6 +18,8 @@
 pub mod auth;
 pub mod tip;
 
+pub use rest_service::NodeRpcToken;
+
 use anyhow::{Context, Result};
 use libp2p::Multiaddr;
 use sqlx::PgPool;
@@ -83,6 +85,9 @@ pub struct ChainConfig {
     /// disables the validator-uptime endpoint; there's no safe default to
     /// guess since it's a different address than the p2p bootnodes.
     pub node_rpc_url: Option<String>,
+    /// Optional bearer credential for this chain's node HTTP RPC. Its Debug
+    /// representation is redacted by [`NodeRpcToken`].
+    pub node_rpc_token: Option<NodeRpcToken>,
 }
 
 /// Process-level configuration, plus the single chain the CLI describes.
@@ -116,11 +121,15 @@ pub fn parse_args() -> Result<Args> {
     let mut bootnodes = Vec::new();
     if let Ok(value) = std::env::var("RETRACER_BOOTNODES") {
         for addr in value.split(',').filter(|s| !s.is_empty()) {
-            bootnodes.push(addr.parse().with_context(|| format!("invalid multiaddr: {addr}"))?);
+            bootnodes.push(
+                addr.parse()
+                    .with_context(|| format!("invalid multiaddr: {addr}"))?,
+            );
         }
     }
     let mut port = 0u16;
-    let mut database_url = std::env::var("RETRACER_DATABASE_URL").unwrap_or_else(|_| DEFAULT_DATABASE_URL.to_string());
+    let mut database_url =
+        std::env::var("RETRACER_DATABASE_URL").unwrap_or_else(|_| DEFAULT_DATABASE_URL.to_string());
     let mut chain_id = DEFAULT_CHAIN_ID.to_string();
     let mut grpc_port = DEFAULT_GRPC_PORT;
     let mut rest_port = Some(DEFAULT_REST_PORT);
@@ -135,10 +144,23 @@ pub fn parse_args() -> Result<Args> {
     // the same as unset, not as "auth token is the empty string" — the
     // latter would silently lock every caller out, since no real
     // `Authorization` header value equals "Bearer " with nothing after it.
-    let mut node_rpc_url = std::env::var("RETRACER_NODE_RPC_URL").ok().filter(|v| !v.is_empty());
-    let mut auth_token = std::env::var("RETRACER_AUTH_TOKEN").ok().filter(|v| !v.is_empty());
+    let mut node_rpc_url = std::env::var("RETRACER_NODE_RPC_URL")
+        .ok()
+        .filter(|v| !v.is_empty());
+    let mut node_rpc_token = std::env::var("RETRACER_NODE_RPC_TOKEN")
+        .ok()
+        .filter(|v| !v.is_empty())
+        .map(NodeRpcToken::new)
+        .transpose()?;
+    let mut auth_token = std::env::var("RETRACER_AUTH_TOKEN")
+        .ok()
+        .filter(|v| !v.is_empty());
     let mut rate_limit_rps: Option<u32> = match std::env::var("RETRACER_RATE_LIMIT_RPS") {
-        Ok(value) if !value.is_empty() => Some(value.parse().context("RETRACER_RATE_LIMIT_RPS must be a u32")?),
+        Ok(value) if !value.is_empty() => Some(
+            value
+                .parse()
+                .context("RETRACER_RATE_LIMIT_RPS must be a u32")?,
+        ),
         _ => None,
     };
     let mut args = std::env::args().skip(1);
@@ -148,7 +170,10 @@ pub fn parse_args() -> Result<Args> {
                 let value = args.next().context("--bootnodes requires a value")?;
                 bootnodes.clear();
                 for addr in value.split(',').filter(|s| !s.is_empty()) {
-                    bootnodes.push(addr.parse().with_context(|| format!("invalid multiaddr: {addr}"))?);
+                    bootnodes.push(
+                        addr.parse()
+                            .with_context(|| format!("invalid multiaddr: {addr}"))?,
+                    );
                 }
             }
             "--port" => {
@@ -186,9 +211,16 @@ pub fn parse_args() -> Result<Args> {
                 sync_protocol = args.next().context("--sync-protocol requires a value")?;
             }
             "--max-pending-blocks" => {
-                let value = args.next().context("--max-pending-blocks requires a value")?;
-                max_pending_blocks = value.parse().context("--max-pending-blocks must be a usize")?;
-                anyhow::ensure!(max_pending_blocks > 0, "--max-pending-blocks must be at least 1");
+                let value = args
+                    .next()
+                    .context("--max-pending-blocks requires a value")?;
+                max_pending_blocks = value
+                    .parse()
+                    .context("--max-pending-blocks must be a usize")?;
+                anyhow::ensure!(
+                    max_pending_blocks > 0,
+                    "--max-pending-blocks must be at least 1"
+                );
             }
             "--write-pool-size" => {
                 let value = args.next().context("--write-pool-size requires a value")?;
@@ -206,6 +238,10 @@ pub fn parse_args() -> Result<Args> {
             }
             "--node-rpc-url" => {
                 node_rpc_url = Some(args.next().context("--node-rpc-url requires a value")?);
+            }
+            "--node-rpc-token" => {
+                let value = args.next().context("--node-rpc-token requires a value")?;
+                node_rpc_token = Some(NodeRpcToken::new(value)?);
             }
             "--auth-token" => {
                 auth_token = Some(args.next().context("--auth-token requires a value")?);
@@ -234,6 +270,7 @@ pub fn parse_args() -> Result<Args> {
             finality_depth,
             kind_schema,
             node_rpc_url,
+            node_rpc_token,
         },
         auth_token,
         rate_limit_rps,
@@ -314,7 +351,9 @@ impl Runner {
         let read_pool = storage::connect(database_url, read_pool_size)
             .await
             .context("failed to connect to Postgres (read pool)")?;
-        storage::migrate(&write_pool).await.context("failed to run migrations")?;
+        storage::migrate(&write_pool)
+            .await
+            .context("failed to run migrations")?;
 
         Ok(Runner {
             write_pool,
@@ -415,7 +454,8 @@ impl Runner {
         let (blocks_tx, _) = tokio::sync::broadcast::channel(BLOCK_BROADCAST_CAPACITY);
         // None until a peer answers a status request — "not connected yet",
         // which the API reports as absent rather than as zero lag.
-        let (network_tx, network_view) = tokio::sync::watch::channel(ingestion::NetworkView::default());
+        let (network_tx, network_view) =
+            tokio::sync::watch::channel(ingestion::NetworkView::default());
 
         // Bounded so a stalled indexing loop applies backpressure to the p2p
         // receive loop in `ingestion::run` instead of buffering blocks in
@@ -462,6 +502,7 @@ impl Runner {
             address_validator: hooks.address_validator.clone(),
             network_view: network_view.clone(),
             node_rpc_url: config.node_rpc_url.clone(),
+            node_rpc_token: config.node_rpc_token.clone(),
         });
         self.runtimes.push(grpc_service::ChainRuntime {
             chain_id: config.chain_id,
@@ -484,7 +525,10 @@ impl Runner {
     /// chain that died, with data that silently stops advancing. Failing
     /// visibly is the better outcome — a supervisor restarts it.
     pub async fn run(self) -> Result<()> {
-        anyhow::ensure!(!self.runtimes.is_empty(), "no chains registered; nothing to do");
+        anyhow::ensure!(
+            !self.runtimes.is_empty(),
+            "no chains registered; nothing to do"
+        );
 
         let chain_ids: Vec<&str> = self.runtimes.iter().map(|r| r.chain_id.as_str()).collect();
         info!(chains = ?chain_ids, default = %chain_ids[0], "serving");
@@ -498,10 +542,14 @@ impl Runner {
             );
         }
 
-        let grpc_addr = format!("0.0.0.0:{}", self.grpc_port).parse().context("invalid gRPC port")?;
+        let grpc_addr = format!("0.0.0.0:{}", self.grpc_port)
+            .parse()
+            .context("invalid gRPC port")?;
         let grpc_service = grpc_service::server(self.read_pool.clone(), self.runtimes);
-        let grpc_service =
-            tonic::service::interceptor::InterceptedService::new(grpc_service, auth::GrpcGuard(guard.clone()));
+        let grpc_service = tonic::service::interceptor::InterceptedService::new(
+            grpc_service,
+            auth::GrpcGuard(guard.clone()),
+        );
         tokio::spawn(async move {
             info!(%grpc_addr, "gRPC listening");
             if let Err(err) = tonic::transport::Server::builder()
@@ -514,14 +562,16 @@ impl Runner {
         });
 
         if let Some(rest_port) = self.rest_port {
-            let router = rest_service::router(self.read_pool.clone(), self.rest_chains)
-                .layer(axum::middleware::from_fn_with_state(guard, auth::rest_guard));
+            let router = rest_service::router(self.read_pool.clone(), self.rest_chains).layer(
+                axum::middleware::from_fn_with_state(guard, auth::rest_guard),
+            );
             tokio::spawn(async move {
                 let addr = format!("0.0.0.0:{rest_port}");
                 match tokio::net::TcpListener::bind(&addr).await {
                     Ok(listener) => {
                         info!(%addr, "REST listening");
-                        let service = router.into_make_service_with_connect_info::<std::net::SocketAddr>();
+                        let service =
+                            router.into_make_service_with_connect_info::<std::net::SocketAddr>();
                         if let Err(err) = axum::serve(listener, service).await {
                             warn!("REST server exited: {err}");
                         }
@@ -574,130 +624,183 @@ where
 
     loop {
         inbox.clear();
-        if block_rx.recv_many(&mut inbox, storage::INSERT_BATCH_BLOCKS).await == 0 {
+        if block_rx
+            .recv_many(&mut inbox, storage::INSERT_BATCH_BLOCKS)
+            .await
+            == 0
+        {
             break; // channel closed
         }
 
         for block in inbox.drain(..) {
-        let height = storage::IndexableBlock::height(&block) as i64;
-        let parent_hash = block.parent_hash();
+            let height = storage::IndexableBlock::height(&block) as i64;
+            let parent_hash = block.parent_hash();
 
-        // Read per block rather than cached: finality advances while we index,
-        // and a stale value would refuse rollbacks the chain has since allowed
-        // — or, worse, allow one it has since certified against.
-        let finalized = network_view.borrow().finalized_height.map(|h| h as i64);
+            // Read per block rather than cached: finality advances while we index,
+            // and a stale value would refuse rollbacks the chain has since allowed
+            // — or, worse, allow one it has since certified against.
+            let finalized = network_view.borrow().finalized_height.map(|h| h as i64);
 
-        match tip::classify(
-            tip.as_ref(),
-            height,
-            &parent_hash,
-            rewound_from,
-            finality_depth,
-            finalized,
-        ) {
-            TipAction::Extend => {}
-            TipAction::Stale => continue,
-            TipAction::Gap => {
-                // Not a fork — `ingestion` backfills gaps over the sync
-                // protocol before forwarding past one, so this stays a
-                // warn-only safety net. Rolling back here would delete blocks
-                // that are perfectly good.
-                warn!(
-                    %chain_id,
-                    height,
-                    tip_height = tip.as_ref().map(|t| t.height),
-                    "block arrived beyond our tip with heights missing in between"
-                );
-            }
-            TipAction::Fork { rollback_to } => {
-                // Commit what's pending before rolling back: `rollback_to`
-                // deletes committed rows, and blocks still in the batch would
-                // survive it and reappear above the rewind point.
-                let _ = flush_batch(&write_pool, &chain_id, &mut batch, &address_extractor, &blocks_tx)
+            match tip::classify(
+                tip.as_ref(),
+                height,
+                &parent_hash,
+                rewound_from,
+                finality_depth,
+                finalized,
+            ) {
+                TipAction::Extend => {}
+                TipAction::Stale => continue,
+                TipAction::Gap => {
+                    // Not a fork — `ingestion` backfills gaps over the sync
+                    // protocol before forwarding past one, so this stays a
+                    // warn-only safety net. Rolling back here would delete blocks
+                    // that are perfectly good.
+                    warn!(
+                        %chain_id,
+                        height,
+                        tip_height = tip.as_ref().map(|t| t.height),
+                        "block arrived beyond our tip with heights missing in between"
+                    );
+                }
+                TipAction::Fork { rollback_to } => {
+                    // Commit what's pending before rolling back: `rollback_to`
+                    // deletes committed rows, and blocks still in the batch would
+                    // survive it and reappear above the rewind point.
+                    let _ = flush_batch(
+                        &write_pool,
+                        &chain_id,
+                        &mut batch,
+                        &address_extractor,
+                        &blocks_tx,
+                    )
                     .await;
-                let from = rewound_from.unwrap_or(height - 1);
-                warn!(
-                    %chain_id,
-                    height,
-                    rollback_to,
-                    expected_parent = tip.as_ref().map(|t| t.hash.as_str()).unwrap_or(""),
-                    got_parent = %parent_hash,
-                    "fork detected; un-indexing and re-requesting"
-                );
-                let removed = storage::rollback_to(&write_pool, &chain_id, rollback_to).await?;
-                warn!(%chain_id, removed_blocks = removed, rollback_to, "rolled back");
+                    let from = rewound_from.unwrap_or(height - 1);
+                    warn!(
+                        %chain_id,
+                        height,
+                        rollback_to,
+                        expected_parent = tip.as_ref().map(|t| t.hash.as_str()).unwrap_or(""),
+                        got_parent = %parent_hash,
+                        "fork detected; un-indexing and re-requesting"
+                    );
+                    let removed = storage::rollback_to(&write_pool, &chain_id, rollback_to).await?;
+                    warn!(%chain_id, removed_blocks = removed, rollback_to, "rolled back");
 
-                tip = if rollback_to < 0 {
-                    None
-                } else {
-                    storage::get_block_hash(&write_pool, &chain_id, rollback_to)
-                        .await?
-                        .map(|hash| Tip { height: rollback_to, hash })
-                };
-                rewound_from = Some(from);
-                // Drop this block: it belongs after the height we just rewound
-                // to, and will come back through the sync protocol once
-                // ingestion has rewound too.
-                let _ = rewind_tx.send((rollback_to + 1).max(0) as u64).await;
-                continue;
-            }
-            TipAction::ForkBelowFinalized { would_rollback_to, finalized_height } => {
-                // Ingestion stalls here; make what was already accepted
-                // durable rather than losing it with the batch.
-                let _ = flush_batch(&write_pool, &chain_id, &mut batch, &address_extractor, &blocks_tx)
-                    .await;
-                error!(
-                    %chain_id,
-                    height,
+                    tip = if rollback_to < 0 {
+                        None
+                    } else {
+                        storage::get_block_hash(&write_pool, &chain_id, rollback_to)
+                            .await?
+                            .map(|hash| Tip {
+                                height: rollback_to,
+                                hash,
+                            })
+                    };
+                    rewound_from = Some(from);
+                    // Drop this block: it belongs after the height we just rewound
+                    // to, and will come back through the sync protocol once
+                    // ingestion has rewound too.
+                    let _ = rewind_tx.send((rollback_to + 1).max(0) as u64).await;
+                    continue;
+                }
+                TipAction::ForkBelowFinalized {
                     would_rollback_to,
                     finalized_height,
-                    "refusing to un-index a finalized block; a peer is serving a chain that \
-                     contradicts a finality certificate. Ingestion is stalled for this chain."
-                );
-                continue;
-            }
-            TipAction::ForkTooDeep { would_rollback_to, depth } => {
-                let _ = flush_batch(&write_pool, &chain_id, &mut batch, &address_extractor, &blocks_tx)
+                } => {
+                    // Ingestion stalls here; make what was already accepted
+                    // durable rather than losing it with the batch.
+                    let _ = flush_batch(
+                        &write_pool,
+                        &chain_id,
+                        &mut batch,
+                        &address_extractor,
+                        &blocks_tx,
+                    )
                     .await;
-                // Deliberately not fatal and deliberately not obeyed. Refusing
-                // leaves the index intact and stalled rather than letting a
-                // peer with a bogus chain walk us back to genesis — a human
-                // should look at this before any more data is deleted.
-                error!(
-                    %chain_id,
-                    height,
+                    error!(
+                        %chain_id,
+                        height,
+                        would_rollback_to,
+                        finalized_height,
+                        "refusing to un-index a finalized block; a peer is serving a chain that \
+                         contradicts a finality certificate. Ingestion is stalled for this chain."
+                    );
+                    continue;
+                }
+                TipAction::ForkTooDeep {
                     would_rollback_to,
                     depth,
-                    finality_depth,
-                    "refusing to roll back past the finality depth; ingestion is stalled \
-                     for this chain until restarted or the finality depth is raised"
-                );
-                continue;
+                } => {
+                    let _ = flush_batch(
+                        &write_pool,
+                        &chain_id,
+                        &mut batch,
+                        &address_extractor,
+                        &blocks_tx,
+                    )
+                    .await;
+                    // Deliberately not fatal and deliberately not obeyed. Refusing
+                    // leaves the index intact and stalled rather than letting a
+                    // peer with a bogus chain walk us back to genesis — a human
+                    // should look at this before any more data is deleted.
+                    error!(
+                        %chain_id,
+                        height,
+                        would_rollback_to,
+                        depth,
+                        finality_depth,
+                        "refusing to roll back past the finality depth; ingestion is stalled \
+                         for this chain until restarted or the finality depth is raised"
+                    );
+                    continue;
+                }
             }
-        }
 
-        let hash = block.hash();
-        // Tip advances optimistically so the next block in this same batch
-        // classifies against it. `flush_batch` restores it from the database
-        // if the commit fails, so a failed batch cannot leave the tip claiming
-        // heights that were never written.
-        tip = Some(Tip { height, hash });
-        rewound_from = None;
-        batch.push(block);
+            let hash = block.hash();
+            // Tip advances optimistically so the next block in this same batch
+            // classifies against it. `flush_batch` restores it from the database
+            // if the commit fails, so a failed batch cannot leave the tip claiming
+            // heights that were never written.
+            tip = Some(Tip { height, hash });
+            rewound_from = None;
+            batch.push(block);
 
-        if batch.len() >= storage::INSERT_BATCH_BLOCKS {
-            flush_batch(&write_pool, &chain_id, &mut batch, &address_extractor, &blocks_tx).await;
-        }
+            if batch.len() >= storage::INSERT_BATCH_BLOCKS {
+                flush_batch(
+                    &write_pool,
+                    &chain_id,
+                    &mut batch,
+                    &address_extractor,
+                    &blocks_tx,
+                )
+                .await;
+            }
         }
 
         // Channel drained — commit what this chunk accumulated. Once caught
         // up this runs per block, so batching costs no latency when live.
-        if !flush_batch(&write_pool, &chain_id, &mut batch, &address_extractor, &blocks_tx).await {
+        if !flush_batch(
+            &write_pool,
+            &chain_id,
+            &mut batch,
+            &address_extractor,
+            &blocks_tx,
+        )
+        .await
+        {
             tip = durable_tip(&write_pool, &chain_id).await;
         }
     }
 
-    let _ = flush_batch(&write_pool, &chain_id, &mut batch, &address_extractor, &blocks_tx).await;
+    let _ = flush_batch(
+        &write_pool,
+        &chain_id,
+        &mut batch,
+        &address_extractor,
+        &blocks_tx,
+    )
+    .await;
     Ok(())
 }
 
@@ -762,6 +865,9 @@ where
 /// tip that does not exist — spurious gaps and forks.
 async fn durable_tip(pool: &sqlx::PgPool, chain_id: &str) -> Option<Tip> {
     let height = storage::get_cursor(pool, chain_id).await.ok().flatten()?;
-    let hash = storage::get_block_hash(pool, chain_id, height).await.ok().flatten()?;
+    let hash = storage::get_block_hash(pool, chain_id, height)
+        .await
+        .ok()
+        .flatten()?;
     Some(Tip { height, hash })
 }

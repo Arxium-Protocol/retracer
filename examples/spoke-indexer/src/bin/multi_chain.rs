@@ -60,6 +60,7 @@ async fn main() -> Result<()> {
                 finality_depth: 0,
                 kind_schema: "kind_schema.toml".into(),
                 node_rpc_url: None,
+                node_rpc_token: None,
             },
             ChainHooks {
                 address_validator: Some(Arc::new(ingestion::is_corechain_address)),
@@ -86,6 +87,7 @@ async fn main() -> Result<()> {
                 finality_depth: 32,
                 kind_schema: "examples/spoke-indexer/kind_schema.toml".into(),
                 node_rpc_url: None,
+                node_rpc_token: None,
             },
             ChainHooks {
                 tier_b: vec![Box::new(spoke_indexer::AirdropRecipients)],
