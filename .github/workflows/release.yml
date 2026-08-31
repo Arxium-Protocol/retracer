@@ -37,6 +37,10 @@ jobs:
           rustc --version
           cargo --version
 
+      - name: Validate the installer
+        shell: bash
+        run: bash -n scripts/install.sh
+
       - name: Test the workspace
         shell: bash
         run: cargo test --workspace --locked
