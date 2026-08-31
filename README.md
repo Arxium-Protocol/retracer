@@ -117,6 +117,25 @@ the env value.
 following, so they must match what *it* publishes — they're not derived from
 `--chain-id`.
 
+### CoreChain wire compatibility
+
+The bundled CoreChain binary accepts both block generations used by supported
+Arxium nodes:
+
+- Arxium `v0.1.1` through `v0.1.5`, whose blocks do not contain `state_root`.
+- The current `state_root` block shape pinned in this workspace.
+
+Both gossip blocks and sync block pages are decoded with complete-input checks.
+Legacy hashes are computed from the legacy bytes, not from a current block with
+an invented empty root. Other chains remain exact-decoding-only unless their
+embedder supplies an explicit `WireDecoder`.
+
+Newer Arxium revisions chain-scope their network names. For those nodes, pass
+their exact `arxium/blocks/v1/<chain-id>` topic and
+`/arxium/sync/1/<chain-id>` protocol with the two flags above. This naming
+change is independent of the block encoding and cannot be inferred from
+`xc_wire::WIRE_VERSION`.
+
 ---
 
 ## HTTP API

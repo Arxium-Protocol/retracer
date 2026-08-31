@@ -16,6 +16,7 @@
 //!   Spokes can be followed together even though their payloads differ.
 
 pub mod auth;
+pub mod corechain_wire;
 pub mod tip;
 
 pub use rest_service::NodeRpcToken;
@@ -285,8 +286,9 @@ pub fn parse_args() -> Result<Args> {
 /// on `xc-primitives` passes `Block<TheirPayload>` and gets the
 /// `storage::IndexableBlock` impl for free; one with a different block envelope
 /// implements that trait plus `ingestion::HasHeight` for its own type and needs
-/// no fork of these crates. `retracerd` passes
-/// `Block<ingestion::ActionPayload>`, the CoreChain one.
+/// no fork of these crates. `retracerd` uses [`corechain_wire::CoreChainBlock`]
+/// so released and current CoreChain blocks retain their generation-specific
+/// hashes after decoding.
 ///
 /// A convenience wrapper over [`Runner`] for the one-chain case.
 pub async fn run<B>(args: Args, hooks: ChainHooks) -> Result<()>
@@ -309,6 +311,31 @@ where
     .with_auth_token(args.auth_token)
     .with_rate_limit_rps(args.rate_limit_rps);
     runner.add_chain::<B>(args.chain, hooks).await?;
+    runner.run().await
+}
+
+/// One-chain convenience wrapper with an explicit historical wire decoder.
+pub async fn run_with_decoder<B>(
+    args: Args,
+    hooks: ChainHooks,
+    decoder: ingestion::WireDecoder<B>,
+) -> Result<()>
+where
+    B: ingestion::HasHeight + storage::IndexableBlock + Send + Sync + 'static,
+{
+    let mut runner = Runner::new(
+        &args.database_url,
+        args.write_pool_size,
+        args.read_pool_size,
+        args.grpc_port,
+    )
+    .await?
+    .with_rest_port(args.rest_port)
+    .with_auth_token(args.auth_token)
+    .with_rate_limit_rps(args.rate_limit_rps);
+    runner
+        .add_chain_with_decoder(args.chain, hooks, decoder)
+        .await?;
     runner.run().await
 }
 
@@ -398,6 +425,21 @@ impl Runner {
             + Sync
             + 'static,
     {
+        self.add_chain_with_decoder::<B>(config, hooks, ingestion::WireDecoder::<B>::exact())
+            .await
+    }
+
+    /// Registers a chain with a documented historical wire compatibility
+    /// policy. Exact decoding remains the default through [`Self::add_chain`].
+    pub async fn add_chain_with_decoder<B>(
+        &mut self,
+        config: ChainConfig,
+        hooks: ChainHooks,
+        decoder: ingestion::WireDecoder<B>,
+    ) -> Result<()>
+    where
+        B: ingestion::HasHeight + storage::IndexableBlock + Send + Sync + 'static,
+    {
         anyhow::ensure!(
             !self.runtimes.iter().any(|r| r.chain_id == config.chain_id),
             "chain {:?} added twice; two pipelines writing one chain_id would \
@@ -474,11 +516,12 @@ impl Runner {
             sync_protocol: config.sync_protocol.clone(),
             max_pending_blocks: config.max_pending_blocks,
         };
-        self.tasks.push(tokio::spawn(ingestion::run(
+        self.tasks.push(tokio::spawn(ingestion::run_with_decoder(
             ingestion_config,
             block_tx,
             rewind_rx,
             network_tx,
+            decoder,
         )));
 
         self.tasks.push(tokio::spawn(index_chain(

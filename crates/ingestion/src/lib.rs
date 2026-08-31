@@ -9,6 +9,7 @@ use libp2p::swarm::dial_opts::DialOpts;
 use libp2p::swarm::{ConnectionId, NetworkBehaviour, SwarmEvent};
 use libp2p::{Multiaddr, PeerId, StreamProtocol, gossipsub, noise, tcp, yamux};
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc::{Sender, UnboundedSender};
 use tracing::{info, warn};
@@ -97,6 +98,44 @@ impl Default for Config {
 }
 
 use xc_wire::{SyncRequest, SyncResponse};
+
+type DecodeFn<T> = Arc<dyn Fn(&[u8]) -> Result<T> + Send + Sync>;
+
+/// Chain-owned wire decoders for gossip blocks and sync responses.
+///
+/// Exact decoding remains the default. A chain with a deliberate compatibility
+/// contract can supply version-aware decoders without making every other chain
+/// accept foreign or ambiguous wire shapes.
+pub struct WireDecoder<B> {
+    decode_block: DecodeFn<B>,
+    decode_sync_response: DecodeFn<SyncResponse<B>>,
+}
+
+impl<B> WireDecoder<B> {
+    pub fn new(
+        decode_block: impl Fn(&[u8]) -> Result<B> + Send + Sync + 'static,
+        decode_sync_response: impl Fn(&[u8]) -> Result<SyncResponse<B>> + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            decode_block: Arc::new(decode_block),
+            decode_sync_response: Arc::new(decode_sync_response),
+        }
+    }
+
+    pub fn decode_block(&self, bytes: &[u8]) -> Result<B> {
+        (self.decode_block)(bytes)
+    }
+
+    pub fn decode_sync_response(&self, bytes: &[u8]) -> Result<SyncResponse<B>> {
+        (self.decode_sync_response)(bytes)
+    }
+}
+
+impl<B: serde::de::DeserializeOwned + 'static> WireDecoder<B> {
+    pub fn exact() -> Self {
+        Self::new(decode_exact, decode_exact)
+    }
+}
 
 /// What the network says about itself, refreshed on every status poll.
 ///
@@ -313,11 +352,33 @@ async fn insert_and_drain<B: HasHeight>(
 pub async fn run<B>(
     config: Config,
     block_tx: Sender<B>,
-    mut rewind_rx: tokio::sync::mpsc::Receiver<u64>,
+    rewind_rx: tokio::sync::mpsc::Receiver<u64>,
     network_tx: tokio::sync::watch::Sender<NetworkView>,
 ) -> Result<()>
 where
     B: HasHeight + serde::de::DeserializeOwned + Send + 'static,
+{
+    run_with_decoder(
+        config,
+        block_tx,
+        rewind_rx,
+        network_tx,
+        WireDecoder::exact(),
+    )
+    .await
+}
+
+/// Equivalent to [`run`], with an explicit chain-owned wire compatibility
+/// policy. Prefer [`run`] unless the chain has documented historical encodings.
+pub async fn run_with_decoder<B>(
+    config: Config,
+    block_tx: Sender<B>,
+    mut rewind_rx: tokio::sync::mpsc::Receiver<u64>,
+    network_tx: tokio::sync::watch::Sender<NetworkView>,
+    decoder: WireDecoder<B>,
+) -> Result<()>
+where
+    B: HasHeight + Send + 'static,
 {
     let Config {
         bootnodes,
@@ -516,7 +577,7 @@ where
                 message,
                 ..
             })) if message.topic == blocks_topic.hash() => {
-                match decode_exact::<B>(&message.data) {
+                match decoder.decode_block(&message.data) {
                     Ok(block) => {
                         // A gap here means a gossiped block was dropped
                         // somewhere between it and us — ask the same peer to
@@ -558,7 +619,7 @@ where
                 message: request_response::Message::Response { response, .. },
                 ..
             })) => {
-                let sync_response: SyncResponse<B> = match decode_exact(&response) {
+                let sync_response = match decoder.decode_sync_response(&response) {
                     Ok(resp) => resp,
                     Err(err) => {
                         warn!("failed to decode sync response from {peer}: {err}");

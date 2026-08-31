@@ -3038,12 +3038,16 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "axum",
+ "bincode",
  "futures",
  "grpc-service",
+ "hex",
  "ingestion",
  "libp2p",
  "rest-service",
  "serde",
+ "serde_json",
+ "sha2 0.10.9",
  "sqlx",
  "storage",
  "subtle",
@@ -3051,6 +3055,7 @@ dependencies = [
  "tonic",
  "tracing",
  "xc-primitives",
+ "xc-wire",
 ]
 
 [[package]]

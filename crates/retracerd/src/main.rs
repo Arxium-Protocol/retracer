@@ -1,7 +1,6 @@
 use anyhow::Result;
 use retracer_core::ChainHooks;
 use tracing_subscriber::EnvFilter;
-use xc_primitives::Block;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -10,15 +9,19 @@ async fn main() -> Result<()> {
     dotenvy::dotenv().ok();
 
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
-    tracing_subscriber::fmt().with_env_filter(filter).with_target(false).init();
+    tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_target(false)
+        .init();
 
     let args = retracer_core::parse_args()?;
 
     // Every CoreChain-specific choice the indexer makes is made here, and only
     // here — the library crates are generic over all of it:
     //
-    // - `Block<ActionPayload>` is the wire type to decode into. A Spoke Chain
-    //   binary is this same file with its own block/payload type.
+    // - `CoreChainBlock` normalizes the supported released/current wire shapes
+    //   while preserving each sender generation's block hash. A Spoke Chain
+    //   binary uses its own exact block/payload type instead.
     // - `address_validator` is the chain's address format. Without one, the
     //   indexer still works but stops validating addresses and stops resolving
     //   `Search` queries to accounts.
@@ -32,5 +35,10 @@ async fn main() -> Result<()> {
         address_validator: Some(std::sync::Arc::new(ingestion::is_corechain_address)),
     };
 
-    retracer_core::run::<Block<ingestion::ActionPayload>>(args, hooks).await
+    retracer_core::run_with_decoder::<retracer_core::corechain_wire::CoreChainBlock>(
+        args,
+        hooks,
+        retracer_core::corechain_wire::decoder(),
+    )
+    .await
 }

@@ -17,9 +17,14 @@ futures = "0.3"
 axum = "0.8"
 sqlx = { workspace = true }
 serde = { workspace = true }
+serde_json = { workspace = true }
+bincode = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
+xc-primitives = { workspace = true }
+xc-wire = { workspace = true }
 subtle = { workspace = true }
 
 [dev-dependencies]
-xc-primitives = { workspace = true }
 sqlx = { workspace = true }
 serde = { workspace = true }
