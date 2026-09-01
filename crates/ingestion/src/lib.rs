@@ -157,6 +157,12 @@ pub struct NetworkView {
     pub last_status_at: Option<Instant>,
 }
 
+#[derive(Clone, Copy)]
+struct ObservedTip {
+    height: u64,
+    observed_at: Instant,
+}
+
 impl NetworkView {
     pub fn has_fresh_status(&self) -> bool {
         self.active_peer_count > 0
@@ -172,6 +178,7 @@ fn publish_network_view(
     network_tx: &tokio::sync::watch::Sender<NetworkView>,
     active_peers: &HashSet<PeerId>,
     peer_tips: &HashMap<PeerId, u64>,
+    observed_block_heights: &HashMap<PeerId, ObservedTip>,
     finalized_by_peer: &HashMap<PeerId, Option<u64>>,
     status_seen_at: &HashMap<PeerId, Instant>,
 ) {
@@ -190,7 +197,13 @@ fn publish_network_view(
         tip_height: peer_tips
             .iter()
             .filter(|(peer, _)| has_fresh_status(peer))
-            .map(|(_, height)| *height)
+            .map(|(peer, status_height)| {
+                observed_block_heights
+                    .get(peer)
+                    .map(|tip| tip.height)
+                    .unwrap_or_default()
+                    .max(*status_height)
+            })
             .max(),
         finalized_height: finalized_by_peer
             .iter()
@@ -211,6 +224,75 @@ fn publish_network_view(
             true
         }
     });
+}
+
+fn observe_next_block(
+    peer: PeerId,
+    height: u64,
+    fresh_status_tip: Option<u64>,
+    observed_block_heights: &mut HashMap<PeerId, ObservedTip>,
+) -> bool {
+    let Some(status_tip) = fresh_status_tip else {
+        return false;
+    };
+    let previous_tip = observed_block_heights
+        .get(&peer)
+        .map(|tip| tip.height)
+        .unwrap_or(status_tip);
+    if height != previous_tip.saturating_add(1) {
+        return false;
+    }
+    observed_block_heights.insert(
+        peer,
+        ObservedTip {
+            height,
+            observed_at: Instant::now(),
+        },
+    );
+    true
+}
+
+fn observe_contiguous_tip(
+    peer: PeerId,
+    height: Option<u64>,
+    fresh_status_tip: Option<u64>,
+    observed_block_heights: &mut HashMap<PeerId, ObservedTip>,
+) -> bool {
+    let Some((height, status_tip)) = height.zip(fresh_status_tip) else {
+        return false;
+    };
+    let Some(previous_tip) = observed_block_heights.get(&peer).map(|tip| tip.height) else {
+        return false;
+    };
+    debug_assert!(previous_tip >= status_tip);
+    if height <= previous_tip {
+        return false;
+    }
+    observed_block_heights.insert(
+        peer,
+        ObservedTip {
+            height,
+            observed_at: Instant::now(),
+        },
+    );
+    true
+}
+
+fn reconcile_observed_tip(
+    peer: PeerId,
+    reported_tip: u64,
+    requested_at: Option<Instant>,
+    observed_block_heights: &mut HashMap<PeerId, ObservedTip>,
+) {
+    let should_remove = observed_block_heights.get(&peer).is_some_and(|observed| {
+        reported_tip >= observed.height
+            || requested_at.is_some_and(|requested_at| {
+                observed.height > reported_tip && observed.observed_at < requested_at
+            })
+    });
+    if should_remove {
+        observed_block_heights.remove(&peer);
+    }
 }
 
 #[derive(NetworkBehaviour)]
@@ -259,12 +341,28 @@ fn schedule_redial(
     });
 }
 
-fn send_sync_request(swarm: &mut libp2p::Swarm<Behaviour>, peer: &PeerId, request: &SyncRequest) {
+fn send_sync_request(
+    swarm: &mut libp2p::Swarm<Behaviour>,
+    peer: &PeerId,
+    request: &SyncRequest,
+) -> Option<request_response::OutboundRequestId> {
     match bincode::serde::encode_to_vec(request, bincode::config::standard()) {
-        Ok(bytes) => {
-            swarm.behaviour_mut().sync.send_request(peer, bytes);
+        Ok(bytes) => Some(swarm.behaviour_mut().sync.send_request(peer, bytes)),
+        Err(err) => {
+            warn!("failed to encode sync request: {err}");
+            None
         }
-        Err(err) => warn!("failed to encode sync request: {err}"),
+    }
+}
+
+fn track_status_request(
+    swarm: &mut libp2p::Swarm<Behaviour>,
+    peer: &PeerId,
+    request: &SyncRequest,
+    status_requests: &mut HashMap<request_response::OutboundRequestId, Instant>,
+) {
+    if let Some(request_id) = send_sync_request(swarm, peer, request) {
+        status_requests.insert(request_id, Instant::now());
     }
 }
 
@@ -457,8 +555,13 @@ where
     // Each connected peer's last-reported tip, so a `Blocks` response knows
     // whether to ask for another page (mirrors `arxd/network`).
     let mut peer_tips: HashMap<PeerId, u64> = HashMap::new();
+    // A fresh status response establishes trust in a connected peer. Blocks
+    // subsequently received from that peer are newer direct evidence of its
+    // height than the last five-second status poll.
+    let mut observed_block_heights: HashMap<PeerId, ObservedTip> = HashMap::new();
     let mut finalized_by_peer: HashMap<PeerId, Option<u64>> = HashMap::new();
     let mut status_seen_at: HashMap<PeerId, Instant> = HashMap::new();
+    let mut status_requests: HashMap<request_response::OutboundRequestId, Instant> = HashMap::new();
     let mut active_peers: HashSet<PeerId> = HashSet::new();
     // Blocks that arrived ahead of `next_expected` (a gossiped block while a
     // gap-filling sync request is still in flight) — held here instead of
@@ -478,6 +581,9 @@ where
         let event = tokio::select! {
             event = swarm.select_next_some() => event,
             _ = status_poll.tick() => {
+                status_requests.retain(|_, sent_at| {
+                    sent_at.elapsed() <= STATUS_FRESHNESS_TIMEOUT
+                });
                 let peers: Vec<PeerId> = swarm.connected_peers().copied().collect();
                 for peer in peers {
                     // Status is the older, universally-supported request and
@@ -486,8 +592,18 @@ where
                     // fails to decode it and answers nothing, which costs a
                     // warning on its side and leaves finality reported as
                     // absent here — degraded, not broken.
-                    send_sync_request(&mut swarm, &peer, &SyncRequest::Status);
-                    send_sync_request(&mut swarm, &peer, &SyncRequest::NodeInfo);
+                    track_status_request(
+                        &mut swarm,
+                        &peer,
+                        &SyncRequest::Status,
+                        &mut status_requests,
+                    );
+                    track_status_request(
+                        &mut swarm,
+                        &peer,
+                        &SyncRequest::NodeInfo,
+                        &mut status_requests,
+                    );
                 }
                 continue;
             }
@@ -503,9 +619,18 @@ where
                 warn!(from, dropped_pending = pending.len(), "rewinding after rollback");
                 next_expected = Some(from);
                 pending.clear();
+                observed_block_heights.clear();
+                publish_network_view(
+                    &network_tx,
+                    &active_peers,
+                    &peer_tips,
+                    &observed_block_heights,
+                    &finalized_by_peer,
+                    &status_seen_at,
+                );
                 let peers: Vec<PeerId> = swarm.connected_peers().copied().collect();
                 for peer in peers {
-                    send_sync_request(&mut swarm, &peer, &SyncRequest::Blocks { from });
+                    let _ = send_sync_request(&mut swarm, &peer, &SyncRequest::Blocks { from });
                 }
                 continue;
             }
@@ -525,6 +650,7 @@ where
                     &network_tx,
                     &active_peers,
                     &peer_tips,
+                    &observed_block_heights,
                     &finalized_by_peer,
                     &status_seen_at,
                 );
@@ -533,9 +659,14 @@ where
                     bootnode_peers.insert(peer_id, addr);
                 }
                 if let Some(from) = next_expected {
-                    send_sync_request(&mut swarm, &peer_id, &SyncRequest::Blocks { from });
+                    let _ = send_sync_request(&mut swarm, &peer_id, &SyncRequest::Blocks { from });
                 } else {
-                    send_sync_request(&mut swarm, &peer_id, &SyncRequest::Status);
+                    track_status_request(
+                        &mut swarm,
+                        &peer_id,
+                        &SyncRequest::Status,
+                        &mut status_requests,
+                    );
                 }
             }
             SwarmEvent::OutgoingConnectionError {
@@ -557,12 +688,14 @@ where
                 if num_established == 0 {
                     active_peers.remove(&peer_id);
                     peer_tips.remove(&peer_id);
+                    observed_block_heights.remove(&peer_id);
                     finalized_by_peer.remove(&peer_id);
                     status_seen_at.remove(&peer_id);
                     publish_network_view(
                         &network_tx,
                         &active_peers,
                         &peer_tips,
+                        &observed_block_heights,
                         &finalized_by_peer,
                         &status_seen_at,
                     );
@@ -579,6 +712,27 @@ where
             })) if message.topic == blocks_topic.hash() => {
                 match decoder.decode_block(&message.data) {
                     Ok(block) => {
+                        let fresh_status_tip = status_seen_at
+                            .get(&propagation_source)
+                            .filter(|seen_at| seen_at.elapsed() <= STATUS_FRESHNESS_TIMEOUT)
+                            .and_then(|_| peer_tips.get(&propagation_source).copied());
+                        if next_expected.is_none_or(|expected| block.height() == expected)
+                            && observe_next_block(
+                                propagation_source,
+                                block.height(),
+                                fresh_status_tip,
+                                &mut observed_block_heights,
+                            )
+                        {
+                            publish_network_view(
+                                &network_tx,
+                                &active_peers,
+                                &peer_tips,
+                                &observed_block_heights,
+                                &finalized_by_peer,
+                                &status_seen_at,
+                            );
+                        }
                         // A gap here means a gossiped block was dropped
                         // somewhere between it and us — ask the same peer to
                         // fill in what we're missing. The gossiped block
@@ -591,12 +745,14 @@ where
                         if let Some(expected) = next_expected
                             && block.height() > expected
                         {
-                            send_sync_request(
+                            let _ = send_sync_request(
                                 &mut swarm,
                                 &propagation_source,
                                 &SyncRequest::Blocks { from: expected },
                             );
                         }
+                        let expected_before = next_expected;
+                        let received_height = block.height();
                         if !insert_and_drain(
                             block,
                             &mut next_expected,
@@ -608,6 +764,32 @@ where
                         {
                             return Ok(());
                         }
+                        // Cap the credited tip at `received_height`: `insert_and_drain`
+                        // may also drain blocks that were sitting in `pending` from a
+                        // different peer (e.g. an earlier ahead-of-gap gossip, or a
+                        // disconnected peer's now-unattributable buffer). Crediting
+                        // this peer past its own block would misattribute another
+                        // peer's provenance to whoever happened to close the gap.
+                        let contiguous_tip = next_expected
+                            .and_then(|height| height.checked_sub(1))
+                            .map(|tip| tip.min(received_height));
+                        if next_expected > expected_before
+                            && observe_contiguous_tip(
+                                propagation_source,
+                                contiguous_tip,
+                                fresh_status_tip,
+                                &mut observed_block_heights,
+                            )
+                        {
+                            publish_network_view(
+                                &network_tx,
+                                &active_peers,
+                                &peer_tips,
+                                &observed_block_heights,
+                                &finalized_by_peer,
+                                &status_seen_at,
+                            );
+                        }
                     }
                     Err(err) => {
                         warn!("undecodable gossiped block from {propagation_source}: {err}");
@@ -616,9 +798,14 @@ where
             }
             SwarmEvent::Behaviour(BehaviourEvent::Sync(request_response::Event::Message {
                 peer,
-                message: request_response::Message::Response { response, .. },
+                message:
+                    request_response::Message::Response {
+                        request_id,
+                        response,
+                    },
                 ..
             })) => {
+                let status_requested_at = status_requests.remove(&request_id);
                 let sync_response = match decoder.decode_sync_response(&response) {
                     Ok(resp) => resp,
                     Err(err) => {
@@ -628,18 +815,26 @@ where
                 };
                 match sync_response {
                     SyncResponse::Status { tip_height } => {
+                        reconcile_observed_tip(
+                            peer,
+                            tip_height,
+                            status_requested_at,
+                            &mut observed_block_heights,
+                        );
                         peer_tips.insert(peer, tip_height);
                         status_seen_at.insert(peer, Instant::now());
                         publish_network_view(
                             &network_tx,
                             &active_peers,
                             &peer_tips,
+                            &observed_block_heights,
                             &finalized_by_peer,
                             &status_seen_at,
                         );
                         let from = next_expected.unwrap_or(1);
                         if tip_height >= from {
-                            send_sync_request(&mut swarm, &peer, &SyncRequest::Blocks { from });
+                            let _ =
+                                send_sync_request(&mut swarm, &peer, &SyncRequest::Blocks { from });
                         }
                     }
                     SyncResponse::NodeInfo(info) => {
@@ -651,6 +846,12 @@ where
                                 "sync wire version mismatch; newer fields may be missing"
                             );
                         }
+                        reconcile_observed_tip(
+                            peer,
+                            info.tip_height,
+                            status_requested_at,
+                            &mut observed_block_heights,
+                        );
                         peer_tips.insert(peer, info.tip_height);
                         finalized_by_peer.insert(peer, info.finalized_height);
                         status_seen_at.insert(peer, Instant::now());
@@ -658,6 +859,7 @@ where
                             &network_tx,
                             &active_peers,
                             &peer_tips,
+                            &observed_block_heights,
                             &finalized_by_peer,
                             &status_seen_at,
                         );
@@ -671,6 +873,34 @@ where
                     }
                     SyncResponse::Blocks(mut blocks) => {
                         blocks.sort_by_key(|b| b.height());
+                        let fresh_status_tip = status_seen_at
+                            .get(&peer)
+                            .filter(|seen_at| seen_at.elapsed() <= STATUS_FRESHNESS_TIMEOUT)
+                            .and_then(|_| peer_tips.get(&peer).copied());
+                        let mut network_view_changed = false;
+                        for block in &blocks {
+                            network_view_changed |= observe_next_block(
+                                peer,
+                                block.height(),
+                                fresh_status_tip,
+                                &mut observed_block_heights,
+                            );
+                        }
+                        if network_view_changed {
+                            publish_network_view(
+                                &network_tx,
+                                &active_peers,
+                                &peer_tips,
+                                &observed_block_heights,
+                                &finalized_by_peer,
+                                &status_seen_at,
+                            );
+                        }
+                        let expected_before = next_expected;
+                        // `blocks` is sorted ascending above, so its last element is
+                        // this response's own highest height — captured before the
+                        // move below.
+                        let received_height = blocks.last().map(|b| b.height());
                         for block in blocks {
                             if !insert_and_drain(
                                 block,
@@ -684,19 +914,53 @@ where
                                 return Ok(());
                             }
                         }
+                        // Cap the credited tip at `received_height`: `insert_and_drain`
+                        // may also drain blocks that were sitting in `pending` from a
+                        // different peer (e.g. an earlier ahead-of-gap gossip, or a
+                        // disconnected peer's now-unattributable buffer). Crediting
+                        // this peer past its own response would misattribute another
+                        // peer's provenance to whoever happened to close the gap.
+                        let contiguous_tip = next_expected
+                            .and_then(|height| height.checked_sub(1))
+                            .zip(received_height)
+                            .map(|(tip, received)| tip.min(received));
+                        if next_expected > expected_before
+                            && observe_contiguous_tip(
+                                peer,
+                                contiguous_tip,
+                                fresh_status_tip,
+                                &mut observed_block_heights,
+                            )
+                        {
+                            publish_network_view(
+                                &network_tx,
+                                &active_peers,
+                                &peer_tips,
+                                &observed_block_heights,
+                                &finalized_by_peer,
+                                &status_seen_at,
+                            );
+                        }
                         // Server-side responses are capped at a page size
                         // (see `arxd/network`), so keep paging until we've
                         // caught up to this peer's last-known tip.
                         let from = next_expected.unwrap_or(1);
                         if peer_tips.get(&peer).is_some_and(|&tip| tip >= from) {
-                            send_sync_request(&mut swarm, &peer, &SyncRequest::Blocks { from });
+                            let _ =
+                                send_sync_request(&mut swarm, &peer, &SyncRequest::Blocks { from });
                         }
                     }
                 }
             }
             SwarmEvent::Behaviour(BehaviourEvent::Sync(
-                request_response::Event::OutboundFailure { peer, error, .. },
+                request_response::Event::OutboundFailure {
+                    peer,
+                    request_id,
+                    error,
+                    ..
+                },
             )) => {
+                status_requests.remove(&request_id);
                 warn!("sync request to {peer} failed: {error}");
             }
             _ => {}
@@ -723,6 +987,13 @@ mod tests {
         }
     }
 
+    fn observed_tip(height: u64) -> ObservedTip {
+        ObservedTip {
+            height,
+            observed_at: Instant::now(),
+        }
+    }
+
     #[test]
     fn status_is_fresh_only_when_it_belongs_to_an_active_peer() {
         let mut view = NetworkView {
@@ -744,6 +1015,10 @@ mod tests {
         let fresh_peer = PeerId::random();
         let active_peers = HashSet::from([stale_peer, fresh_peer]);
         let peer_tips = HashMap::from([(stale_peer, 100), (fresh_peer, 42)]);
+        let observed_block_heights = HashMap::from([
+            (stale_peer, observed_tip(101)),
+            (fresh_peer, observed_tip(43)),
+        ]);
         let finalized_by_peer = HashMap::from([(stale_peer, Some(99)), (fresh_peer, Some(40))]);
         let status_seen_at = HashMap::from([
             (
@@ -758,14 +1033,116 @@ mod tests {
             &network_tx,
             &active_peers,
             &peer_tips,
+            &observed_block_heights,
             &finalized_by_peer,
             &status_seen_at,
         );
 
         let view = *network_rx.borrow();
         assert!(view.has_fresh_status());
-        assert_eq!(view.tip_height, Some(42));
+        assert_eq!(view.tip_height, Some(43));
         assert_eq!(view.finalized_height, Some(40));
+    }
+
+    #[test]
+    fn observed_blocks_advance_a_fresh_peers_network_tip() {
+        let peer = PeerId::random();
+        let active_peers = HashSet::from([peer]);
+        let peer_tips = HashMap::from([(peer, 40)]);
+        let observed_block_heights = HashMap::from([(peer, observed_tip(42))]);
+        let status_seen_at = HashMap::from([(peer, Instant::now())]);
+        let (network_tx, network_rx) = tokio::sync::watch::channel(NetworkView::default());
+
+        publish_network_view(
+            &network_tx,
+            &active_peers,
+            &peer_tips,
+            &observed_block_heights,
+            &HashMap::new(),
+            &status_seen_at,
+        );
+
+        let view = *network_rx.borrow();
+        assert!(view.has_fresh_status());
+        assert_eq!(view.tip_height, Some(42));
+    }
+
+    #[test]
+    fn observed_blocks_must_extend_a_fresh_status_tip_sequentially() {
+        let peer = PeerId::random();
+        let mut observed_block_heights = HashMap::new();
+
+        assert!(!observe_next_block(
+            peer,
+            42,
+            Some(40),
+            &mut observed_block_heights
+        ));
+        assert!(observe_next_block(
+            peer,
+            41,
+            Some(40),
+            &mut observed_block_heights
+        ));
+        assert!(observe_next_block(
+            peer,
+            42,
+            Some(40),
+            &mut observed_block_heights
+        ));
+        assert!(!observe_next_block(
+            peer,
+            43,
+            None,
+            &mut observed_block_heights
+        ));
+        assert_eq!(
+            observed_block_heights.get(&peer).map(|tip| tip.height),
+            Some(42)
+        );
+    }
+
+    #[test]
+    fn a_status_requested_after_an_observation_can_retire_it() {
+        let peer = PeerId::random();
+        let observed_at = Instant::now() - Duration::from_secs(2);
+        let mut observed_block_heights = HashMap::from([(
+            peer,
+            ObservedTip {
+                height: 42,
+                observed_at,
+            },
+        )]);
+
+        reconcile_observed_tip(
+            peer,
+            40,
+            Some(observed_at - Duration::from_secs(1)),
+            &mut observed_block_heights,
+        );
+        assert!(observed_block_heights.contains_key(&peer));
+
+        reconcile_observed_tip(
+            peer,
+            40,
+            Some(observed_at + Duration::from_secs(1)),
+            &mut observed_block_heights,
+        );
+        assert!(!observed_block_heights.contains_key(&peer));
+    }
+
+    #[test]
+    fn contiguous_drain_requires_a_sequential_observation() {
+        let peer = PeerId::random();
+        let mut observed_block_heights = HashMap::new();
+
+        assert!(!observe_contiguous_tip(
+            peer,
+            Some(1_000),
+            Some(10),
+            &mut observed_block_heights,
+        ));
+        assert!(observed_block_heights.is_empty());
     }
 
     /// Produced from the sibling Arxium checkout at exact commit
@@ -829,6 +1206,48 @@ mod tests {
             Some(4),
             "draining the gap should also release the buffered block 3"
         );
+
+        let mut heights = vec![];
+        while let Ok(b) = rx.try_recv() {
+            heights.push(b.height);
+        }
+        assert_eq!(heights, vec![1, 2, 3]);
+    }
+
+    /// Mirrors `gap_fill_backfill_is_not_dropped_by_a_later_gossip_block`'s
+    /// scenario, but checks the network-tip crediting done around
+    /// `insert_and_drain` in `run`: the peer that closes a gap must not be
+    /// credited for a higher-height block it never itself sent, just because
+    /// draining `pending` happened to sweep that block in too. Height 3 here
+    /// stands in for a block gossiped by some *other*, possibly now
+    /// disconnected, peer.
+    #[tokio::test]
+    async fn closing_a_gap_does_not_credit_another_peers_buffered_block() {
+        let (tx, mut rx) = channel(300);
+        let mut next_expected = Some(1);
+        let mut pending = BTreeMap::new();
+
+        // Some other peer's gossip buffers height 3 ahead of the gap.
+        assert!(insert_and_drain(block(3), &mut next_expected, &mut pending, &tx, CAP).await);
+
+        // This peer's own response only ever claimed heights 1 and 2.
+        let expected_before = next_expected;
+        let received_height = 2;
+        assert!(insert_and_drain(block(1), &mut next_expected, &mut pending, &tx, CAP).await);
+        assert!(insert_and_drain(block(2), &mut next_expected, &mut pending, &tx, CAP).await);
+
+        // The drain also swept in height 3, so naively crediting
+        // `next_expected - 1` would misattribute it to this peer.
+        assert_eq!(next_expected, Some(4));
+        let contiguous_tip = next_expected
+            .and_then(|height| height.checked_sub(1))
+            .map(|tip| tip.min(received_height));
+        assert_eq!(
+            contiguous_tip,
+            Some(2),
+            "credit must be capped at what this peer actually sent, not what pending swept in"
+        );
+        assert!(next_expected > expected_before);
 
         let mut heights = vec![];
         while let Ok(b) = rx.try_recv() {
