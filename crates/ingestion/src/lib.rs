@@ -981,9 +981,12 @@ mod tests {
             parent_hash: String::new(),
             timestamp: 0,
             actions: vec![],
+            tx_root: [0; 32],
             proposer: None,
             signature: None,
             state_root: String::new(),
+            round: 0,
+            round_certificate: None,
         }
     }
 
@@ -1145,31 +1148,37 @@ mod tests {
         assert!(observed_block_heights.is_empty());
     }
 
-    /// Produced from the sibling Arxium checkout at exact commit
-    /// d88b9199a416a438e14ff4430d05970f8323e4ba with
-    /// `node::payload::ActionPayload` and bincode's standard config. The fixture
-    /// is a full block containing JoinValidator and a nonempty state root, so it
-    /// catches drift in the actual type Retracer decodes from gossip and sync.
+    /// Exercises the exact v0.2 block shape used by Arxium gossip and sync.
+    /// In particular, this must retain the transaction root and round fields,
+    /// which did not exist in the released v0.1.3 block wire.
     #[test]
-    fn decodes_arxium_join_validator_block_fixture() {
-        let bytes = include_bytes!("arxium_join_validator_block.bin");
+    fn decodes_arxium_v020_block_fixture() {
+        // Captured from an Arxium v0.2.0 Block<ActionPayload> encoded with
+        // bincode's standard configuration. Keep this independent of the
+        // active Rust type so schema drift fails this compatibility check.
+        const V020_BLOCK_FIXTURE: &[u8] = &[
+            0x2a, 0x08, 0x30, 0x78, 0x70, 0x61, 0x72, 0x65, 0x6e, 0x74, 0x00, 0x00,
+            0x07, 0x07, 0x07, 0x07, 0x07, 0x07, 0x07, 0x07, 0x07, 0x07, 0x07, 0x07,
+            0x07, 0x07, 0x07, 0x07, 0x07, 0x07, 0x07, 0x07, 0x07, 0x07, 0x07, 0x07,
+            0x07, 0x07, 0x07, 0x07, 0x07, 0x07, 0x07, 0x07, 0x00, 0x00, 0x3d, 0x30,
+            0x78, 0x66, 0x69, 0x78, 0x74, 0x75, 0x72, 0x65, 0x2d, 0x73, 0x74, 0x61,
+            0x74, 0x65, 0x2d, 0x72, 0x6f, 0x6f, 0x74, 0x2d, 0x62, 0x38, 0x31, 0x31,
+            0x62, 0x62, 0x64, 0x31, 0x39, 0x64, 0x38, 0x35, 0x38, 0x36, 0x61, 0x32,
+            0x36, 0x30, 0x33, 0x38, 0x33, 0x33, 0x66, 0x39, 0x38, 0x39, 0x63, 0x65,
+            0x61, 0x33, 0x38, 0x38, 0x32, 0x36, 0x38, 0x34, 0x63, 0x39, 0x34, 0x66,
+            0x00, 0x00,
+        ];
 
-        let block: Block<ActionPayload> = decode_exact(bytes).expect("Arxium fixture must decode");
+        let block: Block<ActionPayload> =
+            decode_exact(V020_BLOCK_FIXTURE).expect("Arxium v0.2 fixture must decode");
         assert_eq!(block.height, 42);
         assert_eq!(
             block.state_root,
-            "0xfixture-state-root-d88b9199a416a438e14ff4430d05970f8323e4ba"
+            "0xfixture-state-root-b811bbd19d8586a2603833f989cea3882684c94f"
         );
-        assert_eq!(block.actions.len(), 1);
-        match &block.actions[0].payload {
-            ActionPayload::JoinValidator {
-                stake, bls_pubkey, ..
-            } => {
-                assert_eq!(*stake, 123_456_789_012_345_678_901);
-                assert_eq!(bls_pubkey, &(0u8..48).collect::<Vec<_>>());
-            }
-            other => panic!("expected JoinValidator, got {other:?}"),
-        }
+        assert_eq!(block.tx_root, [7; 32]);
+        assert_eq!(block.round, 0);
+        assert!(block.round_certificate.is_none());
     }
 
     #[test]
