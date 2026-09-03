@@ -351,6 +351,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "blst"
+version = "0.3.17"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c20659f9bbee16cbbd2f7393e40ab6309f5a98f76a2eb57a995ec508b72387fe"
+dependencies = [
+ "cc",
+ "glob",
+ "threadpool",
+ "zeroize",
+]
+
+[[package]]
 name = "bs58"
 version = "0.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1136,6 +1148,12 @@ dependencies = [
  "opaque-debug",
  "polyval",
 ]
+
+[[package]]
+name = "glob"
+version = "0.3.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e4eba85ea1d0a966a983acd07deee566e67395d2d96b6fb39e62b5a833f1eb0b"
 
 [[package]]
 name = "grpc-service"
@@ -2386,6 +2404,16 @@ checksum = "071dfc062690e90b734c0b2273ce72ad0ffa95f0c74596bc250dcfd960262841"
 dependencies = [
  "autocfg",
  "libm",
+]
+
+[[package]]
+name = "num_cpus"
+version = "1.17.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "91df4bbde75afed763b708b7eee1e8e7651e02d97f6d5dd763e89367e957b23b"
+dependencies = [
+ "hermit-abi",
+ "libc",
 ]
 
 [[package]]
@@ -3839,6 +3867,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "threadpool"
+version = "1.8.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d050e60b33d41c19108b32cea32164033a9013fe3b46cbd4457559bfbf77afaa"
+dependencies = [
+ "num_cpus",
+]
+
+[[package]]
 name = "time"
 version = "0.3.55"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4767,10 +4804,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "xc-bls"
+version = "0.1.0"
+source = "git+https://github.com/Arxium-Protocol/Arxium?rev=b811bbd19d8586a2603833f989cea3882684c94f#b811bbd19d8586a2603833f989cea3882684c94f"
+dependencies = [
+ "blst",
+ "serde",
+ "thiserror 2.0.20",
+]
+
+[[package]]
 name = "xc-primitives"
 version = "0.1.0"
-source = "git+https://github.com/Arxium-Protocol/Arxium?rev=d88b9199a416a438e14ff4430d05970f8323e4ba#d88b9199a416a438e14ff4430d05970f8323e4ba"
+source = "git+https://github.com/Arxium-Protocol/Arxium?rev=b811bbd19d8586a2603833f989cea3882684c94f#b811bbd19d8586a2603833f989cea3882684c94f"
 dependencies = [
+ "anyhow",
  "bech32",
  "bincode",
  "ed25519-dalek 3.0.0",
@@ -4779,6 +4827,7 @@ dependencies = [
  "serde_json",
  "sha2 0.11.0",
  "thiserror 2.0.20",
+ "xc-bls",
 ]
 
 [[package]]

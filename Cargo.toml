@@ -39,7 +39,7 @@ sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio",
 # wire types (Action<P>/Block<P>) stay byte-compatible with what arxd actually
 # gossips. xc-primitives is the same crate a third-party indexer would need —
 # replace this revision pin with a stable tag when Arxium publishes one.
-xc-primitives = { git = "https://github.com/Arxium-Protocol/Arxium", rev = "d88b9199a416a438e14ff4430d05970f8323e4ba" }
+xc-primitives = { git = "https://github.com/Arxium-Protocol/Arxium", rev = "b811bbd19d8586a2603833f989cea3882684c94f" }
 # The sync protocol's wire shapes, shared with the node rather than copied.
 # Before this crate existed these were hand-vendored here, and bincode carries
 # no version tag — a field added node-side decoded as garbage with no error.
