@@ -58,9 +58,12 @@ fn block(height: u64, parent: &str, actions: Vec<Action<TestPayload>>) -> Block<
         parent_hash: parent.to_string(),
         timestamp: 1_700_000_000 + height as i64 as u64,
         actions,
+        tx_root: [0; 32],
         proposer: Some(addr(9)),
         signature: None,
         state_root: String::new(),
+        round: 0,
+        round_certificate: None,
     }
 }
 
@@ -484,9 +487,12 @@ async fn count_proposers_in_range_only_counts_heights_inside_the_bound() {
             parent_hash: parent.to_string(),
             timestamp: 1_700_000_000 + height,
             actions: vec![],
+            tx_root: [0; 32],
             proposer: Some(addr(proposer)),
             signature: None,
             state_root: String::new(),
+            round: 0,
+            round_certificate: None,
         }
     };
 

@@ -1146,9 +1146,12 @@ mod tests {
             parent_hash: String::new(),
             timestamp: 0,
             actions,
+            tx_root: [0; 32],
             proposer: None,
             signature: None,
             state_root: String::new(),
+            round: 0,
+            round_certificate: None,
         }
     }
 
