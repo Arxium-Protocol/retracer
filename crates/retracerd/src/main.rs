@@ -38,7 +38,7 @@ async fn main() -> Result<()> {
     retracer_core::run_with_decoder::<retracer_core::corechain_wire::CoreChainBlock>(
         args,
         hooks,
-        retracer_core::corechain_wire::decoder(),
+        retracer_core::corechain_wire::tolerant_decoder(),
     )
     .await
 }

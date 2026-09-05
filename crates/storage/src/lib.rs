@@ -826,6 +826,7 @@ pub fn block_row_from_wire<B: IndexableBlock>(block: &B) -> Result<BlockRow> {
         parent_hash: block.parent_hash(),
         timestamp: block.timestamp() as i64,
         proposer: block.proposer(),
+        undecoded_action_count: count_undecoded(&actions),
         actions,
     })
 }
@@ -847,7 +848,18 @@ pub struct BlockRow {
     pub parent_hash: String,
     pub timestamp: i64,
     pub proposer: Option<String>,
+    /// How many of `actions` are `kind == "unknown"` — a tolerant decode
+    /// (see `corechain_wire::tolerant_decoder`) couldn't interpret their
+    /// payload, but kept them as rows rather than dropping them, so the
+    /// block stays complete. Derived from `actions` at construction time,
+    /// not stored: "unknown" is exactly what `split_kind` produces for a
+    /// multi-key unknown-action payload, so no schema change is needed.
+    pub undecoded_action_count: usize,
     pub actions: Vec<ActionRow>,
+}
+
+fn count_undecoded(actions: &[ActionRow]) -> usize {
+    actions.iter().filter(|a| a.kind == "unknown").count()
 }
 
 async fn actions_for_block(pool: &PgPool, chain_id: &str, height: i64) -> Result<Vec<ActionRow>> {
@@ -884,6 +896,7 @@ pub async fn get_block_by_height(
         parent_hash: row.parent_hash,
         timestamp: row.timestamp,
         proposer: row.proposer,
+        undecoded_action_count: count_undecoded(&actions),
         actions,
     }))
 }
@@ -910,6 +923,7 @@ pub async fn get_block_by_hash(
         parent_hash: row.parent_hash,
         timestamp: row.timestamp,
         proposer: row.proposer,
+        undecoded_action_count: count_undecoded(&actions),
         actions,
     }))
 }
@@ -1069,16 +1083,18 @@ pub async fn get_blocks_in_range(
 
     Ok(rows
         .into_iter()
-        .map(
-            |(height, hash, parent_hash, timestamp, proposer)| BlockRow {
-                actions: by_height.remove(&height).unwrap_or_default(),
+        .map(|(height, hash, parent_hash, timestamp, proposer)| {
+            let actions = by_height.remove(&height).unwrap_or_default();
+            BlockRow {
+                undecoded_action_count: count_undecoded(&actions),
+                actions,
                 height,
                 hash,
                 parent_hash,
                 timestamp,
                 proposer,
-            },
-        )
+            }
+        })
         .collect())
 }
 

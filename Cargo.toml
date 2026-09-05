@@ -44,3 +44,11 @@ xc-primitives = { git = "https://github.com/Arxium-Protocol/arxium", rev = "ed2a
 # Before this crate existed these were hand-vendored here, and bincode carries
 # no version tag — a field added node-side decoded as garbage with no error.
 xc-wire = { git = "https://github.com/Arxium-Protocol/arxium", rev = "ed2a1fa6564b7f5b53624e2927a8542dd74f2fff" }
+
+# ponytail: local override to build/test against Arxium's not-yet-pushed
+# security fixes (bad6330: full-consumption + with_limit on untrusted bincode
+# decodes) before re-pinning `rev` above. Remove this section and bump `rev`
+# once bad6330 is pushed to arxium.git.
+[patch."https://github.com/Arxium-Protocol/arxium"]
+xc-primitives = { path = "../Arxium/core/primitives" }
+xc-wire = { path = "../Arxium/core/wire" }

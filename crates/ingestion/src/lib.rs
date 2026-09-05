@@ -16,7 +16,8 @@ use tracing::{info, warn};
 use xc_primitives::{Action, Block, RawAction, RawBlock};
 
 fn decode_exact<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> Result<T> {
-    let (value, consumed) = bincode::serde::decode_from_slice(bytes, bincode::config::standard())?;
+    let (value, consumed) =
+        bincode::serde::decode_from_slice(bytes, xc_primitives::wire_config())?;
     anyhow::ensure!(
         consumed == bytes.len(),
         "trailing bytes after bincode value"
@@ -28,19 +29,34 @@ fn decode_exact<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> Result<T> {
 /// a warning) any action whose payload doesn't decode as `P` instead of
 /// failing the whole block. This is what makes an out-of-date `ActionPayload`
 /// mirror non-fatal: see `Action<P>`'s wire format in xc_primitives::action.
+///
+/// A payload that decodes but leaves trailing bytes (e.g. a peer padding it
+/// by a byte) is treated the same as one that fails to decode at all —
+/// accepting it would mean this action's decoded value re-encodes to
+/// different bytes than actually arrived on the wire, which is exactly what
+/// would make its `tx_root`/hash contribution unreproducible. See
+/// `Implementation_log_2026-09-05.md`.
 fn raw_block_into_tolerant<P: serde::de::DeserializeOwned>(raw: RawBlock) -> Block<P> {
     let actions = raw
         .actions
         .into_iter()
         .filter_map(|ra: RawAction| {
-            match bincode::serde::decode_from_slice::<P, _>(&ra.payload, bincode::config::standard())
+            match bincode::serde::decode_from_slice::<P, _>(&ra.payload, xc_primitives::wire_config())
             {
-                Ok((payload, _)) => Some(Action {
+                Ok((payload, consumed)) if consumed == ra.payload.len() => Some(Action {
                     sender: ra.sender,
                     nonce: ra.nonce,
                     signature: ra.signature,
                     payload,
                 }),
+                Ok(_) => {
+                    warn!(
+                        sender = %ra.sender,
+                        nonce = ra.nonce,
+                        "skipping action with non-canonically-encoded payload"
+                    );
+                    None
+                }
                 Err(err) => {
                     warn!(
                         sender = %ra.sender,
@@ -1568,6 +1584,46 @@ mod tests {
             block.actions[0].payload,
             ActionPayload::RevokeOperator
         ));
+    }
+
+    /// A payload that decodes as a recognized variant but leaves trailing
+    /// bytes (padded by a peer) must be treated as unrecognized and skipped,
+    /// not accepted with the padding silently dropped — otherwise the
+    /// action's decoded value would re-encode to different bytes than
+    /// arrived, breaking `tx_root` reproducibility. See
+    /// `Implementation_log_2026-09-05.md`.
+    #[test]
+    fn tolerant_decoder_skips_non_canonically_padded_payload() {
+        let sender = xc_primitives::Address::from_pubkey_bytes(&[7u8; 32]).unwrap();
+        let mut padded_bytes = bincode::serde::encode_to_vec(
+            &ActionPayload::RevokeOperator,
+            bincode::config::standard(),
+        )
+        .unwrap();
+        padded_bytes.push(0xff);
+
+        let raw = RawBlock {
+            height: 7,
+            parent_hash: String::new(),
+            timestamp: 0,
+            actions: vec![RawAction {
+                sender,
+                nonce: 1,
+                signature: None,
+                payload: padded_bytes,
+            }],
+            tx_root: [0; 32],
+            proposer: None,
+            signature: None,
+            state_root: String::new(),
+            round: 0,
+            round_certificate: None,
+        };
+        let encoded = bincode::serde::encode_to_vec(&raw, bincode::config::standard()).unwrap();
+
+        let block: Block<ActionPayload> =
+            decode_block_tolerant(&encoded).expect("tolerant decode should skip, not fail");
+        assert!(block.actions.is_empty(), "padded action must be dropped, not accepted");
     }
 
     /// Reproduces the gap-fill race this fix closes: a gossiped block

@@ -3,7 +3,7 @@ use ingestion::{ActionPayload, HasHeight, WireDecoder};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use sha2::{Digest, Sha256};
 use storage::{IndexableAction, IndexableBlock};
-use xc_primitives::{Action, Address, Block};
+use xc_primitives::{Action, Address, Block, RawAction, RawBlock};
 use xc_wire::SyncResponse;
 
 /// CoreChain block normalized for indexing while retaining the hash from its
@@ -78,8 +78,24 @@ pub fn decoder() -> WireDecoder<CoreChainBlock> {
     WireDecoder::new(decode_block, decode_sync_response)
 }
 
+/// Like [`decoder`], but a current-generation block whose action payload
+/// doesn't decode as `ActionPayload` (an unrecognized variant, or a
+/// non-canonically-padded one) is kept, not dropped: it becomes a
+/// `CoreChainAction` with a synthetic multi-key payload — see
+/// [`unknown_action`] — which `storage::split_kind` classifies as
+/// `kind = "unknown"` rather than silently shrinking the block's action list.
+/// This is what CoreChain's explorer uses (never `ingestion::WireDecoder::tolerant`,
+/// which drops unrecognized actions outright — honest for a chain that
+/// accepts that loss, not for a compliance explorer that must stay a
+/// complete, externally-verifiable view of the chain). The legacy arm is
+/// unaffected: v0.1.x is a frozen historical format that never gains new
+/// variants, so it stays exact-decode-only, exactly like [`decoder`].
+pub fn tolerant_decoder() -> WireDecoder<CoreChainBlock> {
+    WireDecoder::new(decode_block_tolerant, decode_sync_response_tolerant)
+}
+
 fn decode_exact<T: DeserializeOwned>(bytes: &[u8]) -> Result<T> {
-    let (value, consumed) = bincode::serde::decode_from_slice(bytes, bincode::config::standard())?;
+    let (value, consumed) = bincode::serde::decode_from_slice(bytes, xc_primitives::wire_config())?;
     anyhow::ensure!(
         consumed == bytes.len(),
         "trailing bytes after bincode value"
@@ -117,6 +133,129 @@ fn decode_sync_response(bytes: &[u8]) -> Result<SyncResponse<CoreChainBlock>> {
             "unsupported CoreChain sync wire: current decode failed ({current_err}); legacy decode failed ({legacy_err})"
         )),
     }
+}
+
+fn decode_block_tolerant(bytes: &[u8]) -> Result<CoreChainBlock> {
+    let current = decode_exact::<RawBlock>(bytes);
+    let legacy = decode_exact::<LegacyBlock>(bytes);
+    match (current, legacy) {
+        (Ok(_), Ok(_)) => Err(anyhow!("ambiguous CoreChain block wire generation")),
+        (Ok(raw), Err(_)) => Ok(normalize_current_block_tolerant(raw)),
+        (Err(_), Ok(block)) => normalize_legacy_block(block),
+        (Err(current_err), Err(legacy_err)) => Err(anyhow!(
+            "unsupported CoreChain block wire: current decode failed ({current_err}); legacy decode failed ({legacy_err})"
+        )),
+    }
+}
+
+fn decode_sync_response_tolerant(bytes: &[u8]) -> Result<SyncResponse<CoreChainBlock>> {
+    // `SyncResponse<RawBlock>` shares `SyncResponse<Block<ActionPayload>>`'s
+    // exact wire layout (see `ingestion::decode_sync_response_tolerant`), so
+    // this always decodes structurally when the generation is "current".
+    let current = decode_exact::<SyncResponse<RawBlock>>(bytes);
+    let legacy = decode_exact::<SyncResponse<LegacyBlock>>(bytes);
+    match (current, legacy) {
+        (Ok(current), Ok(legacy)) => {
+            if matches!((&current, &legacy), (SyncResponse::Blocks(a), SyncResponse::Blocks(b)) if !a.is_empty() || !b.is_empty())
+            {
+                return Err(anyhow!("ambiguous CoreChain sync block wire generation"));
+            }
+            Ok(normalize_current_response_tolerant(current))
+        }
+        (Ok(response), Err(_)) => Ok(normalize_current_response_tolerant(response)),
+        (Err(_), Ok(response)) => normalize_legacy_response(response),
+        (Err(current_err), Err(legacy_err)) => Err(anyhow!(
+            "unsupported CoreChain sync wire: current decode failed ({current_err}); legacy decode failed ({legacy_err})"
+        )),
+    }
+}
+
+fn normalize_current_response_tolerant(
+    response: SyncResponse<RawBlock>,
+) -> SyncResponse<CoreChainBlock> {
+    match response {
+        SyncResponse::Status { tip_height } => SyncResponse::Status { tip_height },
+        SyncResponse::Blocks(blocks) => {
+            SyncResponse::Blocks(blocks.into_iter().map(normalize_current_block_tolerant).collect())
+        }
+        SyncResponse::NodeInfo(info) => SyncResponse::NodeInfo(info),
+        SyncResponse::Hashes(hashes) => SyncResponse::Hashes(hashes),
+    }
+}
+
+/// Unlike [`normalize_current_block`], hashes the [`RawBlock`] itself (never
+/// a `Block<ActionPayload>` built from only the actions that happened to
+/// decode) — `RawBlock::hash()` reproduces the real on-chain hash regardless
+/// of how many actions this reader could interpret, so a block with an
+/// unknown action still gets the hash it actually has on-chain, not one
+/// silently computed over a truncated action list.
+fn normalize_current_block_tolerant(raw: RawBlock) -> CoreChainBlock {
+    let hash = raw.hash();
+    CoreChainBlock {
+        height: raw.height,
+        hash,
+        parent_hash: raw.parent_hash,
+        timestamp: raw.timestamp,
+        proposer: raw.proposer.map(|address| address.to_string()),
+        actions: raw
+            .actions
+            .into_iter()
+            .map(normalize_raw_action_tolerant)
+            .collect(),
+    }
+}
+
+/// Decodes one action's raw payload as `ActionPayload`, falling back to
+/// [`unknown_action`] for a variant this reader's copy of `ActionPayload`
+/// doesn't recognize, or for a non-canonically-padded payload (same
+/// treatment as a genuine unknown — see `Action<P>`'s `Deserialize` impl and
+/// `Implementation_log_2026-09-05.md`). Never drops the action outright: an
+/// explorer that silently shrank a block's action list would misreport what
+/// actually happened on-chain.
+fn normalize_raw_action_tolerant(ra: RawAction) -> CoreChainAction {
+    let decoded =
+        bincode::serde::decode_from_slice::<ActionPayload, _>(&ra.payload, xc_primitives::wire_config());
+    match decoded {
+        Ok((payload, consumed)) if consumed == ra.payload.len() => CoreChainAction {
+            sender: ra.sender.to_string(),
+            identity: ra.signature.filter(|signature| !signature.is_empty()),
+            payload: serde_json::to_value(payload)
+                .unwrap_or_else(|err| unknown_payload(&ra.payload, ra.nonce, &err.to_string())),
+        },
+        Ok(_) => unknown_action(ra, "non-canonically-encoded payload (trailing bytes)"),
+        Err(err) => unknown_action(ra, &format!("unrecognized payload variant: {err}")),
+    }
+}
+
+/// Builds the `CoreChainAction` for an action whose payload this reader
+/// couldn't interpret. The payload JSON deliberately has more than one key,
+/// so `storage::split_kind` falls through to `kind = "unknown"` instead of
+/// treating it as a recognized single-variant action — see
+/// `storage::wire::split_kind`. `discriminant` is a best-effort read of the
+/// bincode variant index prefix (not validated against any known enum), kept
+/// even when payload interpretation otherwise fails, since it's often enough
+/// on its own to tell which future variant this was.
+fn unknown_action(ra: RawAction, reason: &str) -> CoreChainAction {
+    let sender = ra.sender.to_string();
+    let identity = ra.signature.filter(|signature| !signature.is_empty());
+    CoreChainAction {
+        sender,
+        identity,
+        payload: unknown_payload(&ra.payload, ra.nonce, reason),
+    }
+}
+
+fn unknown_payload(raw_payload: &[u8], nonce: u64, reason: &str) -> serde_json::Value {
+    let discriminant =
+        bincode::serde::decode_from_slice::<u32, _>(raw_payload, bincode::config::standard())
+            .ok()
+            .map(|(discriminant, _)| discriminant);
+    serde_json::json!({
+        "discriminant": discriminant,
+        "raw_payload_hex": hex::encode(raw_payload),
+        "nonce": nonce,
+        "reason": reason,
+    })
 }
 
 fn normalize_current_response(
@@ -400,6 +539,122 @@ mod tests {
             decoder()
                 .decode_block(&LEGACY_FIXTURE[..LEGACY_FIXTURE.len() - 1])
                 .is_err()
+        );
+    }
+
+    /// `tolerant_decoder`'s legacy arm must stay byte-for-byte the same as
+    /// `decoder`'s — v0.1.x is frozen and never gains new variants, so there's
+    /// nothing for the tolerant path to be tolerant *of* here.
+    #[test]
+    fn tolerant_decoder_still_decodes_the_legacy_fixture() {
+        let legacy = tolerant_decoder()
+            .decode_block(LEGACY_FIXTURE)
+            .expect("v0.1.3 fixture must decode under tolerant_decoder");
+        assert_eq!(legacy.height, 42);
+        assert_eq!(legacy.actions.len(), 2);
+    }
+
+    fn raw_block_with_one_action(action: RawAction, expected_action_count: usize) -> (RawBlock, usize) {
+        let sender = action.sender.clone();
+        let block = RawBlock {
+            height: 5,
+            parent_hash: "0xparent".to_string(),
+            timestamp: 1000,
+            actions: vec![action],
+            tx_root: [1u8; 32],
+            proposer: Some(sender),
+            signature: None,
+            state_root: "0xstate".to_string(),
+            round: 0,
+            round_certificate: None,
+        };
+        (block, expected_action_count)
+    }
+
+    /// An action whose payload doesn't decode as `ActionPayload` (here: an
+    /// out-of-range enum variant index, standing in for a variant this
+    /// reader's copy of `ActionPayload` predates) must not disappear from the
+    /// block. It becomes a `kind = "unknown"` row carrying the raw bytes, and
+    /// the block's hash must still match what `RawBlock::hash()` (i.e. the
+    /// real on-chain hash) says — never a hash computed as if the action had
+    /// been dropped.
+    #[test]
+    fn tolerant_decoder_keeps_an_unrecognized_action_as_an_unknown_row() {
+        let sender = Address::from_pubkey_bytes(&[3u8; 32]).unwrap();
+        let bogus_payload =
+            bincode::serde::encode_to_vec(&99u32, bincode::config::standard()).unwrap();
+        let (raw_block, expected_count) = raw_block_with_one_action(
+            RawAction {
+                sender,
+                nonce: 7,
+                signature: Some("deadbeef".to_string()),
+                payload: bogus_payload,
+            },
+            1,
+        );
+        let expected_hash = raw_block.hash();
+        let bytes = bincode::serde::encode_to_vec(&raw_block, xc_primitives::wire_config()).unwrap();
+
+        let decoded = tolerant_decoder()
+            .decode_block(&bytes)
+            .expect("structurally valid RawBlock must always decode");
+        assert_eq!(decoded.hash, expected_hash);
+        assert_eq!(decoded.actions.len(), expected_count);
+
+        let payload = &decoded.actions[0].payload;
+        assert!(
+            payload.get("raw_payload_hex").is_some(),
+            "unknown action must carry its raw payload bytes: {payload:?}"
+        );
+        assert_eq!(payload["nonce"], serde_json::json!(7));
+
+        // `storage::split_kind` only treats a single-key object (or a bare
+        // string, for a unit variant) as a real payload kind, falling back to
+        // "unknown" for anything else — so a multi-key object here is what
+        // makes this row classify as unknown rather than some real kind.
+        assert!(
+            payload.as_object().is_some_and(|o| o.len() > 1),
+            "unknown-row payload must not look like a single-variant payload: {payload:?}"
+        );
+    }
+
+    /// A non-canonically-padded payload (one trailing byte after an
+    /// otherwise-valid `ActionPayload` encoding) gets the same unknown-row
+    /// treatment as a genuinely unrecognized variant — accepting it would
+    /// mean the decoded action re-encodes to different bytes than arrived on
+    /// the wire. See `ingestion::raw_block_into_tolerant` for the same rule
+    /// applied to the general-purpose tolerant decoder.
+    #[test]
+    fn tolerant_decoder_treats_padded_payload_as_unknown() {
+        let sender = Address::from_pubkey_bytes(&[4u8; 32]).unwrap();
+        let mut padded_payload = bincode::serde::encode_to_vec(
+            &ActionPayload::LeaveValidator {
+                validator: sender.clone(),
+            },
+            xc_primitives::wire_config(),
+        )
+        .unwrap();
+        padded_payload.push(0xff);
+        let (raw_block, expected_count) = raw_block_with_one_action(
+            RawAction {
+                sender,
+                nonce: 3,
+                signature: Some("cafef00d".to_string()),
+                payload: padded_payload,
+            },
+            1,
+        );
+        let expected_hash = raw_block.hash();
+        let bytes = bincode::serde::encode_to_vec(&raw_block, xc_primitives::wire_config()).unwrap();
+
+        let decoded = tolerant_decoder().decode_block(&bytes).unwrap();
+        assert_eq!(decoded.hash, expected_hash);
+        assert_eq!(decoded.actions.len(), expected_count);
+        assert!(
+            decoded.actions[0]
+                .payload
+                .as_object()
+                .is_some_and(|o| o.len() > 1)
         );
     }
 }
