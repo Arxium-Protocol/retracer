@@ -136,7 +136,7 @@ pub fn parse_args() -> Result<Args> {
     let mut rest_port = Some(DEFAULT_REST_PORT);
     let mut kind_schema = DEFAULT_KIND_SCHEMA.to_string();
     let mut blocks_topic = ingestion::DEFAULT_BLOCKS_TOPIC.to_string();
-    let mut sync_protocol = ingestion::DEFAULT_SYNC_PROTOCOL.to_string();
+    let mut sync_protocol = ingestion::default_sync_protocol(&chain_id);
     let mut max_pending_blocks = ingestion::DEFAULT_MAX_PENDING_BLOCKS;
     let mut write_pool_size = DEFAULT_WRITE_POOL_SIZE;
     let mut read_pool_size = DEFAULT_READ_POOL_SIZE;

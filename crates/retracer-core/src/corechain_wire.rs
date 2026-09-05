@@ -192,12 +192,20 @@ fn normalize_legacy_block(block: LegacyBlock) -> Result<CoreChainBlock> {
         proposer: proposer.map(|address| address.to_string()),
         actions: actions
             .into_iter()
-            .map(normalize_action)
+            .map(normalize_legacy_action)
             .collect::<Result<_>>()?,
     })
 }
 
 fn normalize_action<P: Serialize>(action: Action<P>) -> Result<CoreChainAction> {
+    Ok(CoreChainAction {
+        sender: action.sender.to_string(),
+        identity: action.signature.filter(|signature| !signature.is_empty()),
+        payload: serde_json::to_value(action.payload)?,
+    })
+}
+
+fn normalize_legacy_action<P: Serialize>(action: LegacyAction<P>) -> Result<CoreChainAction> {
     Ok(CoreChainAction {
         sender: action.sender.to_string(),
         identity: action.signature.filter(|signature| !signature.is_empty()),
@@ -217,9 +225,22 @@ struct LegacyBlock {
     height: u64,
     parent_hash: String,
     timestamp: u64,
-    actions: Vec<Action<LegacyActionPayload>>,
+    actions: Vec<LegacyAction<LegacyActionPayload>>,
     proposer: Option<Address>,
     signature: Option<String>,
+}
+
+/// `xc_primitives::Action<P>`'s wire shape as it was before Track B's
+/// length-prefixed payload change — kept here, decoupled from the live type,
+/// because this fixture is a frozen historical wire format (v0.1.1-v0.1.5)
+/// that must keep decoding exactly as it always did, regardless of any later
+/// change to the current `Action<P>` encoding.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct LegacyAction<P> {
+    sender: Address,
+    nonce: u64,
+    signature: Option<String>,
+    payload: P,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

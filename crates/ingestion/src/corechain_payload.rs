@@ -46,4 +46,34 @@ pub enum ActionPayload {
         operator: Address,
     },
     RevokeOperator,
+    GrantAttestation {
+        subject: Address,
+        hash: String,
+    },
+    RevokeAttestation {
+        subject: Address,
+    },
+    RegisterAsset {
+        asset_id: String,
+        compliance_required: bool,
+    },
+    IssueAsset {
+        asset_id: String,
+        amount: u128,
+    },
+    TransferAsset {
+        asset_id: String,
+        to: Address,
+        amount: u128,
+    },
+    RegisterAttestor {
+        attestor: Address,
+        name: String,
+    },
+    DeregisterAttestor {
+        attestor: Address,
+    },
+    SubmitExecutionFault {
+        artifact_json: String,
+    },
 }

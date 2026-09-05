@@ -52,7 +52,7 @@ async fn main() -> Result<()> {
                 bootnodes: vec![],
                 port: 0,
                 blocks_topic: ingestion::DEFAULT_BLOCKS_TOPIC.into(),
-                sync_protocol: ingestion::DEFAULT_SYNC_PROTOCOL.into(),
+                sync_protocol: ingestion::default_sync_protocol("corechain-devnet"),
                 max_pending_blocks: ingestion::DEFAULT_MAX_PENDING_BLOCKS,
                 // CoreChain is single-proposer with no forks, so nothing to
                 // un-index. Zero declares that rather than leaving a rollback
