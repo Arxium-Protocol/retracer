@@ -4806,6 +4806,7 @@ dependencies = [
 [[package]]
 name = "xc-bls"
 version = "0.1.0"
+source = "git+https://github.com/Arxium-Protocol/arxium?rev=bad6330b26eb426c11f779286b946c59d1a814a8#bad6330b26eb426c11f779286b946c59d1a814a8"
 dependencies = [
  "blst",
  "serde",
@@ -4815,6 +4816,7 @@ dependencies = [
 [[package]]
 name = "xc-primitives"
 version = "0.1.0"
+source = "git+https://github.com/Arxium-Protocol/arxium?rev=bad6330b26eb426c11f779286b946c59d1a814a8#bad6330b26eb426c11f779286b946c59d1a814a8"
 dependencies = [
  "anyhow",
  "bech32",
@@ -4831,6 +4833,7 @@ dependencies = [
 [[package]]
 name = "xc-wire"
 version = "0.1.0"
+source = "git+https://github.com/Arxium-Protocol/arxium?rev=bad6330b26eb426c11f779286b946c59d1a814a8#bad6330b26eb426c11f779286b946c59d1a814a8"
 dependencies = [
  "serde",
 ]
