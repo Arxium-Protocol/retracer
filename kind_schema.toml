@@ -41,28 +41,28 @@ name = "GrantAttestation"
 
   [[kind.roles]]
   path = "$.subject"
-  role = "subject"
+  role = "other:subject"
 
 [[kind]]
 name = "RevokeAttestation"
 
   [[kind.roles]]
   path = "$.subject"
-  role = "subject"
+  role = "other:subject"
 
 [[kind]]
 name = "RegisterAttestor"
 
   [[kind.roles]]
   path = "$.attestor"
-  role = "attestor"
+  role = "other:attestor"
 
 [[kind]]
 name = "DeregisterAttestor"
 
   [[kind.roles]]
   path = "$.attestor"
-  role = "attestor"
+  role = "other:attestor"
 
 # RegisterAsset / IssueAsset / SubmitExecutionFault have no address-bearing
 # payload fields — the sender (already indexed via actions.from_address) is
