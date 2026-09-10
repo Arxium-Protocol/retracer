@@ -108,6 +108,37 @@ pub struct Args {
     /// Per-IP request budget, in requests/second, on both surfaces. `None`
     /// (the default) disables rate limiting entirely.
     pub rate_limit_rps: Option<u32>,
+    /// Proxies whose `X-Forwarded-For` the limiter may believe when
+    /// attributing rate-limit buckets. `None` (the default) means the socket
+    /// peer is always the client.
+    pub trusted_proxies: Option<auth::TrustedProxies>,
+}
+
+/// Parses a per-second rate limit, rejecting values the guard cannot honour.
+/// The guard enforces a per-60s window (`RateLimiter` stores `rps * 60`), so a
+/// value whose minute budget overflows `u32` is an error rather than a silent
+/// saturation, and zero — which would deny every request — is rejected rather
+/// than arming a deny-all limiter.
+fn parse_rate_limit_rps(raw: &str, source: &str) -> Result<u32> {
+    let rps: u32 = raw
+        .parse()
+        .with_context(|| format!("{source} must be a u32"))?;
+    validate_rate_limit_rps(rps, source)?;
+    Ok(rps)
+}
+
+/// Rejects rate limits the guard cannot honour, naming `source` (a flag or
+/// env var, or the builder method) in the error. Shared by the CLI boundary
+/// and [`Runner::run`] so programmatic embedders get the same refusal as
+/// flag parsing: zero would deny every request, and a value whose minute
+/// budget overflows `u32` would otherwise saturate silently.
+fn validate_rate_limit_rps(rps: u32, source: &str) -> Result<()> {
+    anyhow::ensure!(rps > 0, "{source} must be greater than zero");
+    anyhow::ensure!(
+        rps.checked_mul(60).is_some(),
+        "{source} is too large: the per-minute budget would overflow a u32"
+    );
+    Ok(())
 }
 
 /// Minimal manual flag parsing — a handful of flags, not worth a clap
@@ -157,13 +188,19 @@ pub fn parse_args() -> Result<Args> {
         .ok()
         .filter(|v| !v.is_empty());
     let mut rate_limit_rps: Option<u32> = match std::env::var("RETRACER_RATE_LIMIT_RPS") {
-        Ok(value) if !value.is_empty() => Some(
-            value
-                .parse()
-                .context("RETRACER_RATE_LIMIT_RPS must be a u32")?,
-        ),
+        Ok(value) if !value.is_empty() => {
+            Some(parse_rate_limit_rps(&value, "RETRACER_RATE_LIMIT_RPS")?)
+        }
         _ => None,
     };
+    let mut trusted_proxies: Option<auth::TrustedProxies> =
+        match std::env::var("RETRACER_TRUSTED_PROXIES") {
+            Ok(value) if !value.is_empty() => Some(
+                auth::TrustedProxies::parse_list(&value)
+                    .map_err(|err| anyhow::anyhow!("RETRACER_TRUSTED_PROXIES: {err}"))?,
+            ),
+            _ => None,
+        };
     let mut args = std::env::args().skip(1);
     while let Some(flag) = args.next() {
         match flag.as_str() {
@@ -249,7 +286,14 @@ pub fn parse_args() -> Result<Args> {
             }
             "--rate-limit-rps" => {
                 let value = args.next().context("--rate-limit-rps requires a value")?;
-                rate_limit_rps = Some(value.parse().context("--rate-limit-rps must be a u32")?);
+                rate_limit_rps = Some(parse_rate_limit_rps(&value, "--rate-limit-rps")?);
+            }
+            "--trusted-proxies" => {
+                let value = args.next().context("--trusted-proxies requires a value")?;
+                trusted_proxies = Some(
+                    auth::TrustedProxies::parse_list(&value)
+                        .map_err(|err| anyhow::anyhow!("--trusted-proxies: {err}"))?,
+                );
             }
             other => anyhow::bail!("unknown flag: {other}"),
         }
@@ -275,6 +319,7 @@ pub fn parse_args() -> Result<Args> {
         },
         auth_token,
         rate_limit_rps,
+        trusted_proxies,
     })
 }
 
@@ -309,7 +354,8 @@ where
     .await?
     .with_rest_port(args.rest_port)
     .with_auth_token(args.auth_token)
-    .with_rate_limit_rps(args.rate_limit_rps);
+    .with_rate_limit_rps(args.rate_limit_rps)
+    .with_trusted_proxies(args.trusted_proxies);
     runner.add_chain::<B>(args.chain, hooks).await?;
     runner.run().await
 }
@@ -332,7 +378,8 @@ where
     .await?
     .with_rest_port(args.rest_port)
     .with_auth_token(args.auth_token)
-    .with_rate_limit_rps(args.rate_limit_rps);
+    .with_rate_limit_rps(args.rate_limit_rps)
+    .with_trusted_proxies(args.trusted_proxies);
     runner
         .add_chain_with_decoder(args.chain, hooks, decoder)
         .await?;
@@ -356,6 +403,7 @@ pub struct Runner {
     rest_port: Option<u16>,
     auth_token: Option<String>,
     rate_limit_rps: Option<u32>,
+    trusted_proxies: Option<auth::TrustedProxies>,
     runtimes: Vec<grpc_service::ChainRuntime>,
     rest_chains: Vec<rest_service::RestChain>,
     tasks: Vec<JoinHandle<Result<()>>>,
@@ -389,6 +437,7 @@ impl Runner {
             rest_port: None,
             auth_token: None,
             rate_limit_rps: None,
+            trusted_proxies: None,
             runtimes: Vec::new(),
             rest_chains: Vec::new(),
             tasks: Vec::new(),
@@ -409,9 +458,19 @@ impl Runner {
     }
 
     /// Per-IP request budget in requests/second, both surfaces. `None` (the
-    /// default) disables rate limiting.
+    /// default) disables rate limiting. Zero or overflowing values fail
+    /// [`Runner::run`] rather than arming a deny-all or saturated limiter.
     pub fn with_rate_limit_rps(mut self, rps: Option<u32>) -> Self {
         self.rate_limit_rps = rps;
+        self
+    }
+
+    /// Proxies whose `X-Forwarded-For` the limiter may believe. `None` (the
+    /// default) means the socket peer is always the client. Only configure
+    /// addresses you operate: trusting a header from anyone else lets them
+    /// mint a fresh rate-limit bucket per request.
+    pub fn with_trusted_proxies(mut self, proxies: Option<auth::TrustedProxies>) -> Self {
+        self.trusted_proxies = proxies;
         self
     }
 
@@ -576,12 +635,21 @@ impl Runner {
         let chain_ids: Vec<&str> = self.runtimes.iter().map(|r| r.chain_id.as_str()).collect();
         info!(chains = ?chain_ids, default = %chain_ids[0], "serving");
 
-        let guard = auth::GuardConfig::new(self.auth_token, self.rate_limit_rps);
+        if let Some(rps) = self.rate_limit_rps {
+            validate_rate_limit_rps(rps, "with_rate_limit_rps")?;
+        }
+        let guard = auth::GuardConfig::new(self.auth_token, self.rate_limit_rps)
+            .with_trusted_proxies(self.trusted_proxies);
         if guard.is_active() {
             info!(
                 auth = guard.token.is_some(),
                 rate_limit = guard.rate_limiter.is_some(),
                 "request guard active on both surfaces"
+            );
+        } else {
+            warn!(
+                "no --auth-token and no --rate-limit-rps: both API surfaces are \
+                 open to anyone who can reach them; only run like this on a closed network"
             );
         }
 
@@ -913,4 +981,29 @@ async fn durable_tip(pool: &sqlx::PgPool, chain_id: &str) -> Option<Tip> {
         .ok()
         .flatten()?;
     Some(Tip { height, hash })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rate_limit_parsing_accepts_sane_values() {
+        assert_eq!(parse_rate_limit_rps("1", "test").unwrap(), 1);
+        assert_eq!(parse_rate_limit_rps("100", "test").unwrap(), 100);
+        // Largest rps whose per-minute budget still fits a u32.
+        assert_eq!(
+            parse_rate_limit_rps("71582788", "test").unwrap(),
+            71_582_788
+        );
+    }
+
+    #[test]
+    fn rate_limit_parsing_rejects_zero_overflow_and_garbage() {
+        assert!(parse_rate_limit_rps("0", "test").is_err());
+        assert!(parse_rate_limit_rps("71582789", "test").is_err());
+        assert!(parse_rate_limit_rps("4294967295", "test").is_err());
+        assert!(parse_rate_limit_rps("many", "test").is_err());
+        assert!(parse_rate_limit_rps("", "test").is_err());
+    }
 }

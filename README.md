@@ -87,10 +87,11 @@ answers — "not connected" and "caught up" are different states.
 ## Configuration
 
 All flags are optional; the defaults match a local devnet. `--bootnodes`,
-`--database-url`, `--node-rpc-url`, `--node-rpc-token`, `--auth-token`, and `--rate-limit-rps`
+`--database-url`, `--node-rpc-url`, `--node-rpc-token`, `--auth-token`, `--rate-limit-rps`,
+and `--trusted-proxies`
 can also come from a `.env` file (copy `.env.example`) via
 `RETRACER_BOOTNODES`/`RETRACER_DATABASE_URL`/`RETRACER_NODE_RPC_URL`/`RETRACER_NODE_RPC_TOKEN`/
-`RETRACER_AUTH_TOKEN`/`RETRACER_RATE_LIMIT_RPS` — a flag always overrides
+`RETRACER_AUTH_TOKEN`/`RETRACER_RATE_LIMIT_RPS`/`RETRACER_TRUSTED_PROXIES` — a flag always overrides
 the env value.
 
 | Flag | Default | Description |
@@ -112,6 +113,7 @@ the env value.
 | `--read-pool-size` | `16` | Postgres connections for reads |
 | `--auth-token` | none | Shared secret required as `Authorization: Bearer <token>` on both surfaces (`/health` and `/ready` stay open). Unset = both surfaces stay open, same as today |
 | `--rate-limit-rps` | none | Per-IP request budget, both surfaces. Unset = no rate limiting |
+| `--trusted-proxies` | none | Comma-separated IPs/CIDRs (e.g. `10.0.0.8,10.0.0.0/8`) whose `X-Forwarded-For` the limiter may believe. Unset = the socket peer is always the client; only set addresses you operate |
 
 `--blocks-topic` and `--sync-protocol` are a wire agreement with the node you're
 following, so they must match what *it* publishes — they're not derived from

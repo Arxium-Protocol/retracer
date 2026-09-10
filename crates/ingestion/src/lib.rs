@@ -171,17 +171,18 @@ pub struct Config {
     pub max_pending_blocks: usize,
 }
 
-impl Default for Config {
-    fn default() -> Self {
+impl Config {
+    /// Builds a `Config` for `chain_id`, deriving the sync protocol from it.
+    /// There is deliberately no `Default` impl: a parameterless default would
+    /// have to guess the sync protocol (previously `corechain-devnet`), and a
+    /// caller on any other chain would silently subscribe to the wrong one.
+    pub fn for_chain(chain_id: &str) -> Self {
         Self {
             bootnodes: Vec::new(),
             listen_port: 0,
             resume_from: None,
             blocks_topic: DEFAULT_BLOCKS_TOPIC.to_string(),
-            // ponytail: no chain_id in scope for a parameterless Default —
-            // real callers (retracer-core) compute this from their actual
-            // --chain-id instead of using this fallback.
-            sync_protocol: default_sync_protocol("corechain-devnet"),
+            sync_protocol: default_sync_protocol(chain_id),
             max_pending_blocks: DEFAULT_MAX_PENDING_BLOCKS,
         }
     }

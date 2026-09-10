@@ -582,7 +582,7 @@ mod tests {
     fn tolerant_decoder_keeps_an_unrecognized_action_as_an_unknown_row() {
         let sender = Address::from_pubkey_bytes(&[3u8; 32]).unwrap();
         let bogus_payload =
-            bincode::serde::encode_to_vec(&99u32, bincode::config::standard()).unwrap();
+            bincode::serde::encode_to_vec(99u32, bincode::config::standard()).unwrap();
         let (raw_block, expected_count) = raw_block_with_one_action(
             RawAction {
                 sender,

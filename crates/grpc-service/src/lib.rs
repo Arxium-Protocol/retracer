@@ -23,6 +23,7 @@ use storage::{ActionRow, AddressExtractor, AddressValidator, BlockRow, BlockSumm
 use tokio::sync::broadcast;
 use tokio_stream::Stream;
 use tokio_stream::wrappers::BroadcastStream;
+use tokio_stream::wrappers::errors::BroadcastStreamRecvError;
 use tonic::{Request, Response, Status};
 
 /// Same page-size cap the node's own RPC uses (`xc_storage::MAX_PAGE_SIZE`) —
@@ -33,6 +34,11 @@ const MAX_PAGE_SIZE: u32 = 100;
 /// Header selecting which chain an RPC is about. Absent means the default
 /// chain — see the `service` comment in `retracer.proto`.
 pub const CHAIN_HEADER: &str = "x-chain-id";
+
+/// Upper bound on a search string, matching `rest_service::MAX_SEARCH_LEN`.
+/// Kept as a duplicate rather than a shared constant because the service
+/// crates deliberately never depend on each other.
+const MAX_SEARCH_LEN: usize = 256;
 
 /// Everything the service needs that varies per chain.
 ///
@@ -267,6 +273,11 @@ impl Retracer for Service {
     async fn search(&self, request: Request<SearchRequest>) -> Result<Response<SearchResponse>, Status> {
         let chain = self.chain(&request)?;
         let q = request.into_inner().query;
+        if q.len() > MAX_SEARCH_LEN {
+            return Err(Status::invalid_argument(format!(
+                "query must be {MAX_SEARCH_LEN} characters or fewer"
+            )));
+        }
 
         if let Ok(height) = q.parse::<i64>()
             && storage::block_exists_at_height(&self.pool, &chain.chain_id, height)
@@ -479,17 +490,28 @@ impl Retracer for Service {
             }
         })
         .try_flatten();
-        let live_stream = BroadcastStream::new(live_rx).filter_map(move |item| async move {
-            match item {
-                Ok(row) if row.height > replay_ceiling => Some(Ok(Block::from(row))),
-                Ok(_) => None,
-                // A slow subscriber that falls behind the broadcast channel's
-                // capacity misses those blocks rather than blocking ingestion
-                // for every other subscriber — logged, not surfaced as a
-                // stream error (the stream itself is still healthy).
-                Err(err) => {
-                    tracing::warn!("SubscribeBlocks subscriber lagged: {err}");
-                    None
+        let lag_chain_id = chain.chain_id.clone();
+        let live_stream = BroadcastStream::new(live_rx).filter_map(move |item| {
+            let lag_chain_id = lag_chain_id.clone();
+            async move {
+                match item {
+                    Ok(row) if row.height > replay_ceiling => Some(Ok(Block::from(row))),
+                    Ok(_) => None,
+                    // A slow subscriber that falls behind the broadcast
+                    // channel's capacity misses those blocks rather than
+                    // blocking ingestion for every other subscriber — logged
+                    // with the gap size, not surfaced as a stream error (the
+                    // stream itself is still healthy). A consumer without its
+                    // own gap detection loses these blocks silently, so the
+                    // count is what an alert keys on.
+                    Err(BroadcastStreamRecvError::Lagged(skipped)) => {
+                        tracing::warn!(
+                            chain_id = %lag_chain_id,
+                            skipped,
+                            "SubscribeBlocks subscriber lagged"
+                        );
+                        None
+                    }
                 }
             }
         });
@@ -505,13 +527,21 @@ impl Retracer for Service {
         chain.check_address(&address)?;
 
         let address_extractor = chain.address_extractor.clone();
+        let lag_chain_id = chain.chain_id.clone();
         let stream = BroadcastStream::new(chain.blocks_tx.subscribe())
-            .filter_map(|item| async move {
-                match item {
-                    Ok(row) => Some(row),
-                    Err(err) => {
-                        tracing::warn!("SubscribeAccountActions subscriber lagged: {err}");
-                        None
+            .filter_map(move |item| {
+                let lag_chain_id = lag_chain_id.clone();
+                async move {
+                    match item {
+                        Ok(row) => Some(row),
+                        Err(BroadcastStreamRecvError::Lagged(skipped)) => {
+                            tracing::warn!(
+                                chain_id = %lag_chain_id,
+                                skipped,
+                                "SubscribeAccountActions subscriber lagged"
+                            );
+                            None
+                        }
                     }
                 }
             })

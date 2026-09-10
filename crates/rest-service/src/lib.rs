@@ -23,8 +23,8 @@ use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 use storage::AddressValidator;
 
 #[derive(Clone, PartialEq, Eq)]
@@ -62,6 +62,63 @@ const MAX_UPTIME_CONCURRENCY: usize = 16;
 const NODE_RPC_TIMEOUT: Duration = Duration::from_secs(5);
 const READINESS_DB_TIMEOUT: Duration = Duration::from_secs(2);
 
+/// How long a fetched validator set stays valid in [`UptimeCache`]. Sets are
+/// stable once finalised; the TTL bounds staleness where they are not, and
+/// repeat uptime requests over the same range stop costing one node call per
+/// height.
+const UPTIME_CACHE_TTL: Duration = Duration::from_secs(300);
+const UPTIME_CACHE_MAX_ENTRIES: usize = 20_000;
+
+struct UptimeCacheEntry {
+    fetched: Instant,
+    validators: Vec<String>,
+}
+
+/// Cache of node validator sets keyed by `(chain_id, height)`, bounding the
+/// uptime endpoint's node fan-out. Swept on insert past capacity rather than
+/// by a background task, mirroring the rate limiter's sweep-on-grow.
+struct UptimeCache {
+    ttl: Duration,
+    max_entries: usize,
+    entries: Mutex<HashMap<(String, u64), UptimeCacheEntry>>,
+}
+
+impl UptimeCache {
+    fn new() -> Self {
+        Self::with_limits(UPTIME_CACHE_TTL, UPTIME_CACHE_MAX_ENTRIES)
+    }
+
+    fn with_limits(ttl: Duration, max_entries: usize) -> Self {
+        Self {
+            ttl,
+            max_entries,
+            entries: Mutex::new(HashMap::new()),
+        }
+    }
+
+    fn get(&self, chain_id: &str, height: u64) -> Option<Vec<String>> {
+        let entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
+        entries
+            .get(&(chain_id.to_string(), height))
+            .filter(|e| e.fetched.elapsed() < self.ttl)
+            .map(|e| e.validators.clone())
+    }
+
+    fn insert(&self, chain_id: &str, height: u64, validators: Vec<String>) {
+        let mut entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
+        if entries.len() > self.max_entries {
+            entries.retain(|_, e| e.fetched.elapsed() < self.ttl);
+        }
+        entries.insert(
+            (chain_id.to_string(), height),
+            UptimeCacheEntry {
+                fetched: Instant::now(),
+                validators,
+            },
+        );
+    }
+}
+
 /// What the REST layer needs to know about a chain. A subset of
 /// `grpc_service::ChainRuntime` — no broadcast channel, because this surface
 /// has no streaming endpoints.
@@ -89,6 +146,7 @@ struct AppState {
     chains: Arc<Vec<RestChain>>,
     known: Arc<HashSet<String>>,
     http: reqwest::Client,
+    uptime_cache: Arc<UptimeCache>,
 }
 
 impl AppState {
@@ -121,6 +179,7 @@ pub fn router(pool: PgPool, chains: Vec<RestChain>) -> Router {
         chains: Arc::new(chains),
         known: Arc::new(known),
         http,
+        uptime_cache: Arc::new(UptimeCache::new()),
     };
 
     Router::new()
@@ -544,16 +603,24 @@ async fn get_validator_uptime(
     .await?;
 
     let http = state.http.clone();
+    let cache = state.uptime_cache.clone();
+    let cache_chain = chain_id.to_string();
     let sets: Vec<anyhow::Result<(u64, Vec<String>)>> = stream::iter(query.from..=query.to)
         .map(|height| {
             let http = http.clone();
+            let cache = cache.clone();
+            let cache_chain = cache_chain.clone();
             let node_rpc_url = node_rpc_url.clone();
             let node_rpc_token = node_rpc_token.clone();
             async move {
+                if let Some(set) = cache.get(&cache_chain, height) {
+                    return Ok((height, set));
+                }
                 let mut set =
                     fetch_validator_set(&http, &node_rpc_url, node_rpc_token.as_ref(), height)
                         .await?;
                 set.sort();
+                cache.insert(&cache_chain, height, set.clone());
                 Ok((height, set))
             }
         })
@@ -624,6 +691,11 @@ async fn fetch_validator_set(
         .with_context(|| format!("decoding response body from {url}"))
 }
 
+/// Upper bound on a search string, which fans out to a height lookup, an
+/// address check and two hash lookups. Hashes and heights are short; anything
+/// longer is a caller mistake or a cost probe, not a query.
+const MAX_SEARCH_LEN: usize = 256;
+
 #[derive(Deserialize)]
 struct SearchQuery {
     q: String,
@@ -648,6 +720,11 @@ async fn search(
 ) -> ApiResult<SearchHit> {
     let chain = state.chain(&chain_id)?;
     let q = query.q;
+    if q.len() > MAX_SEARCH_LEN {
+        return Err(ApiError::BadRequest(format!(
+            "q must be {MAX_SEARCH_LEN} characters or fewer"
+        )));
+    }
 
     if let Ok(height) = q.parse::<i64>()
         && storage::block_exists_at_height(&state.pool, &chain_id, height).await?
@@ -761,6 +838,38 @@ mod tests {
                 .unwrap();
         });
         (format!("http://{address}"), request_rx)
+    }
+
+    #[test]
+    fn uptime_cache_hits_misses_and_expires() {
+        let cache = UptimeCache::new();
+        assert!(cache.get("chain", 7).is_none());
+        cache.insert("chain", 7, vec!["arx1".to_string()]);
+        assert_eq!(cache.get("chain", 7), Some(vec!["arx1".to_string()]));
+        assert!(cache.get("chain", 8).is_none());
+        assert!(cache.get("other", 7).is_none());
+
+        let stale = UptimeCache::with_limits(Duration::ZERO, 10);
+        stale.insert("chain", 7, vec!["arx1".to_string()]);
+        assert!(
+            stale.get("chain", 7).is_none(),
+            "a zero TTL must expire immediately"
+        );
+    }
+
+    #[test]
+    fn uptime_cache_sweep_bounds_memory() {
+        // Zero TTL so every entry is already expired: once past capacity each
+        // insert must sweep, keeping the map far below the inserted count.
+        let cache = UptimeCache::with_limits(Duration::ZERO, 4);
+        for height in 0..10 {
+            cache.insert("chain", height, vec!["arx1".to_string()]);
+        }
+        let len = cache.entries.lock().unwrap().len();
+        assert!(
+            len <= 5,
+            "sweep must have reclaimed expired entries, len = {len}"
+        );
     }
 
     #[test]
