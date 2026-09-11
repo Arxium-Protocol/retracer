@@ -64,6 +64,21 @@ name = "DeregisterAttestor"
   path = "$.attestor"
   role = "other:attestor"
 
-# RegisterAsset / IssueAsset / SubmitExecutionFault have no address-bearing
-# payload fields — the sender (already indexed via actions.from_address) is
-# the only party.
+[[kind]]
+name = "ForcedTransfer"
+
+  # Neither party signed the action — the governor did — so both are only
+  # discoverable through the payload. `from` is the holder whose balance was
+  # taken, which makes it the address most likely to be searched for after
+  # one of these lands.
+  [[kind.roles]]
+  path = "$.from"
+  role = "from"
+
+  [[kind.roles]]
+  path = "$.to"
+  role = "to"
+
+# RegisterAsset / IssueAsset / SubmitExecutionFault / FreezeAsset /
+# UnfreezeAsset have no address-bearing payload fields — the sender (already
+# indexed via actions.from_address) is the only party.
