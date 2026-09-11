@@ -48,6 +48,17 @@ warn() { printf '\033[1;33mwarning:\033[0m %s\n' "$1" >&2; }
 die() { printf '\033[1;31merror:\033[0m %s\n' "$1" >&2; exit 1; }
 run() { if [ "$dry_run" -eq 1 ]; then printf '  would run: %s\n' "$*"; else "$@"; fi; }
 
+# Release tags become URL path segments, a tarball name, and a directory
+# name below — so anything that is not shaped like a tag is refused before
+# it is used as any of those. Checked for both --version input and the
+# latest-release lookup below: a hostile or corrupted API response must not
+# turn into a download URL or a `../` escape in the unpack path.
+check_version_tag() {
+  printf '%s' "$1" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z._-]+)?$' \
+    || die "refusing version tag $(printf '%s' "$1" | head -c 64).
+Tags look like v0.2.0 — pass --version vX.Y.Z to pin the release explicitly."
+}
+
 # Falls back to the default when non-interactive (--yes, or no TTY on
 # stdin — the `curl | bash` case).
 ask() {
@@ -103,14 +114,23 @@ fi
 
 # ------------------------------------------------------------ resolve version
 
-if [ -z "$version" ]; then
+if [ -n "$version" ]; then
+  check_version_tag "$version"
+else
   say "Resolving latest release..."
   # Unauthenticated API, 60 requests/hour/IP — plenty for an installer,
-  # avoids depending on jq being present.
-  version="$(curl -fsSL "https://api.github.com/repos/${REPO}/releases/latest" \
-    | sed -n 's/.*"tag_name": *"\([^"]*\)".*/\1/p' | head -1)"
-  [ -n "$version" ] || die "could not determine the latest release tag.
+  # avoids depending on jq being present. Retried and time-boxed: without
+  # --max-time a stalled connection hangs the installer with no message.
+  latest_json="$(curl -fsSL --retry 2 --max-time 20 \
+    "https://api.github.com/repos/${REPO}/releases/latest")" \
+    || die "could not reach the GitHub releases API — network down, or the
+60 req/hour unauthenticated rate limit is spent.
 Pass --version vX.Y.Z to skip the lookup entirely."
+  version="$(printf '%s\n' "$latest_json" \
+    | sed -n 's/.*"tag_name": *"\([^"]*\)".*/\1/p' | head -1)"
+  [ -n "$version" ] || die "the releases API answered, but no tag_name came back.
+Pass --version vX.Y.Z to skip the lookup entirely."
+  check_version_tag "$version"
 fi
 
 asset="retracerd-${version}-${ASSET_ARCH}.tar.gz"
