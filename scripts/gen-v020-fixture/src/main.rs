@@ -13,7 +13,7 @@
 //! path dependencies in this crate's Cargo.toml if yours lives elsewhere.
 
 use arxd_runtime::ActionPayload;
-use xc_primitives::{Action, Address};
+use xc_primitives::{Action, Address, AssetClass, AssetMetadata, ClaimTopic};
 
 fn addr(byte: u8) -> Address {
     Address::from_pubkey_bytes(&[byte; 32]).expect("32 bytes is a valid pubkey")
@@ -38,6 +38,7 @@ fn main() {
             validator: addr(0x02),
             stake: 1,
             bls_pubkey: vec![0xAA; 4],
+            bls_pop: vec![0xAB; 4],
         }),
         action(ActionPayload::LeaveValidator {
             validator: addr(0x02),
@@ -57,6 +58,7 @@ fn main() {
         action(ActionPayload::RegisterBlsKey {
             validator: addr(0x02),
             pubkey: vec![0xBB; 4],
+            pop: vec![0xBC; 4],
         }),
         action(ActionPayload::VerifyIdentityCredential {
             proof: vec![0xCC; 4],
@@ -68,6 +70,8 @@ fn main() {
         action(ActionPayload::GrantAttestation {
             subject: addr(0x04),
             hash: "h".to_string(),
+            topics: vec![ClaimTopic::Kyc, ClaimTopic::Accredited],
+            jurisdiction: Some("CH".to_string()),
         }),
         action(ActionPayload::RevokeAttestation {
             subject: addr(0x04),
@@ -75,6 +79,17 @@ fn main() {
         action(ActionPayload::RegisterAsset {
             asset_id: "a".to_string(),
             compliance_required: true,
+            // Every optional field populated on purpose: a `None`/empty
+            // metadata would encode as a handful of zero bytes and would not
+            // catch a mirror that got the field order wrong.
+            metadata: AssetMetadata {
+                asset_class: AssetClass::Bond,
+                decimals: 6,
+                required_claims: vec![ClaimTopic::Kyc, ClaimTopic::Accredited],
+                allowed_jurisdictions: Some(vec!["CH".to_string(), "DE".to_string()]),
+                max_supply: Some(1_000),
+                metadata_uri: Some("ipfs://a".to_string()),
+            },
         }),
         action(ActionPayload::IssueAsset {
             asset_id: "a".to_string(),
@@ -94,6 +109,19 @@ fn main() {
         }),
         action(ActionPayload::SubmitExecutionFault {
             artifact_json: "{}".to_string(),
+        }),
+        action(ActionPayload::FreezeAsset {
+            asset_id: "a".to_string(),
+        }),
+        action(ActionPayload::UnfreezeAsset {
+            asset_id: "a".to_string(),
+        }),
+        action(ActionPayload::ForcedTransfer {
+            asset_id: "a".to_string(),
+            from: addr(0x04),
+            to: addr(0x05),
+            amount: 1,
+            reason: "court order".to_string(),
         }),
     ];
 
