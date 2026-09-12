@@ -124,6 +124,13 @@ name = "RecoverHolder"
   path = "$.replacement"
   role = "to"
 
+[[kind]]
+name = "IssueAssetTo"
+
+  [[kind.roles]]
+  path = "$.to"
+  role = "to"
+
 # RegisterAsset / IssueAsset / BurnAsset / SubmitExecutionFault / FreezeAsset /
 # UnfreezeAsset have no address-bearing payload fields — the sender (already
 # indexed via actions.from_address) is the only party.

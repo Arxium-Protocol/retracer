@@ -171,4 +171,10 @@ pub enum ActionPayload {
         lost: Address,
         replacement: Address,
     },
+    /// Arxium `a7d81ed` — variant 27.
+    IssueAssetTo {
+        asset_id: String,
+        to: Address,
+        amount: u128,
+    },
 }

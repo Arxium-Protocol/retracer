@@ -1545,6 +1545,7 @@ mod tests {
                 ActionPayload::UnlockHolderAmount { .. } => "UnlockHolderAmount",
                 ActionPayload::IssuerForcedTransfer { .. } => "IssuerForcedTransfer",
                 ActionPayload::RecoverHolder { .. } => "RecoverHolder",
+                ActionPayload::IssueAssetTo { .. } => "IssueAssetTo",
             })
             .collect();
         assert_eq!(
