@@ -1539,6 +1539,12 @@ mod tests {
                 ActionPayload::FreezeAsset { .. } => "FreezeAsset",
                 ActionPayload::UnfreezeAsset { .. } => "UnfreezeAsset",
                 ActionPayload::ForcedTransfer { .. } => "ForcedTransfer",
+                ActionPayload::BurnAsset { .. } => "BurnAsset",
+                ActionPayload::SetHolderFrozen { .. } => "SetHolderFrozen",
+                ActionPayload::LockHolderAmount { .. } => "LockHolderAmount",
+                ActionPayload::UnlockHolderAmount { .. } => "UnlockHolderAmount",
+                ActionPayload::IssuerForcedTransfer { .. } => "IssuerForcedTransfer",
+                ActionPayload::RecoverHolder { .. } => "RecoverHolder",
             })
             .collect();
         assert_eq!(

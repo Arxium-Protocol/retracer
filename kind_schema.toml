@@ -79,6 +79,51 @@ name = "ForcedTransfer"
   path = "$.to"
   role = "to"
 
-# RegisterAsset / IssueAsset / SubmitExecutionFault / FreezeAsset /
+[[kind]]
+name = "SetHolderFrozen"
+
+  [[kind.roles]]
+  path = "$.holder"
+  role = "other:holder"
+
+[[kind]]
+name = "LockHolderAmount"
+
+  [[kind.roles]]
+  path = "$.holder"
+  role = "other:holder"
+
+[[kind]]
+name = "UnlockHolderAmount"
+
+  [[kind.roles]]
+  path = "$.holder"
+  role = "other:holder"
+
+[[kind]]
+name = "IssuerForcedTransfer"
+
+  [[kind.roles]]
+  path = "$.from"
+  role = "from"
+
+  [[kind.roles]]
+  path = "$.to"
+  role = "to"
+
+[[kind]]
+name = "RecoverHolder"
+
+  # The lost wallet is the one someone will search for; the replacement is
+  # where its balance went.
+  [[kind.roles]]
+  path = "$.lost"
+  role = "from"
+
+  [[kind.roles]]
+  path = "$.replacement"
+  role = "to"
+
+# RegisterAsset / IssueAsset / BurnAsset / SubmitExecutionFault / FreezeAsset /
 # UnfreezeAsset have no address-bearing payload fields — the sender (already
 # indexed via actions.from_address) is the only party.

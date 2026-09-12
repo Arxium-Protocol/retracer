@@ -138,4 +138,37 @@ pub enum ActionPayload {
         amount: u128,
         reason: String,
     },
+    /// Issuer holder controls, Arxium `c90a6f4` — variants 21–26 in this
+    /// order. Positional: do not reorder.
+    BurnAsset {
+        asset_id: String,
+        amount: u128,
+    },
+    SetHolderFrozen {
+        asset_id: String,
+        holder: Address,
+        frozen: bool,
+    },
+    LockHolderAmount {
+        asset_id: String,
+        holder: Address,
+        amount: u128,
+    },
+    UnlockHolderAmount {
+        asset_id: String,
+        holder: Address,
+        amount: u128,
+    },
+    IssuerForcedTransfer {
+        asset_id: String,
+        from: Address,
+        to: Address,
+        amount: u128,
+        reason: String,
+    },
+    RecoverHolder {
+        asset_id: String,
+        lost: Address,
+        replacement: Address,
+    },
 }
