@@ -477,6 +477,21 @@ mod tests {
         assert!(schema.resolve("LeaveValidator", &leave_payload).is_empty());
     }
 
+    /// The schema shipped at the repo root must always parse — it is what
+    /// `retracerd` loads by default, and a typo there is a startup failure
+    /// on every deploy.
+    #[test]
+    fn the_shipped_corechain_schema_parses() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../kind_schema.toml");
+        let schema = KindSchema::load(&path).unwrap();
+        let asset_projections = schema
+            .projections()
+            .iter()
+            .filter(|p| p.segments == ["asset"])
+            .count();
+        assert!(asset_projections >= 12, "every asset-naming kind indexes $.asset, got {asset_projections}");
+    }
+
     #[test]
     fn rejects_unknown_role_strings() {
         let err = KindSchema::parse(

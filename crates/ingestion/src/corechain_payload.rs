@@ -39,6 +39,7 @@ pub enum ClaimTopic {
 
 /// Mirror of `xc_primitives::AssetMetadata`, the grouped registration fields
 /// of `RegisterAsset`. Field order is the wire format, same as variant order.
+/// `symbol`/`name` (V6 reset) come last, after `metadata_uri`.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct AssetMetadata {
     pub asset_class: AssetClass,
@@ -47,6 +48,31 @@ pub struct AssetMetadata {
     pub allowed_jurisdictions: Option<Vec<String>>,
     pub max_supply: Option<u128>,
     pub metadata_uri: Option<String>,
+    /// Display ticker, `[A-Z0-9]{1,12}`. Never unique, never an identifier —
+    /// show it beside the truncated ref and the issuer's attestation status.
+    pub symbol: String,
+    /// Display name, 1–64 bytes.
+    pub name: String,
+}
+
+/// Mirror of `xc_primitives::AssetRef` — the chain-wide asset identity since
+/// the V6 reset: `SHA-256("arxium/asset/v1" || issuer_pubkey || 0x00 ||
+/// asset_id)`, rendered bech32 with HRP `arxasset`. On the wire it is one
+/// length-prefixed string, exactly like `Address`, so a transparent newtype
+/// over `String` is byte-identical to the node's type. Every asset variant
+/// after `RegisterAsset` names its asset by this; `RegisterAsset` alone still
+/// carries the issuer-scoped slug it is derived from.
+///
+/// Pinned check value: `(arx132yw8ht5p8cetl2jmvknewjawt9xwzdlrk2pyxlnwjyqrdq0dawqaq6lsz, "gold")`
+/// → `arxasset1z8d4jt8yt0xtjm6lvk8umc9relegrwq4xu928eqxyjfcsnjuex6qe873qa`.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct AssetRef(pub String);
+
+impl std::fmt::Display for AssetRef {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -101,17 +127,19 @@ pub enum ActionPayload {
     RevokeAttestation {
         subject: Address,
     },
+    /// The slug being claimed — the one asset variant that still carries
+    /// `asset_id`; the chain derives the `AssetRef` from `(sender, asset_id)`.
     RegisterAsset {
         asset_id: String,
         compliance_required: bool,
         metadata: AssetMetadata,
     },
     IssueAsset {
-        asset_id: String,
+        asset: AssetRef,
         amount: u128,
     },
     TransferAsset {
-        asset_id: String,
+        asset: AssetRef,
         to: Address,
         amount: u128,
     },
@@ -126,13 +154,13 @@ pub enum ActionPayload {
         artifact_json: String,
     },
     FreezeAsset {
-        asset_id: String,
+        asset: AssetRef,
     },
     UnfreezeAsset {
-        asset_id: String,
+        asset: AssetRef,
     },
     ForcedTransfer {
-        asset_id: String,
+        asset: AssetRef,
         from: Address,
         to: Address,
         amount: u128,
@@ -141,39 +169,39 @@ pub enum ActionPayload {
     /// Issuer holder controls, Arxium `c90a6f4` — variants 21–26 in this
     /// order. Positional: do not reorder.
     BurnAsset {
-        asset_id: String,
+        asset: AssetRef,
         amount: u128,
     },
     SetHolderFrozen {
-        asset_id: String,
+        asset: AssetRef,
         holder: Address,
         frozen: bool,
     },
     LockHolderAmount {
-        asset_id: String,
+        asset: AssetRef,
         holder: Address,
         amount: u128,
     },
     UnlockHolderAmount {
-        asset_id: String,
+        asset: AssetRef,
         holder: Address,
         amount: u128,
     },
     IssuerForcedTransfer {
-        asset_id: String,
+        asset: AssetRef,
         from: Address,
         to: Address,
         amount: u128,
         reason: String,
     },
     RecoverHolder {
-        asset_id: String,
+        asset: AssetRef,
         lost: Address,
         replacement: Address,
     },
     /// Arxium `a7d81ed` — variant 27.
     IssueAssetTo {
-        asset_id: String,
+        asset: AssetRef,
         to: Address,
         amount: u128,
     },

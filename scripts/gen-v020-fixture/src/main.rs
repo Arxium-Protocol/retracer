@@ -13,10 +13,15 @@
 //! path dependencies in this crate's Cargo.toml if yours lives elsewhere.
 
 use arxd_runtime::ActionPayload;
-use xc_primitives::{Action, Address, AssetClass, AssetMetadata, ClaimTopic};
+use xc_primitives::{Action, Address, AssetClass, AssetMetadata, AssetRef, ClaimTopic};
 
 fn addr(byte: u8) -> Address {
     Address::from_pubkey_bytes(&[byte; 32]).expect("32 bytes is a valid pubkey")
+}
+
+/// The ref `RegisterAsset { asset_id: "a" }` from the fixture sender derives.
+fn asset() -> AssetRef {
+    AssetRef::derive(&addr(0x07), "a").expect("valid issuer")
 }
 
 fn action(payload: ActionPayload) -> Action<ActionPayload> {
@@ -89,14 +94,16 @@ fn main() {
                 allowed_jurisdictions: Some(vec!["CH".to_string(), "DE".to_string()]),
                 max_supply: Some(1_000),
                 metadata_uri: Some("ipfs://a".to_string()),
+                symbol: "AAA".to_string(),
+                name: "Asset A".to_string(),
             },
         }),
         action(ActionPayload::IssueAsset {
-            asset_id: "a".to_string(),
+            asset: asset(),
             amount: 1,
         }),
         action(ActionPayload::TransferAsset {
-            asset_id: "a".to_string(),
+            asset: asset(),
             to: addr(0x05),
             amount: 1,
         }),
@@ -110,19 +117,28 @@ fn main() {
         action(ActionPayload::SubmitExecutionFault {
             artifact_json: "{}".to_string(),
         }),
-        action(ActionPayload::FreezeAsset {
-            asset_id: "a".to_string(),
-        }),
-        action(ActionPayload::UnfreezeAsset {
-            asset_id: "a".to_string(),
-        }),
+        action(ActionPayload::FreezeAsset { asset: asset() }),
+        action(ActionPayload::UnfreezeAsset { asset: asset() }),
         action(ActionPayload::ForcedTransfer {
-            asset_id: "a".to_string(),
+            asset: asset(),
             from: addr(0x04),
             to: addr(0x05),
             amount: 1,
             reason: "court order".to_string(),
         }),
+        action(ActionPayload::BurnAsset { asset: asset(), amount: 1 }),
+        action(ActionPayload::SetHolderFrozen { asset: asset(), holder: addr(0x04), frozen: true }),
+        action(ActionPayload::LockHolderAmount { asset: asset(), holder: addr(0x04), amount: 1 }),
+        action(ActionPayload::UnlockHolderAmount { asset: asset(), holder: addr(0x04), amount: 1 }),
+        action(ActionPayload::IssuerForcedTransfer {
+            asset: asset(),
+            from: addr(0x04),
+            to: addr(0x05),
+            amount: 1,
+            reason: "court order".to_string(),
+        }),
+        action(ActionPayload::RecoverHolder { asset: asset(), lost: addr(0x04), replacement: addr(0x05) }),
+        action(ActionPayload::IssueAssetTo { asset: asset(), to: addr(0x05), amount: 1 }),
     ];
 
     let block = xc_primitives::Block {
@@ -150,6 +166,7 @@ fn main() {
     }
     println!("\n];");
     println!("// {} bytes, {} actions", bytes.len(), block.actions.len());
+    println!("// asset ref for (sender 0x07, \"a\"): {}", asset());
 }
 
 fn nested_block() -> xc_primitives::Block<ActionPayload> {

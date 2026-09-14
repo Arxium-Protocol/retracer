@@ -32,6 +32,14 @@ name = "Unstake"
 [[kind]]
 name = "TransferAsset"
 
+  # V6 reset: the asset is named by its derived `AssetRef` (`arxasset1…`), not
+  # a slug, so "every action touching this asset" is a payload-field query.
+  # Indexed as text — it is an identifier, not an address, so it is not a
+  # role (roles go through the address validator, which only accepts `arx1`).
+  [[kind.index]]
+  path = "$.asset"
+  type = "text"
+
   [[kind.roles]]
   path = "$.to"
   role = "to"
@@ -67,6 +75,10 @@ name = "DeregisterAttestor"
 [[kind]]
 name = "ForcedTransfer"
 
+  [[kind.index]]
+  path = "$.asset"
+  type = "text"
+
   # Neither party signed the action — the governor did — so both are only
   # discoverable through the payload. `from` is the holder whose balance was
   # taken, which makes it the address most likely to be searched for after
@@ -82,12 +94,20 @@ name = "ForcedTransfer"
 [[kind]]
 name = "SetHolderFrozen"
 
+  [[kind.index]]
+  path = "$.asset"
+  type = "text"
+
   [[kind.roles]]
   path = "$.holder"
   role = "other:holder"
 
 [[kind]]
 name = "LockHolderAmount"
+
+  [[kind.index]]
+  path = "$.asset"
+  type = "text"
 
   [[kind.roles]]
   path = "$.holder"
@@ -96,12 +116,20 @@ name = "LockHolderAmount"
 [[kind]]
 name = "UnlockHolderAmount"
 
+  [[kind.index]]
+  path = "$.asset"
+  type = "text"
+
   [[kind.roles]]
   path = "$.holder"
   role = "other:holder"
 
 [[kind]]
 name = "IssuerForcedTransfer"
+
+  [[kind.index]]
+  path = "$.asset"
+  type = "text"
 
   [[kind.roles]]
   path = "$.from"
@@ -113,6 +141,10 @@ name = "IssuerForcedTransfer"
 
 [[kind]]
 name = "RecoverHolder"
+
+  [[kind.index]]
+  path = "$.asset"
+  type = "text"
 
   # The lost wallet is the one someone will search for; the replacement is
   # where its balance went.
@@ -127,10 +159,49 @@ name = "RecoverHolder"
 [[kind]]
 name = "IssueAssetTo"
 
+  [[kind.index]]
+  path = "$.asset"
+  type = "text"
+
   [[kind.roles]]
   path = "$.to"
   role = "to"
 
 # RegisterAsset / IssueAsset / BurnAsset / SubmitExecutionFault / FreezeAsset /
 # UnfreezeAsset have no address-bearing payload fields — the sender (already
-# indexed via actions.from_address) is the only party.
+# indexed via actions.from_address) is the only party. The ones that name an
+# asset still get the `$.asset` projection so an asset's whole history is one
+# indexed query. RegisterAsset carries the slug (`asset_id`), not the ref.
+
+[[kind]]
+name = "IssueAsset"
+  [[kind.index]]
+  path = "$.asset"
+  type = "text"
+
+[[kind]]
+name = "BurnAsset"
+  [[kind.index]]
+  path = "$.asset"
+  type = "text"
+
+[[kind]]
+name = "FreezeAsset"
+  [[kind.index]]
+  path = "$.asset"
+  type = "text"
+
+[[kind]]
+name = "UnfreezeAsset"
+  [[kind.index]]
+  path = "$.asset"
+  type = "text"
+
+[[kind]]
+name = "RegisterAsset"
+  [[kind.index]]
+  path = "$.asset_id"
+  type = "text"
+  [[kind.index]]
+  path = "$.metadata.symbol"
+  type = "text"

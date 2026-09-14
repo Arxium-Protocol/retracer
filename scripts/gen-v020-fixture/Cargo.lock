@@ -290,6 +290,7 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror",
+ "tracing",
  "xc-artifact",
  "xc-bls",
  "xc-chain-spec",
