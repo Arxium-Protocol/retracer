@@ -26,8 +26,9 @@ fn decode_exact<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> Result<T> {
 
 /// Converts a structurally-decoded [`RawBlock`] into `Block<P>`, dropping (with
 /// a warning) any action whose payload doesn't decode as `P` instead of
-/// failing the whole block. This is what makes an out-of-date `ActionPayload`
-/// mirror non-fatal: see `Action<P>`'s wire format in xc_primitives::action.
+/// failing the whole block. This is what makes a Retracer build older than
+/// the node's `ActionPayload` non-fatal: see `Action<P>`'s wire format in
+/// xc_primitives::action.
 ///
 /// A payload that decodes but leaves trailing bytes (e.g. a peer padding it
 /// by a byte) is treated the same as one that fails to decode at all —
@@ -1899,9 +1900,8 @@ mod tests {
         // V6 reset: every asset variant after `RegisterAsset` names the
         // asset by `AssetRef`, derived on the node from `(sender, "a")`.
         // The same pinned derivation the node's own tests check.
-        let expected_ref = AssetRef(
-            "arxasset1vadd7q2pzj3ceyca977gwfczpvayv0kg95rckyyptv4m24gaaxrsgknym8".to_string(),
-        );
+        let expected_ref: AssetRef =
+            "arxasset1vadd7q2pzj3ceyca977gwfczpvayv0kg95rckyyptv4m24gaaxrsgknym8".parse().unwrap();
         match &block.actions[13].payload {
             ActionPayload::IssueAsset { asset, .. } => assert_eq!(asset, &expected_ref),
             other => panic!("index 13 should be IssueAsset, got {other:?}"),
@@ -1983,8 +1983,8 @@ mod tests {
     }
 
     /// A block containing one action whose payload discriminant (99) is
-    /// nowhere in the local `ActionPayload` mirror — standing in for a
-    /// variant Arxium has added since this crate's copy was last updated.
+    /// nowhere in `ActionPayload` — standing in for a variant Arxium has
+    /// added since the pinned `arxd-payload` rev.
     /// `decode_exact` must still fail the whole block (it has no way to know
     /// how many payload bytes to skip); `decode_block_tolerant` must drop
     /// just that action and keep the rest, which is the entire point of

@@ -39,12 +39,16 @@ sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio",
 # wire types (Action<P>/Block<P>) stay byte-compatible with what arxd actually
 # gossips. xc-primitives is the same crate a third-party indexer would need —
 # replace this revision pin with a stable tag when Arxium publishes one.
-xc-primitives = { git = "https://github.com/Arxium-Protocol/arxium", rev = "24cc78557198d39fd9439d41bc474c6adbfdead6" }
+xc-primitives = { git = "https://github.com/Arxium-Protocol/arxium", rev = "59be752" }
 # The sync protocol's wire shapes, shared with the node rather than copied.
 # Before this crate existed these were hand-vendored here, and bincode carries
 # no version tag — a field added node-side decoded as garbage with no error.
-xc-wire = { git = "https://github.com/Arxium-Protocol/arxium", rev = "24cc78557198d39fd9439d41bc474c6adbfdead6" }
-xc-poe = { git = "https://github.com/Arxium-Protocol/arxium", rev = "24cc78557198d39fd9439d41bc474c6adbfdead6" }
-xc-bls = { git = "https://github.com/Arxium-Protocol/arxium", rev = "24cc78557198d39fd9439d41bc474c6adbfdead6" }
-xc-storage = { git = "https://github.com/Arxium-Protocol/arxium", rev = "24cc78557198d39fd9439d41bc474c6adbfdead6" }
-arxd-finality = { git = "https://github.com/Arxium-Protocol/arxium", rev = "24cc78557198d39fd9439d41bc474c6adbfdead6" }
+xc-wire = { git = "https://github.com/Arxium-Protocol/arxium", rev = "59be752" }
+xc-poe = { git = "https://github.com/Arxium-Protocol/arxium", rev = "59be752" }
+xc-bls = { git = "https://github.com/Arxium-Protocol/arxium", rev = "59be752" }
+xc-storage = { git = "https://github.com/Arxium-Protocol/arxium", rev = "59be752" }
+arxd-finality = { git = "https://github.com/Arxium-Protocol/arxium", rev = "59be752" }
+# CoreChain's `ActionPayload` itself — a leaf crate node-side, so the enum is
+# shared rather than hand-mirrored here (it was, until 59be752; every appended
+# variant had to be copied in the same position or blocks misdecoded).
+arxd-payload = { git = "https://github.com/Arxium-Protocol/arxium", rev = "59be752" }

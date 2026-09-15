@@ -10,6 +10,7 @@ tokio = { workspace = true, features = ["sync", "macros", "rt", "time"] }
 serde = { workspace = true }
 bincode = { workspace = true }
 xc-primitives = { workspace = true }
+arxd-payload = { workspace = true }
 xc-wire = { workspace = true }
 libp2p = { workspace = true }
 futures = "0.3"

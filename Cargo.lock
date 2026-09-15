@@ -79,7 +79,7 @@ checksum = "76a2e8124351fda1ef8aaaa3bbd7ebbcb486bbcd4225aca0aa0d84bb2db8fecb"
 [[package]]
 name = "arxd-finality"
 version = "0.1.0"
-source = "git+https://github.com/Arxium-Protocol/arxium?rev=24cc78557198d39fd9439d41bc474c6adbfdead6#24cc78557198d39fd9439d41bc474c6adbfdead6"
+source = "git+https://github.com/Arxium-Protocol/arxium?rev=59be752#59be752fd33985a79ee2b321e31f0a1079a7deee"
 dependencies = [
  "metrics",
  "serde",
@@ -88,6 +88,15 @@ dependencies = [
  "xc-poe",
  "xc-primitives",
  "xc-storage",
+]
+
+[[package]]
+name = "arxd-payload"
+version = "0.1.0"
+source = "git+https://github.com/Arxium-Protocol/arxium?rev=59be752#59be752fd33985a79ee2b321e31f0a1079a7deee"
+dependencies = [
+ "serde",
+ "xc-primitives",
 ]
 
 [[package]]
@@ -1700,6 +1709,7 @@ name = "ingestion"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "arxd-payload",
  "bincode",
  "futures",
  "libp2p",
@@ -4967,7 +4977,7 @@ dependencies = [
 [[package]]
 name = "xc-bls"
 version = "0.1.0"
-source = "git+https://github.com/Arxium-Protocol/arxium?rev=24cc78557198d39fd9439d41bc474c6adbfdead6#24cc78557198d39fd9439d41bc474c6adbfdead6"
+source = "git+https://github.com/Arxium-Protocol/arxium?rev=59be752#59be752fd33985a79ee2b321e31f0a1079a7deee"
 dependencies = [
  "blst",
  "serde",
@@ -4977,7 +4987,7 @@ dependencies = [
 [[package]]
 name = "xc-circuit"
 version = "0.1.0"
-source = "git+https://github.com/Arxium-Protocol/arxium?rev=24cc78557198d39fd9439d41bc474c6adbfdead6#24cc78557198d39fd9439d41bc474c6adbfdead6"
+source = "git+https://github.com/Arxium-Protocol/arxium?rev=59be752#59be752fd33985a79ee2b321e31f0a1079a7deee"
 dependencies = [
  "hex",
  "serde",
@@ -4988,7 +4998,7 @@ dependencies = [
 [[package]]
 name = "xc-poe"
 version = "0.1.0"
-source = "git+https://github.com/Arxium-Protocol/arxium?rev=24cc78557198d39fd9439d41bc474c6adbfdead6#24cc78557198d39fd9439d41bc474c6adbfdead6"
+source = "git+https://github.com/Arxium-Protocol/arxium?rev=59be752#59be752fd33985a79ee2b321e31f0a1079a7deee"
 dependencies = [
  "bincode",
  "serde",
@@ -5000,7 +5010,7 @@ dependencies = [
 [[package]]
 name = "xc-primitives"
 version = "0.1.0"
-source = "git+https://github.com/Arxium-Protocol/arxium?rev=24cc78557198d39fd9439d41bc474c6adbfdead6#24cc78557198d39fd9439d41bc474c6adbfdead6"
+source = "git+https://github.com/Arxium-Protocol/arxium?rev=59be752#59be752fd33985a79ee2b321e31f0a1079a7deee"
 dependencies = [
  "anyhow",
  "bech32",
@@ -5017,7 +5027,7 @@ dependencies = [
 [[package]]
 name = "xc-storage"
 version = "0.1.0"
-source = "git+https://github.com/Arxium-Protocol/arxium?rev=24cc78557198d39fd9439d41bc474c6adbfdead6#24cc78557198d39fd9439d41bc474c6adbfdead6"
+source = "git+https://github.com/Arxium-Protocol/arxium?rev=59be752#59be752fd33985a79ee2b321e31f0a1079a7deee"
 dependencies = [
  "bincode",
  "hex",
@@ -5034,7 +5044,7 @@ dependencies = [
 [[package]]
 name = "xc-wire"
 version = "0.1.0"
-source = "git+https://github.com/Arxium-Protocol/arxium?rev=24cc78557198d39fd9439d41bc474c6adbfdead6#24cc78557198d39fd9439d41bc474c6adbfdead6"
+source = "git+https://github.com/Arxium-Protocol/arxium?rev=59be752#59be752fd33985a79ee2b321e31f0a1079a7deee"
 dependencies = [
  "serde",
 ]
