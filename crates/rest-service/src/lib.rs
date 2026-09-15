@@ -53,10 +53,9 @@ impl std::fmt::Debug for NodeRpcToken {
 const MAX_PAGE_SIZE: i64 = 100;
 
 /// Caps how many `GET /validators?height=N` calls one uptime request can
-/// fan out to the node — this is an on-demand backfill computation (one
-/// node call per height), not a cached live figure, so an unbounded range
-/// would let one caller hammer the node. Raise if a real caller needs more;
-/// add caching before raising it much further.
+/// fan out to the node — each height not already in [`UptimeCache`] costs one
+/// node call, so an unbounded range would let one caller hammer the node.
+/// Raise if a real caller needs more.
 const MAX_UPTIME_RANGE: u64 = 5_000;
 const MAX_UPTIME_CONCURRENCY: usize = 16;
 const NODE_RPC_TIMEOUT: Duration = Duration::from_secs(5);
@@ -545,39 +544,43 @@ struct UptimeQuery {
 }
 
 #[derive(Serialize)]
+struct UptimeReport {
+    from: u64,
+    to: u64,
+    /// Indexed heights with a known proposer inside the range. Anything
+    /// below `to - from + 1` means part of the range is not indexed yet.
+    heights_counted: u64,
+    validators: Vec<ValidatorUptime>,
+}
+
+#[derive(Serialize)]
 struct ValidatorUptime {
     address: String,
-    /// Heights where this address was the primary round-robin designee
-    /// (`sorted(validator_set_at_height)[height % len]`, the same formula
-    /// `core/primitives::consensus::expected_proposer` uses) — a pure
-    /// function of on-chain-public data, not a replay of chain-specific
-    /// dispatch logic, so this stays on the right side of the boundary
-    /// rules even though `GetValidatorSet` itself is deliberately absent.
-    /// Backup-proposer takeover (a validator's turn passing to the next
-    /// one after a silent slot) is not counted here — that needs the
-    /// chain's `SLOT_DURATION` constant, which isn't part of any public
-    /// API, so this is "was it your turn," not "were you eligible."
+    /// Heights where this address was the round-0 (primary) designee.
     turns_owed: u64,
-    turns_proposed: i64,
-    /// `None` when this address was never the primary designee in range —
-    /// dividing by zero owed turns isn't a 0% uptime, it's "not this
-    /// validator's turn to be measured here."
+    /// Owed turns this address filled itself at round 0.
+    turns_proposed: u64,
+    /// `turns_owed - turns_proposed`.
+    turns_missed: u64,
+    /// Blocks this address produced at round > 0, standing in for a
+    /// validator that missed. Never counted toward its own uptime.
+    backup_proposals: u64,
+    /// `turns_proposed / turns_owed`; `None` when nothing was owed.
     uptime: Option<f64>,
 }
 
 /// Backfills validator uptime over `[from, to]` by calling the node's own
-/// `GET /validators?height=N` once per height (see `Retracer_Design.md`'s
-/// boundary rules on why the validator set isn't derived locally) and
-/// comparing the primary round-robin designee at each height against who
-/// actually proposed it (`storage::count_proposers_in_range`, already-local
-/// data). One node call per height is deliberate here — this is an
-/// on-demand backfill, not a live figure; a live/continuously-updated
-/// version would need caching this doesn't do (see `MAX_UPTIME_RANGE`).
+/// `GET /validators?height=N` (a `UptimeCache` entry per `(chain, height)`
+/// keeps a repeat range from re-fetching, see `UPTIME_CACHE_TTL`) and
+/// comparing the round-0 designee at each height against who actually
+/// proposed it (`storage::list_proposed_heights`, already-local data). Only
+/// heights `list_proposed_heights` returns are fetched from the node, so an
+/// unindexed height never counts as an owed turn and never costs a node call.
 async fn get_validator_uptime(
     State(state): State<AppState>,
     Path(chain_id): Path<String>,
     Query(query): Query<UptimeQuery>,
-) -> ApiResult<Vec<ValidatorUptime>> {
+) -> ApiResult<UptimeReport> {
     let chain = state.chain(&chain_id)?;
     let Some(node_rpc_url) = chain.node_rpc_url.clone() else {
         return Err(ApiError::BadRequest(format!(
@@ -594,7 +597,7 @@ async fn get_validator_uptime(
         )));
     }
 
-    let proposed = storage::count_proposers_in_range(
+    let rows = storage::list_proposed_heights(
         &state.pool,
         &chain_id,
         query.from as i64,
@@ -602,72 +605,136 @@ async fn get_validator_uptime(
     )
     .await?;
 
+    if rows.is_empty() {
+        return Ok(Json(UptimeReport {
+            from: query.from,
+            to: query.to,
+            heights_counted: 0,
+            validators: Vec::new(),
+        }));
+    }
+
     let http = state.http.clone();
     let cache = state.uptime_cache.clone();
     let cache_chain = chain_id.to_string();
-    let sets: Vec<anyhow::Result<(u64, Vec<String>)>> = stream::iter(query.from..=query.to)
-        .map(|height| {
-            let http = http.clone();
-            let cache = cache.clone();
-            let cache_chain = cache_chain.clone();
-            let node_rpc_url = node_rpc_url.clone();
-            let node_rpc_token = node_rpc_token.clone();
-            async move {
-                if let Some(set) = cache.get(&cache_chain, height) {
-                    return Ok((height, set));
-                }
-                let mut set =
-                    fetch_validator_set(&http, &node_rpc_url, node_rpc_token.as_ref(), height)
-                        .await?;
-                set.sort();
-                cache.insert(&cache_chain, height, set.clone());
-                Ok((height, set))
+    let sets: Vec<anyhow::Result<(u64, Vec<String>)>> = stream::iter(
+        rows.iter().map(|row| row.height as u64).collect::<Vec<_>>(),
+    )
+    .map(|height| {
+        let http = http.clone();
+        let cache = cache.clone();
+        let cache_chain = cache_chain.clone();
+        let node_rpc_url = node_rpc_url.clone();
+        let node_rpc_token = node_rpc_token.clone();
+        async move {
+            if let Some(set) = cache.get(&cache_chain, height) {
+                return Ok((height, set));
             }
-        })
-        .buffer_unordered(MAX_UPTIME_CONCURRENCY)
-        .collect()
-        .await;
+            let mut set =
+                fetch_validator_set(&http, &node_rpc_url, node_rpc_token.as_ref(), height).await?;
+            set.sort();
+            cache.insert(&cache_chain, height, set.clone());
+            Ok((height, set))
+        }
+    })
+    .buffer_unordered(MAX_UPTIME_CONCURRENCY)
+    .collect()
+    .await;
 
-    let mut owed: HashMap<String, u64> = HashMap::new();
+    let mut validator_sets: HashMap<u64, Vec<String>> = HashMap::new();
     for result in sets {
         let (height, set) = result?;
-        if let Some(designee) = primary_designee(&set, height) {
-            *owed.entry(designee.to_string()).or_insert(0) += 1;
-        }
+        validator_sets.insert(height, set);
     }
 
-    Ok(Json(compute_uptime(owed, proposed)))
+    let heights_counted = rows.len() as u64;
+    Ok(Json(UptimeReport {
+        from: query.from,
+        to: query.to,
+        heights_counted,
+        validators: compute_uptime(&rows, &validator_sets),
+    }))
 }
 
-/// The primary round-robin designee for `height`, given the validator set
-/// already sorted the way `core/primitives::consensus::expected_proposer`
-/// sorts it (lexicographically). `None` for an empty set.
-fn primary_designee(sorted_validators: &[String], height: u64) -> Option<&str> {
+/// Mirrors `core/primitives::consensus::eligible_proposer`: the validator
+/// entitled to propose `height` at `round`, from a lexicographically sorted
+/// set. `None` for an empty set.
+fn eligible_designee(sorted_validators: &[String], height: u64, round: u64) -> Option<&str> {
     if sorted_validators.is_empty() {
         return None;
     }
-    Some(sorted_validators[(height as usize) % sorted_validators.len()].as_str())
+    let idx = (height as usize).wrapping_add(round as usize) % sorted_validators.len();
+    Some(sorted_validators[idx].as_str())
 }
 
 fn compute_uptime(
-    owed: HashMap<String, u64>,
-    proposed: HashMap<String, i64>,
+    rows: &[storage::ProposedHeight],
+    sets: &HashMap<u64, Vec<String>>,
 ) -> Vec<ValidatorUptime> {
-    let mut rows: Vec<ValidatorUptime> = owed
+    let mut owed: HashMap<String, u64> = HashMap::new();
+    let mut proposed: HashMap<String, u64> = HashMap::new();
+    let mut backup: HashMap<String, u64> = HashMap::new();
+
+    for row in rows {
+        let height = row.height as u64;
+        let round = row.round as u64;
+        let Some(set) = sets.get(&height) else {
+            tracing::warn!(height, "no validator set fetched for an owed height; skipping");
+            continue;
+        };
+        let Some(primary) = eligible_designee(set, height, 0) else {
+            continue;
+        };
+
+        *owed.entry(primary.to_string()).or_insert(0) += 1;
+
+        if round == 0 {
+            if row.proposer == primary {
+                *proposed.entry(primary.to_string()).or_insert(0) += 1;
+            } else {
+                tracing::warn!(
+                    height,
+                    proposer = %row.proposer,
+                    primary,
+                    "round-0 block was not proposed by the primary designee"
+                );
+            }
+        } else {
+            *backup.entry(row.proposer.clone()).or_insert(0) += 1;
+            if let Some(expected) = eligible_designee(set, height, round)
+                && row.proposer != expected
+            {
+                tracing::warn!(
+                    height,
+                    round,
+                    proposer = %row.proposer,
+                    expected,
+                    "backup proposer does not match the round's eligible designee"
+                );
+            }
+        }
+    }
+
+    let mut addresses: std::collections::BTreeSet<String> = owed.keys().cloned().collect();
+    addresses.extend(backup.keys().cloned());
+
+    addresses
         .into_iter()
-        .map(|(address, turns_owed)| {
+        .map(|address| {
+            let turns_owed = owed.get(&address).copied().unwrap_or(0);
             let turns_proposed = proposed.get(&address).copied().unwrap_or(0);
+            let backup_proposals = backup.get(&address).copied().unwrap_or(0);
             let uptime = (turns_owed > 0).then(|| turns_proposed as f64 / turns_owed as f64);
             ValidatorUptime {
                 address,
                 turns_owed,
                 turns_proposed,
+                turns_missed: turns_owed.saturating_sub(turns_proposed),
+                backup_proposals,
                 uptime,
             }
         })
-        .collect();
-    rows.sort_by(|a, b| a.address.cmp(&b.address));
-    rows
+        .collect()
 }
 
 async fn fetch_validator_set(
@@ -916,42 +983,84 @@ mod tests {
     }
 
     #[test]
-    fn primary_designee_rotates_lexicographically_by_height_modulo_set_size() {
-        let validators = vec![
-            "arx1b".to_string(),
-            "arx1a".to_string(),
-            "arx1c".to_string(),
-        ];
-        // Sorted order is a, b, c regardless of input order — matches the
-        // node's own `sorted.sort()` before indexing by `height % len`.
-        let mut sorted = validators.clone();
-        sorted.sort();
-        assert_eq!(primary_designee(&sorted, 0), Some("arx1a"));
-        assert_eq!(primary_designee(&sorted, 1), Some("arx1b"));
-        assert_eq!(primary_designee(&sorted, 2), Some("arx1c"));
-        assert_eq!(primary_designee(&sorted, 3), Some("arx1a"), "wraps around");
-        assert_eq!(primary_designee(&[], 0), None);
+    fn eligible_designee_matches_the_node_formula() {
+        let sorted = vec!["a".to_string(), "b".to_string(), "c".to_string()];
+        assert_eq!(eligible_designee(&sorted, 0, 0), Some("a"));
+        assert_eq!(eligible_designee(&sorted, 1, 0), Some("b"));
+        assert_eq!(eligible_designee(&sorted, 3, 0), Some("a"), "wraps around");
+        assert_eq!(eligible_designee(&sorted, 1, 1), Some("c"));
+        assert_eq!(eligible_designee(&sorted, 2, 2), Some("b"));
+        assert_eq!(eligible_designee(&[], 0, 0), None);
+    }
+
+    fn proposed_height(height: i64, proposer: &str, round: i64) -> storage::ProposedHeight {
+        storage::ProposedHeight {
+            height,
+            proposer: proposer.to_string(),
+            round,
+        }
     }
 
     #[test]
-    fn uptime_divides_proposed_by_owed_and_treats_never_owed_as_unmeasured() {
-        let owed = HashMap::from([("a".to_string(), 4u64), ("b".to_string(), 2u64)]);
-        let proposed = HashMap::from([("a".to_string(), 3i64)]);
-        let mut rows = compute_uptime(owed, proposed);
-        rows.sort_by(|a, b| a.address.cmp(&b.address));
+    fn all_turns_filled_gives_full_uptime() {
+        let set = vec!["a".to_string(), "b".to_string(), "c".to_string()];
+        let rows: Vec<storage::ProposedHeight> = (0..=5)
+            .map(|height| {
+                let primary = eligible_designee(&set, height as u64, 0).unwrap();
+                proposed_height(height, primary, 0)
+            })
+            .collect();
+        let sets: HashMap<u64, Vec<String>> = (0..=5u64).map(|h| (h, set.clone())).collect();
 
-        assert_eq!(rows[0].address, "a");
-        assert_eq!(rows[0].turns_owed, 4);
-        assert_eq!(rows[0].turns_proposed, 3);
-        assert_eq!(rows[0].uptime, Some(0.75));
+        let uptime = compute_uptime(&rows, &sets);
+        assert_eq!(uptime.len(), 3);
+        for row in &uptime {
+            assert_eq!(row.turns_owed, 2);
+            assert_eq!(row.turns_proposed, 2);
+            assert_eq!(row.turns_missed, 0);
+            assert_eq!(row.backup_proposals, 0);
+            assert_eq!(row.uptime, Some(1.0));
+        }
+    }
 
-        assert_eq!(rows[1].address, "b");
-        assert_eq!(rows[1].turns_owed, 2);
-        assert_eq!(
-            rows[1].turns_proposed, 0,
-            "no proposed-count row means zero, not missing"
+    #[test]
+    fn backup_takeover_charges_the_primary_not_the_backup() {
+        let set = vec!["a".to_string(), "b".to_string(), "c".to_string()];
+        // height 0: a's turn, a proposes. height 1: b's turn, but c takes
+        // over at round 1. height 2: c's turn, c proposes at round 0.
+        let rows = vec![
+            proposed_height(0, "a", 0),
+            proposed_height(1, "c", 1),
+            proposed_height(2, "c", 0),
+        ];
+        let sets: HashMap<u64, Vec<String>> = (0..=2u64).map(|h| (h, set.clone())).collect();
+
+        let uptime = compute_uptime(&rows, &sets);
+        let b = uptime.iter().find(|r| r.address == "b").unwrap();
+        assert_eq!(b.turns_owed, 1);
+        assert_eq!(b.turns_proposed, 0);
+        assert_eq!(b.turns_missed, 1);
+        assert_eq!(b.uptime, Some(0.0));
+
+        let c = uptime.iter().find(|r| r.address == "c").unwrap();
+        assert_eq!(c.turns_owed, 1);
+        assert_eq!(c.turns_proposed, 1);
+        assert_eq!(c.backup_proposals, 1);
+        assert_eq!(c.uptime, Some(1.0), "never counted above 1.0");
+    }
+
+    #[test]
+    fn unindexed_heights_are_not_owed() {
+        let set = vec!["a".to_string(), "b".to_string(), "c".to_string()];
+        // Height 1 (b's turn) is missing entirely, e.g. not indexed yet.
+        let rows = vec![proposed_height(0, "a", 0), proposed_height(2, "c", 0)];
+        let sets: HashMap<u64, Vec<String>> = [0u64, 2u64].into_iter().map(|h| (h, set.clone())).collect();
+
+        let uptime = compute_uptime(&rows, &sets);
+        assert!(
+            uptime.iter().all(|r| r.address != "b"),
+            "an unindexed height must not create an owed turn for its designee"
         );
-        assert_eq!(rows[1].uptime, Some(0.0));
     }
 
     #[test]

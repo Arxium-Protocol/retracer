@@ -162,6 +162,8 @@ GET  /v1/chains/{chain}/actions/{action_hash}
 
 GET  /v1/chains/{chain}/accounts/{address}/actions?limit=&role=
 GET  /v1/chains/{chain}/search?q=
+
+GET  /v1/chains/{chain}/validators/uptime?from=&to=
 ```
 
 `/health` is process liveness only. `/ready` returns 200 only when PostgreSQL
@@ -295,19 +297,28 @@ and `ingestion::HasHeight` for your own block type — see
 - **Account balances and nonces.** Not derivable from indexed actions; ask the
   node directly.
 - **Validator set membership.** Live membership comes from the node's
-  `/validators`. Retracer reports who has actually *proposed* blocks — and,
-  since 2026-08-25, who *should have*: `GET
-  /v1/chains/{chain_id}/validators/uptime?from=&to=` backfills turns owed
-  (the primary round-robin designee per height, a pure function of the
-  node's own `/validators?height=N` — not a replay of chain-specific
-  dispatch logic) against turns actually proposed. One node call per height,
-  so it's a bounded on-demand backfill (`MAX_UPTIME_RANGE`), not a live
-  figure. Needs `--node-rpc-url`/`RETRACER_NODE_RPC_URL` configured per
+  `/validators`. Retracer reports who has actually *proposed* blocks — and
+  who *should have*: `GET /v1/chains/{chain_id}/validators/uptime?from=&to=`
+  compares each indexed height's round-0 designee (a pure function of the
+  node's own `/validators?height=N`, mirroring the node's own
+  `eligible_proposer` formula, not a replay of chain-specific dispatch logic)
+  against who actually proposed it. A block produced at round > 0 (a backup
+  taking over after the primary missed) is attributed to the primary as a
+  missed turn and to the backup as a `backup_proposals` count, never as extra
+  uptime for the backup. Only indexed heights with a known proposer are
+  counted; `heights_counted` in the response says how many of the requested
+  heights that was, so a range reaching past the indexed tip is visible
+  rather than silently under-counted. Node calls are cached per
+  `(chain, height)` for `UPTIME_CACHE_TTL` (5 minutes) and capped per request
+  by `MAX_UPTIME_RANGE`; this is a backfill endpoint, not a live figure.
+  Needs `--node-rpc-url`/`RETRACER_NODE_RPC_URL` configured per
     chain; without it the route 400s rather than guessing an address. Protected
     node RPCs also require `--node-rpc-token`/`RETRACER_NODE_RPC_TOKEN`; the
     credential is sent as `Authorization: Bearer` and is redacted from Debug output.
     Send bearer-authenticated requests only over loopback, HTTPS, or the encrypted
     WireGuard network; ordinary remote HTTP exposes the credential in transit.
+    Rows indexed before migration `0002` report round 0 regardless of the
+    block's real round, since that column did not exist yet.
 - **Mempool / pending actions.** Confirmed blocks only.
 - **Auth or rate limiting.** Off by default (unchanged trusted-consumer
   behavior), now opt-in via `--auth-token`/`RETRACER_AUTH_TOKEN` (a shared

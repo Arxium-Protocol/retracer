@@ -476,54 +476,76 @@ async fn read_queries_return_what_was_written() {
 }
 
 #[tokio::test]
-async fn count_proposers_in_range_only_counts_heights_inside_the_bound() {
+async fn list_proposed_heights_respects_bounds_and_skips_null_proposers() {
     let pool = skip_without_db!();
-    let chain = chain_id("proposer-range");
+    let chain = chain_id("proposed-heights");
     let extractor = AddressExtractor::tier_a_only(KindSchema::empty());
 
-    let proposed_by = |height: u64, parent: &str, proposer: u8| -> Block<TestPayload> {
+    let block_at = |height: u64,
+                     parent: &str,
+                     proposer: Option<u8>,
+                     round: u32|
+     -> Block<TestPayload> {
         Block {
             height,
             parent_hash: parent.to_string(),
             timestamp: 1_700_000_000 + height,
             actions: vec![],
             tx_root: [0; 32],
-            proposer: Some(addr(proposer)),
+            proposer: proposer.map(addr),
             signature: None,
             state_root: String::new(),
-            round: 0,
+            round,
             round_certificate: None,
         }
     };
 
-    let b0 = proposed_by(0, "0x0", 1);
+    // Height 0 has no proposer (e.g. genesis) and must never appear as owed.
+    let b0 = block_at(0, "0x0", None, 0);
     let parent = b0.hash();
     storage::insert_block(&pool, &chain, &b0, &extractor)
         .await
         .expect("genesis");
-    let b1 = proposed_by(1, &parent, 2);
+    let b1 = block_at(1, &parent, Some(1), 0);
     let parent = b1.hash();
     storage::insert_block(&pool, &chain, &b1, &extractor)
         .await
         .expect("block 1");
-    let b2 = proposed_by(2, &parent, 1);
+    let b2 = block_at(2, &parent, Some(2), 1);
     storage::insert_block(&pool, &chain, &b2, &extractor)
         .await
         .expect("block 2");
 
-    // Full range: address 1 proposed heights 0 and 2, address 2 proposed height 1.
-    let full = storage::count_proposers_in_range(&pool, &chain, 0, 2)
+    let full = storage::list_proposed_heights(&pool, &chain, 0, 2)
         .await
         .expect("full range");
-    assert_eq!(full.get(&addr(1).to_string()), Some(&2));
-    assert_eq!(full.get(&addr(2).to_string()), Some(&1));
+    assert_eq!(
+        full,
+        vec![
+            storage::ProposedHeight {
+                height: 1,
+                proposer: addr(1).to_string(),
+                round: 0,
+            },
+            storage::ProposedHeight {
+                height: 2,
+                proposer: addr(2).to_string(),
+                round: 1,
+            },
+        ]
+    );
 
-    // Narrowed range excludes height 2's contribution.
-    let narrowed = storage::count_proposers_in_range(&pool, &chain, 0, 1)
+    let narrowed = storage::list_proposed_heights(&pool, &chain, 0, 1)
         .await
         .expect("narrowed range");
-    assert_eq!(narrowed.get(&addr(1).to_string()), Some(&1));
-    assert_eq!(narrowed.get(&addr(2).to_string()), Some(&1));
+    assert_eq!(
+        narrowed,
+        vec![storage::ProposedHeight {
+            height: 1,
+            proposer: addr(1).to_string(),
+            round: 0,
+        }]
+    );
 }
 
 #[tokio::test]

@@ -332,17 +332,27 @@ pub struct ProposerRow {
 /// `GET /validators?height=N` (see `rest-service::get_validator_uptime`;
 /// see also `Retracer_Design.md`'s boundary rules on why that computation
 /// doesn't live here).
-pub async fn count_proposers_in_range(
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProposedHeight {
+    pub height: i64,
+    pub proposer: String,
+    pub round: i64,
+}
+
+/// Every indexed block with a known proposer in `[from_height, to_height]`,
+/// ascending. The uptime denominator is built from these rows, so a height
+/// that is not indexed yet (or has no proposer) is never counted as owed.
+pub async fn list_proposed_heights(
     pool: &PgPool,
     chain_id: &str,
     from_height: i64,
     to_height: i64,
-) -> Result<std::collections::HashMap<String, i64>> {
-    let rows: Vec<(String, i64)> = sqlx::query_as(
-        "SELECT proposer, COUNT(*)
+) -> Result<Vec<ProposedHeight>> {
+    let rows: Vec<(i64, String, i64)> = sqlx::query_as(
+        "SELECT height, proposer, round
          FROM blocks
          WHERE chain_id = $1 AND proposer IS NOT NULL AND height BETWEEN $2 AND $3
-         GROUP BY proposer",
+         ORDER BY height",
     )
     .bind(chain_id)
     .bind(from_height)
@@ -350,7 +360,14 @@ pub async fn count_proposers_in_range(
     .fetch_all(pool)
     .await?;
 
-    Ok(rows.into_iter().collect())
+    Ok(rows
+        .into_iter()
+        .map(|(height, proposer, round)| ProposedHeight {
+            height,
+            proposer,
+            round,
+        })
+        .collect())
 }
 
 /// A block without its actions. Separate from `BlockRow` on purpose: the two
