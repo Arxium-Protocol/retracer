@@ -1857,6 +1857,9 @@ mod tests {
                 ActionPayload::IssuerForcedTransfer { .. } => "IssuerForcedTransfer",
                 ActionPayload::RecoverHolder { .. } => "RecoverHolder",
                 ActionPayload::IssueAssetTo { .. } => "IssueAssetTo",
+                ActionPayload::LockIssuance { .. } => "LockIssuance",
+                ActionPayload::TransferIssuer { .. } => "TransferIssuer",
+                ActionPayload::SetAssetMetadataUri { .. } => "SetAssetMetadataUri",
             })
             .collect();
         assert_eq!(

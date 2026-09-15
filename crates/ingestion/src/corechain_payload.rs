@@ -167,4 +167,18 @@ pub enum ActionPayload {
         to: Address,
         amount: u128,
     },
+    /// Variant 28 — issuer permanently gives up minting.
+    LockIssuance {
+        asset: AssetRef,
+    },
+    /// Variant 29.
+    TransferIssuer {
+        asset: AssetRef,
+        new_issuer: Address,
+    },
+    /// Variant 30.
+    SetAssetMetadataUri {
+        asset: AssetRef,
+        metadata_uri: Option<String>,
+    },
 }
