@@ -39,8 +39,12 @@ sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio",
 # wire types (Action<P>/Block<P>) stay byte-compatible with what arxd actually
 # gossips. xc-primitives is the same crate a third-party indexer would need —
 # replace this revision pin with a stable tag when Arxium publishes one.
-xc-primitives = { git = "https://github.com/Arxium-Protocol/arxium", rev = "bad6330b26eb426c11f779286b946c59d1a814a8" }
+xc-primitives = { git = "https://github.com/Arxium-Protocol/arxium", rev = "24cc78557198d39fd9439d41bc474c6adbfdead6" }
 # The sync protocol's wire shapes, shared with the node rather than copied.
 # Before this crate existed these were hand-vendored here, and bincode carries
 # no version tag — a field added node-side decoded as garbage with no error.
-xc-wire = { git = "https://github.com/Arxium-Protocol/arxium", rev = "bad6330b26eb426c11f779286b946c59d1a814a8" }
+xc-wire = { git = "https://github.com/Arxium-Protocol/arxium", rev = "24cc78557198d39fd9439d41bc474c6adbfdead6" }
+xc-poe = { git = "https://github.com/Arxium-Protocol/arxium", rev = "24cc78557198d39fd9439d41bc474c6adbfdead6" }
+xc-bls = { git = "https://github.com/Arxium-Protocol/arxium", rev = "24cc78557198d39fd9439d41bc474c6adbfdead6" }
+xc-storage = { git = "https://github.com/Arxium-Protocol/arxium", rev = "24cc78557198d39fd9439d41bc474c6adbfdead6" }
+arxd-finality = { git = "https://github.com/Arxium-Protocol/arxium", rev = "24cc78557198d39fd9439d41bc474c6adbfdead6" }

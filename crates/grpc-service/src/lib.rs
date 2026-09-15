@@ -3,21 +3,20 @@ pub mod proto {
 }
 
 use futures::{StreamExt, TryStreamExt};
+use proto::Chain as ProtoChain;
 use proto::get_block_request::By;
 use proto::retracer_server::{Retracer, RetracerServer};
 use proto::search_response::Result as SearchResult;
-use proto::Chain as ProtoChain;
 use proto::{
     Action, Block, GetAccountActionsRequest, GetAccountActionsResponse, GetActionRequest,
     GetBlockRequest, GetStatsRequest, GetStatsResponse, GetStatusRequest, GetStatusResponse,
     ListActionsRequest, ListActionsResponse, ListBlocksRequest, ListBlocksResponse,
-    ListChainsRequest, ListChainsResponse, ListProposersRequest, ListProposersResponse,
-    Proposer, SearchRequest, SearchResponse,
-    SubscribeAccountActionsRequest, SubscribeBlocksRequest,
+    ListChainsRequest, ListChainsResponse, ListProposersRequest, ListProposersResponse, Proposer,
+    SearchRequest, SearchResponse, SubscribeAccountActionsRequest, SubscribeBlocksRequest,
 };
 use sqlx::PgPool;
-use std::pin::Pin;
 use std::collections::HashMap;
+use std::pin::Pin;
 use std::sync::Arc;
 use storage::{ActionRow, AddressExtractor, AddressValidator, BlockRow, BlockSummary};
 use tokio::sync::broadcast;
@@ -91,8 +90,16 @@ impl Service {
             .chain_id
             .clone();
         let order: Vec<String> = chains.iter().map(|c| c.chain_id.clone()).collect();
-        let chains = chains.into_iter().map(|c| (c.chain_id.clone(), c)).collect();
-        Service { pool, chains, order, default_chain_id }
+        let chains = chains
+            .into_iter()
+            .map(|c| (c.chain_id.clone(), c))
+            .collect();
+        Service {
+            pool,
+            chains,
+            order,
+            default_chain_id,
+        }
     }
 
     /// Resolves the `x-chain-id` header to a registered chain.
@@ -121,12 +128,24 @@ impl ChainRuntime {
     /// which is the same answer a well-formed unknown address gets.
     fn check_address(&self, address: &str) -> Result<(), Status> {
         match &self.address_validator {
-            Some(valid) if !valid(address) => {
-                Err(Status::invalid_argument("not a valid address for this chain"))
-            }
+            Some(valid) if !valid(address) => Err(Status::invalid_argument(
+                "not a valid address for this chain",
+            )),
             _ => Ok(()),
         }
     }
+}
+
+fn postgres_action_cursor(height: u64, index: u32) -> Result<(i64, i32), Status> {
+    let height = i64::try_from(height)
+        .map_err(|_| Status::invalid_argument("before_height exceeds PostgreSQL BIGINT"))?;
+    let index = i32::try_from(index)
+        .map_err(|_| Status::invalid_argument("before_index exceeds PostgreSQL INT"))?;
+    Ok((height, index))
+}
+
+fn public_network_tip(network: ingestion::NetworkView) -> Option<u64> {
+    network.has_fresh_status().then_some(network.tip_height).flatten()
 }
 
 type ResponseStream<T> = Pin<Box<dyn Stream<Item = Result<T, Status>> + Send>>;
@@ -203,7 +222,10 @@ impl Retracer for Service {
         }))
     }
 
-    async fn get_block(&self, request: Request<GetBlockRequest>) -> Result<Response<Block>, Status> {
+    async fn get_block(
+        &self,
+        request: Request<GetBlockRequest>,
+    ) -> Result<Response<Block>, Status> {
         let chain = self.chain(&request)?;
         let by = request
             .into_inner()
@@ -211,7 +233,9 @@ impl Retracer for Service {
             .ok_or_else(|| Status::invalid_argument("must set either height or hash"))?;
 
         let row = match by {
-            By::Height(height) => storage::get_block_by_height(&self.pool, &chain.chain_id, height as i64).await,
+            By::Height(height) => {
+                storage::get_block_by_height(&self.pool, &chain.chain_id, height as i64).await
+            }
             By::Hash(hash) => storage::get_block_by_hash(&self.pool, &chain.chain_id, &hash).await,
         }
         .map_err(|err| Status::internal(err.to_string()))?;
@@ -221,7 +245,10 @@ impl Retracer for Service {
             .ok_or_else(|| Status::not_found("block not found"))
     }
 
-    async fn get_action(&self, request: Request<GetActionRequest>) -> Result<Response<Action>, Status> {
+    async fn get_action(
+        &self,
+        request: Request<GetActionRequest>,
+    ) -> Result<Response<Action>, Status> {
         let chain = self.chain(&request)?;
         let action_hash = request.into_inner().action_hash;
         storage::get_action_by_hash(&self.pool, &chain.chain_id, &action_hash)
@@ -239,11 +266,15 @@ impl Retracer for Service {
         let chain = self.chain(&request)?;
         let req = request.into_inner();
         chain.check_address(&req.address)?;
-        let limit = if req.limit == 0 { MAX_PAGE_SIZE } else { req.limit.min(MAX_PAGE_SIZE) };
+        let limit = if req.limit == 0 {
+            MAX_PAGE_SIZE
+        } else {
+            req.limit.min(MAX_PAGE_SIZE)
+        };
 
         // Both cursor halves or neither — see list_actions for why.
         let before = match (req.before_height, req.before_index) {
-            (Some(h), Some(i)) => Some((h as i64, i as i32)),
+            (Some(h), Some(i)) => Some(postgres_action_cursor(h, i)?),
             (None, None) => None,
             _ => {
                 return Err(Status::invalid_argument(
@@ -270,7 +301,10 @@ impl Retracer for Service {
 
     /// Same "try each kind in turn" approach as the node's own `/search` —
     /// see `core/rpc`'s `search` handler.
-    async fn search(&self, request: Request<SearchRequest>) -> Result<Response<SearchResponse>, Status> {
+    async fn search(
+        &self,
+        request: Request<SearchRequest>,
+    ) -> Result<Response<SearchResponse>, Status> {
         let chain = self.chain(&request)?;
         let q = request.into_inner().query;
         if q.len() > MAX_SEARCH_LEN {
@@ -289,7 +323,11 @@ impl Retracer for Service {
             }));
         }
 
-        if chain.address_validator.as_ref().is_some_and(|valid| valid(&q)) {
+        if chain
+            .address_validator
+            .as_ref()
+            .is_some_and(|valid| valid(&q))
+        {
             return Ok(Response::new(SearchResponse {
                 result: Some(SearchResult::AccountAddress(q)),
             }));
@@ -322,10 +360,12 @@ impl Retracer for Service {
         request: Request<GetStatusRequest>,
     ) -> Result<Response<GetStatusResponse>, Status> {
         let chain = self.chain(&request)?;
+        let network = *chain.network_view.borrow();
+        let network_tip = public_network_tip(network);
         let status = storage::get_status(&self.pool, &chain.chain_id)
             .await
             .map_err(|err| Status::internal(err.to_string()))?
-            .with_network_tip(chain.network_view.borrow().tip_height);
+            .with_network_tip(network_tip);
 
         Ok(Response::new(GetStatusResponse {
             chain_id: chain.chain_id.clone(),
@@ -342,7 +382,11 @@ impl Retracer for Service {
     ) -> Result<Response<ListBlocksResponse>, Status> {
         let chain = self.chain(&request)?;
         let req = request.into_inner();
-        let limit = if req.limit == 0 { MAX_PAGE_SIZE } else { req.limit.min(MAX_PAGE_SIZE) };
+        let limit = if req.limit == 0 {
+            MAX_PAGE_SIZE
+        } else {
+            req.limit.min(MAX_PAGE_SIZE)
+        };
 
         let rows = storage::list_blocks(
             &self.pool,
@@ -388,13 +432,17 @@ impl Retracer for Service {
     ) -> Result<Response<ListActionsResponse>, Status> {
         let chain = self.chain(&request)?;
         let req = request.into_inner();
-        let limit = if req.limit == 0 { MAX_PAGE_SIZE } else { req.limit.min(MAX_PAGE_SIZE) };
+        let limit = if req.limit == 0 {
+            MAX_PAGE_SIZE
+        } else {
+            req.limit.min(MAX_PAGE_SIZE)
+        };
 
         // Both cursor halves or neither. A height without an index would have
         // to guess at the missing half, and either guess silently drops or
         // repeats the actions in the boundary block.
         let before = match (req.before_height, req.before_index) {
-            (Some(h), Some(i)) => Some((h as i64, i as i32)),
+            (Some(h), Some(i)) => Some(postgres_action_cursor(h, i)?),
             (None, None) => None,
             _ => {
                 return Err(Status::invalid_argument(
@@ -472,21 +520,19 @@ impl Retracer for Service {
                 if next > tip {
                     return Ok::<_, Status>(None);
                 }
-                let page = storage::get_blocks_in_range(
-                    &pool,
-                    &chain_id,
-                    next,
-                    tip,
-                    storage::BLOCK_PAGE,
-                )
-                .await
-                .map_err(|err| Status::internal(err.to_string()))?;
+                let page =
+                    storage::get_blocks_in_range(&pool, &chain_id, next, tip, storage::BLOCK_PAGE)
+                        .await
+                        .map_err(|err| Status::internal(err.to_string()))?;
                 // Empty page before the tip means the range has holes rather
                 // than more rows — stop instead of looping on the same height.
                 let Some(last) = page.last().map(|b| b.height) else {
                     return Ok::<_, Status>(None);
                 };
-                Ok(Some((futures::stream::iter(page.into_iter().map(|row| Ok(Block::from(row)))), last + 1)))
+                Ok(Some((
+                    futures::stream::iter(page.into_iter().map(|row| Ok(Block::from(row)))),
+                    last + 1,
+                )))
             }
         })
         .try_flatten();
@@ -497,20 +543,19 @@ impl Retracer for Service {
                 match item {
                     Ok(row) if row.height > replay_ceiling => Some(Ok(Block::from(row))),
                     Ok(_) => None,
-                    // A slow subscriber that falls behind the broadcast
-                    // channel's capacity misses those blocks rather than
-                    // blocking ingestion for every other subscriber — logged
-                    // with the gap size, not surfaced as a stream error (the
-                    // stream itself is still healthy). A consumer without its
-                    // own gap detection loses these blocks silently, so the
-                    // count is what an alert keys on.
+                    // A slow subscriber cannot recover a broadcast gap from
+                    // this live receiver. Surface DataLoss so clients replay
+                    // from persistent storage rather than treating the next
+                    // event as contiguous history.
                     Err(BroadcastStreamRecvError::Lagged(skipped)) => {
                         tracing::warn!(
                             chain_id = %lag_chain_id,
                             skipped,
                             "SubscribeBlocks subscriber lagged"
                         );
-                        None
+                        Some(Err(Status::data_loss(format!(
+                            "SubscribeBlocks lagged and skipped {skipped} blocks"
+                        ))))
                     }
                 }
             }
@@ -564,7 +609,11 @@ impl Retracer for Service {
 /// one). Matches what `GetAccountActions(role: "to")` already finds
 /// historically via `action_addresses`, computed live here instead so
 /// SubscribeAccountActions notifies recipients, not just senders.
-fn action_matches_address(address_extractor: &AddressExtractor, action: &ActionRow, address: &str) -> bool {
+fn action_matches_address(
+    address_extractor: &AddressExtractor,
+    action: &ActionRow,
+    address: &str,
+) -> bool {
     action.from_address == address
         || address_extractor
             .resolve(&action.kind, &action.payload)
@@ -587,7 +636,7 @@ fn replay_ceiling(from_height: Option<u64>, replayed_through: Option<i64>) -> i6
 
 #[cfg(test)]
 mod tests {
-    use super::{action_matches_address, replay_ceiling, ChainRuntime, Service, CHAIN_HEADER};
+    use super::{CHAIN_HEADER, ChainRuntime, Service, action_matches_address, postgres_action_cursor, public_network_tip, replay_ceiling};
     use std::sync::Arc;
     use storage::{ActionRow, AddressExtractor, KindSchema};
     use tonic::Request;
@@ -622,7 +671,8 @@ mod tests {
     fn request_for(chain: Option<&str>) -> Request<()> {
         let mut req = Request::new(());
         if let Some(chain) = chain {
-            req.metadata_mut().insert(CHAIN_HEADER, chain.parse().unwrap());
+            req.metadata_mut()
+                .insert(CHAIN_HEADER, chain.parse().unwrap());
         }
         req
     }
@@ -636,7 +686,10 @@ mod tests {
     #[tokio::test]
     async fn chain_header_selects_a_registered_chain() {
         let svc = service(&["hub", "spoke-a"]);
-        assert_eq!(svc.chain(&request_for(Some("spoke-a"))).unwrap().chain_id, "spoke-a");
+        assert_eq!(
+            svc.chain(&request_for(Some("spoke-a"))).unwrap().chain_id,
+            "spoke-a"
+        );
     }
 
     /// The important one: an unknown chain must be an error, never a quiet
@@ -650,7 +703,10 @@ mod tests {
             Err(err) => err,
         };
         assert_eq!(err.code(), tonic::Code::NotFound);
-        assert!(err.message().contains("ListChains"), "error should point at discovery");
+        assert!(
+            err.message().contains("ListChains"),
+            "error should point at discovery"
+        );
     }
 
     #[test]
@@ -687,9 +743,35 @@ mod tests {
         assert_eq!(replay_ceiling(Some(9), Some(8)), 8);
     }
 
+    #[test]
+    fn public_status_omits_an_expired_network_tip() {
+        let fresh = ingestion::NetworkView {
+            active_peer_count: 1,
+            status_peer_count: 1,
+            tip_height: Some(42),
+            finalized_height: None,
+            last_status_at: Some(std::time::Instant::now()),
+        };
+        assert_eq!(public_network_tip(fresh), Some(42));
+        let stale = ingestion::NetworkView {
+            last_status_at: Some(std::time::Instant::now() - std::time::Duration::from_secs(16)),
+            ..fresh
+        };
+        assert_eq!(public_network_tip(stale), None);
+    }
+
+    #[test]
+    fn action_cursors_must_fit_postgres_columns() {
+        assert_eq!(postgres_action_cursor(i64::MAX as u64, i32::MAX as u32).unwrap(), (i64::MAX, i32::MAX));
+        assert_eq!(postgres_action_cursor(i64::MAX as u64 + 1, 0).unwrap_err().code(), tonic::Code::InvalidArgument);
+        assert_eq!(postgres_action_cursor(0, i32::MAX as u32 + 1).unwrap_err().code(), tonic::Code::InvalidArgument);
+    }
+
     fn schema_with_transfer_to_role() -> KindSchema {
-        let path = std::env::temp_dir()
-            .join(format!("retracer_grpc_test_kind_schema_{}.toml", std::process::id()));
+        let path = std::env::temp_dir().join(format!(
+            "retracer_grpc_test_kind_schema_{}.toml",
+            std::process::id()
+        ));
         std::fs::write(
             &path,
             r#"

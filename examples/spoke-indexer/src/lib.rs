@@ -23,13 +23,28 @@ use storage::{ActionIndexable, Role};
 /// retyping it from memory.
 #[derive(Debug, Serialize, Deserialize)]
 pub enum MintPayload {
-    MintNft { collection: String, token_id: u64, recipient: String },
-    TransferNft { token_id: u64, to: String },
-    ListForSale { token_id: u64, price: u64 },
-    Delist { token_id: u64 },
+    MintNft {
+        collection: String,
+        token_id: u64,
+        recipient: String,
+    },
+    TransferNft {
+        token_id: u64,
+        to: String,
+    },
+    ListForSale {
+        token_id: u64,
+        price: u64,
+    },
+    Delist {
+        token_id: u64,
+    },
     /// One action, many recipients. This is the case `kind_schema.toml` cannot
     /// handle — see [`AirdropRecipients`].
-    Airdrop { collection: String, recipients: Vec<String> },
+    Airdrop {
+        collection: String,
+        recipients: Vec<String>,
+    },
 }
 
 /// MintChain addresses are `spoke1` followed by 32 hex characters.
@@ -85,10 +100,22 @@ mod tests {
     #[test]
     fn address_validator_accepts_only_well_formed_addresses() {
         assert!(is_mintchain_address(&format!("spoke1{}", "a".repeat(32))));
-        assert!(!is_mintchain_address(&format!("spoke1{}", "a".repeat(31))), "too short");
-        assert!(!is_mintchain_address(&format!("spoke1{}", "z".repeat(32))), "not hex");
-        assert!(!is_mintchain_address("arx1qyqszqgpqyqszqgp"), "another chain's format");
-        assert!(!is_mintchain_address("0xdeadbeef"), "a hash, not an address");
+        assert!(
+            !is_mintchain_address(&format!("spoke1{}", "a".repeat(31))),
+            "too short"
+        );
+        assert!(
+            !is_mintchain_address(&format!("spoke1{}", "z".repeat(32))),
+            "not hex"
+        );
+        assert!(
+            !is_mintchain_address("arx1qyqszqgpqyqszqgp"),
+            "another chain's format"
+        );
+        assert!(
+            !is_mintchain_address("0xdeadbeef"),
+            "a hash, not an address"
+        );
     }
 
     /// Worth testing in your own integration too: this runs on every action of

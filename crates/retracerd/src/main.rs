@@ -15,6 +15,15 @@ async fn main() -> Result<()> {
         .init();
 
     let args = retracer_core::parse_args()?;
+    let certificate_verifier = args.chain.node_rpc_url.clone().map(|url| {
+        retracer_core::corechain_wire::http_certificate_verifier(
+            url,
+            args.chain
+                .node_rpc_token
+                .as_ref()
+                .map(|token| token.expose().to_owned()),
+        )
+    });
 
     // Every CoreChain-specific choice the indexer makes is made here, and only
     // here — the library crates are generic over all of it:
@@ -35,10 +44,13 @@ async fn main() -> Result<()> {
         address_validator: Some(std::sync::Arc::new(ingestion::is_corechain_address)),
     };
 
-    retracer_core::run_with_decoder::<retracer_core::corechain_wire::CoreChainBlock>(
+    retracer_core::run_with_decoder_and_certificate_verifier::<
+        retracer_core::corechain_wire::CoreChainBlock,
+    >(
         args,
         hooks,
-        retracer_core::corechain_wire::tolerant_decoder(),
+        retracer_core::corechain_wire::validated_decoder(),
+        certificate_verifier,
     )
     .await
 }

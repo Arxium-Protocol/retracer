@@ -166,8 +166,8 @@ pub fn parse_args() -> Result<Args> {
     let mut grpc_port = DEFAULT_GRPC_PORT;
     let mut rest_port = Some(DEFAULT_REST_PORT);
     let mut kind_schema = DEFAULT_KIND_SCHEMA.to_string();
-    let mut blocks_topic = ingestion::DEFAULT_BLOCKS_TOPIC.to_string();
-    let mut sync_protocol = ingestion::default_sync_protocol(&chain_id);
+    let mut blocks_topic = None;
+    let mut sync_protocol = None;
     let mut max_pending_blocks = ingestion::DEFAULT_MAX_PENDING_BLOCKS;
     let mut write_pool_size = DEFAULT_WRITE_POOL_SIZE;
     let mut read_pool_size = DEFAULT_READ_POOL_SIZE;
@@ -243,10 +243,10 @@ pub fn parse_args() -> Result<Args> {
                 kind_schema = args.next().context("--kind-schema requires a value")?;
             }
             "--blocks-topic" => {
-                blocks_topic = args.next().context("--blocks-topic requires a value")?;
+                blocks_topic = Some(args.next().context("--blocks-topic requires a value")?);
             }
             "--sync-protocol" => {
-                sync_protocol = args.next().context("--sync-protocol requires a value")?;
+                sync_protocol = Some(args.next().context("--sync-protocol requires a value")?);
             }
             "--max-pending-blocks" => {
                 let value = args
@@ -298,6 +298,9 @@ pub fn parse_args() -> Result<Args> {
             other => anyhow::bail!("unknown flag: {other}"),
         }
     }
+    let blocks_topic = blocks_topic.unwrap_or_else(|| ingestion::default_blocks_topic(&chain_id));
+    let sync_protocol =
+        sync_protocol.unwrap_or_else(|| ingestion::default_sync_protocol(&chain_id));
     Ok(Args {
         database_url,
         grpc_port,
@@ -369,6 +372,20 @@ pub async fn run_with_decoder<B>(
 where
     B: ingestion::HasHeight + storage::IndexableBlock + Send + Sync + 'static,
 {
+    run_with_decoder_and_certificate_verifier(args, hooks, decoder, None).await
+}
+
+/// One-chain wrapper that lets a chain supply independently-verifiable
+/// certificate finality without changing the generic multi-chain API.
+pub async fn run_with_decoder_and_certificate_verifier<B>(
+    args: Args,
+    hooks: ChainHooks,
+    decoder: ingestion::WireDecoder<B>,
+    certificate_verifier: Option<ingestion::CertificateVerifier>,
+) -> Result<()>
+where
+    B: ingestion::HasHeight + storage::IndexableBlock + Send + Sync + 'static,
+{
     let mut runner = Runner::new(
         &args.database_url,
         args.write_pool_size,
@@ -381,7 +398,12 @@ where
     .with_rate_limit_rps(args.rate_limit_rps)
     .with_trusted_proxies(args.trusted_proxies);
     runner
-        .add_chain_with_decoder(args.chain, hooks, decoder)
+        .add_chain_with_decoder_and_certificate_verifier(
+            args.chain,
+            hooks,
+            decoder,
+            certificate_verifier,
+        )
         .await?;
     runner.run().await
 }
@@ -499,6 +521,20 @@ impl Runner {
     where
         B: ingestion::HasHeight + storage::IndexableBlock + Send + Sync + 'static,
     {
+        self.add_chain_with_decoder_and_certificate_verifier(config, hooks, decoder, None)
+            .await
+    }
+
+    pub async fn add_chain_with_decoder_and_certificate_verifier<B>(
+        &mut self,
+        config: ChainConfig,
+        hooks: ChainHooks,
+        decoder: ingestion::WireDecoder<B>,
+        certificate_verifier: Option<ingestion::CertificateVerifier>,
+    ) -> Result<()>
+    where
+        B: ingestion::HasHeight + storage::IndexableBlock + Send + Sync + 'static,
+    {
         anyhow::ensure!(
             !self.runtimes.iter().any(|r| r.chain_id == config.chain_id),
             "chain {:?} added twice; two pipelines writing one chain_id would \
@@ -575,13 +611,16 @@ impl Runner {
             sync_protocol: config.sync_protocol.clone(),
             max_pending_blocks: config.max_pending_blocks,
         };
-        self.tasks.push(tokio::spawn(ingestion::run_with_decoder(
-            ingestion_config,
-            block_tx,
-            rewind_rx,
-            network_tx,
-            decoder,
-        )));
+        self.tasks.push(tokio::spawn(
+            ingestion::run_with_decoder_and_certificate_verifier(
+                ingestion_config,
+                block_tx,
+                rewind_rx,
+                network_tx,
+                decoder,
+                certificate_verifier,
+            ),
+        ));
 
         self.tasks.push(tokio::spawn(index_chain(
             self.write_pool.clone(),

@@ -28,7 +28,10 @@ pub enum TipAction {
     /// unconditionally: un-indexing a certified block would contradict a
     /// cryptographic proof, so a peer claiming this is wrong or lying, and the
     /// right move is to stop rather than to believe it.
-    ForkBelowFinalized { would_rollback_to: i64, finalized_height: i64 },
+    ForkBelowFinalized {
+        would_rollback_to: i64,
+        finalized_height: i64,
+    },
     /// A fork that would unwind more than the configured finality depth.
     /// Refused rather than obeyed: past that depth a peer feeding us a bogus
     /// chain could otherwise walk us all the way back to genesis, and a
@@ -97,7 +100,10 @@ pub fn classify(
     }
 
     if depth > finality_depth {
-        TipAction::ForkTooDeep { would_rollback_to: rollback_to, depth }
+        TipAction::ForkTooDeep {
+            would_rollback_to: rollback_to,
+            depth,
+        }
     } else {
         TipAction::Fork { rollback_to }
     }
@@ -108,26 +114,41 @@ mod tests {
     use super::*;
 
     fn tip(height: i64, hash: &str) -> Tip {
-        Tip { height, hash: hash.to_string() }
+        Tip {
+            height,
+            hash: hash.to_string(),
+        }
     }
 
     #[test]
     fn first_block_always_extends() {
         assert_eq!(classify(None, 0, "", None, 100, None), TipAction::Extend);
-        assert_eq!(classify(None, 9_000, "whatever", None, 100, None), TipAction::Extend);
+        assert_eq!(
+            classify(None, 9_000, "whatever", None, 100, None),
+            TipAction::Extend
+        );
     }
 
     #[test]
     fn matching_parent_extends() {
         let t = tip(5, "0xaaa");
-        assert_eq!(classify(Some(&t), 6, "0xaaa", None, 100, None), TipAction::Extend);
+        assert_eq!(
+            classify(Some(&t), 6, "0xaaa", None, 100, None),
+            TipAction::Extend
+        );
     }
 
     #[test]
     fn already_indexed_height_is_stale() {
         let t = tip(5, "0xaaa");
-        assert_eq!(classify(Some(&t), 5, "0xaaa", None, 100, None), TipAction::Stale);
-        assert_eq!(classify(Some(&t), 2, "0xzzz", None, 100, None), TipAction::Stale);
+        assert_eq!(
+            classify(Some(&t), 5, "0xaaa", None, 100, None),
+            TipAction::Stale
+        );
+        assert_eq!(
+            classify(Some(&t), 2, "0xzzz", None, 100, None),
+            TipAction::Stale
+        );
     }
 
     /// The distinction that matters most: a block from the future is a gap, and
@@ -137,8 +158,14 @@ mod tests {
     #[test]
     fn non_contiguous_height_is_a_gap_not_a_fork() {
         let t = tip(5, "0xaaa");
-        assert_eq!(classify(Some(&t), 7, "0xbbb", None, 100, None), TipAction::Gap);
-        assert_eq!(classify(Some(&t), 500, "0xbbb", None, 100, None), TipAction::Gap);
+        assert_eq!(
+            classify(Some(&t), 7, "0xbbb", None, 100, None),
+            TipAction::Gap
+        );
+        assert_eq!(
+            classify(Some(&t), 500, "0xbbb", None, 100, None),
+            TipAction::Gap
+        );
     }
 
     #[test]
@@ -166,7 +193,10 @@ mod tests {
         let t = tip(17, "0xaaa");
         assert_eq!(
             classify(Some(&t), 18, "0xdifferent", Some(20), 3, None),
-            TipAction::ForkTooDeep { would_rollback_to: 16, depth: 4 },
+            TipAction::ForkTooDeep {
+                would_rollback_to: 16,
+                depth: 4
+            },
             "20 -> 16 is a depth of 4, past the limit"
         );
     }
@@ -180,7 +210,10 @@ mod tests {
         let t = tip(100, "0xaaa");
         assert_eq!(
             classify(Some(&t), 101, "0xdifferent", None, 250, Some(100)),
-            TipAction::ForkBelowFinalized { would_rollback_to: 99, finalized_height: 100 }
+            TipAction::ForkBelowFinalized {
+                would_rollback_to: 99,
+                finalized_height: 100
+            }
         );
     }
 
@@ -202,7 +235,10 @@ mod tests {
         let t = tip(100, "0xaaa");
         assert_eq!(
             classify(Some(&t), 101, "0xdifferent", None, 0, None),
-            TipAction::ForkTooDeep { would_rollback_to: 99, depth: 1 }
+            TipAction::ForkTooDeep {
+                would_rollback_to: 99,
+                depth: 1
+            }
         );
     }
 
@@ -211,7 +247,10 @@ mod tests {
         let t = tip(1_000, "0xaaa");
         assert_eq!(
             classify(Some(&t), 1_001, "0xdifferent", None, 0, None),
-            TipAction::ForkTooDeep { would_rollback_to: 999, depth: 1 }
+            TipAction::ForkTooDeep {
+                would_rollback_to: 999,
+                depth: 1
+            }
         );
     }
 

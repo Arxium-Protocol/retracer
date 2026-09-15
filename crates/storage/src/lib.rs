@@ -597,7 +597,9 @@ impl BlockWrites {
             }
 
             w.action_hash.push(action_hash);
-            w.index_in_block.push(index as i32);
+            w.index_in_block.push(i32::try_from(index).map_err(|_| {
+                anyhow::anyhow!("block {height} has more actions than PostgreSQL INT can index")
+            })?);
             w.kind.push(kind);
             w.from_address.push(action.sender());
             w.payload.push(payload);

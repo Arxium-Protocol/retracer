@@ -51,7 +51,7 @@ async fn main() -> Result<()> {
                 display_name: Some("Arxium CoreChain".into()),
                 bootnodes: vec![],
                 port: 0,
-                blocks_topic: ingestion::DEFAULT_BLOCKS_TOPIC.into(),
+                blocks_topic: ingestion::default_blocks_topic("corechain-devnet"),
                 sync_protocol: ingestion::default_sync_protocol("corechain-devnet"),
                 max_pending_blocks: ingestion::DEFAULT_MAX_PENDING_BLOCKS,
                 // CoreChain is single-proposer with no forks, so nothing to

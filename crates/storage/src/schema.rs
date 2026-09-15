@@ -162,7 +162,13 @@ impl Projection {
 
         let sanitize = |s: &str| -> String {
             s.chars()
-                .map(|c| if c.is_ascii_alphanumeric() { c.to_ascii_lowercase() } else { '_' })
+                .map(|c| {
+                    if c.is_ascii_alphanumeric() {
+                        c.to_ascii_lowercase()
+                    } else {
+                        '_'
+                    }
+                })
                 .take(18)
                 .collect()
         };
@@ -182,7 +188,9 @@ impl Projection {
 fn is_safe_segment(segment: &str) -> bool {
     !segment.is_empty()
         && segment.len() <= 63
-        && segment.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+        && segment
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
 /// One resolved `(json path, role)` rule for a given action `kind`.
@@ -203,7 +211,10 @@ pub struct KindSchema {
 
 impl KindSchema {
     pub fn empty() -> KindSchema {
-        KindSchema { kinds: HashMap::new(), projections: Vec::new() }
+        KindSchema {
+            kinds: HashMap::new(),
+            projections: Vec::new(),
+        }
     }
 
     /// Parses and validates `path` (TOML). Fails loud — an unknown role
@@ -222,7 +233,12 @@ impl KindSchema {
             let roles = kind
                 .roles
                 .into_iter()
-                .map(|r| Ok(FieldRole { path: r.path, role: Role::parse(&r.role)? }))
+                .map(|r| {
+                    Ok(FieldRole {
+                        path: r.path,
+                        role: Role::parse(&r.role)?,
+                    })
+                })
                 .collect::<Result<Vec<_>>>()
                 .with_context(|| format!("kind {:?}", kind.name))?;
 
@@ -244,7 +260,11 @@ impl KindSchema {
                         raw_index.path
                     );
                 }
-                projections.push(Projection { kind: kind.name.clone(), segments, ty });
+                projections.push(Projection {
+                    kind: kind.name.clone(),
+                    segments,
+                    ty,
+                });
             }
 
             kinds.insert(kind.name, roles);
@@ -261,13 +281,21 @@ impl KindSchema {
     /// loaded config. Paths that don't resolve to a JSON string (missing
     /// field, wrong shape) are skipped rather than treated as an error —
     /// payloads are still stored in full regardless (plan §2).
-    pub fn resolve<'a>(&'a self, kind: &str, payload: &serde_json::Value) -> Vec<(String, &'a Role)> {
+    pub fn resolve<'a>(
+        &'a self,
+        kind: &str,
+        payload: &serde_json::Value,
+    ) -> Vec<(String, &'a Role)> {
         let Some(roles) = self.kinds.get(kind) else {
             return Vec::new();
         };
         roles
             .iter()
-            .filter_map(|field| resolve_path(payload, &field.path).and_then(|v| v.as_str()).map(|addr| (addr.to_string(), &field.role)))
+            .filter_map(|field| {
+                resolve_path(payload, &field.path)
+                    .and_then(|v| v.as_str())
+                    .map(|addr| (addr.to_string(), &field.role))
+            })
             .collect()
     }
 }
@@ -310,18 +338,28 @@ impl AddressExtractor {
                 panic!("two Tier B ActionIndexable impls both claim kind {kind:?}");
             }
         }
-        AddressExtractor { tier_a, tier_b: by_kind }
+        AddressExtractor {
+            tier_a,
+            tier_b: by_kind,
+        }
     }
 
     pub fn tier_a_only(tier_a: KindSchema) -> AddressExtractor {
-        AddressExtractor { tier_a, tier_b: HashMap::new() }
+        AddressExtractor {
+            tier_a,
+            tier_b: HashMap::new(),
+        }
     }
 
     pub fn resolve(&self, kind: &str, payload: &serde_json::Value) -> Vec<(String, Role)> {
         if let Some(extractor) = self.tier_b.get(kind) {
             return extractor.resolve(payload);
         }
-        self.tier_a.resolve(kind, payload).into_iter().map(|(addr, role)| (addr, role.clone())).collect()
+        self.tier_a
+            .resolve(kind, payload)
+            .into_iter()
+            .map(|(addr, role)| (addr, role.clone()))
+            .collect()
     }
 }
 
@@ -330,7 +368,8 @@ impl AddressExtractor {
 /// that); no array-index support since no known payload needs it (plan §8).
 fn resolve_path<'a>(value: &'a serde_json::Value, path: &str) -> Option<&'a serde_json::Value> {
     let rest = path.strip_prefix("$.")?;
-    rest.split('.').try_fold(value, |v, segment| v.as_object()?.get(segment))
+    rest.split('.')
+        .try_fold(value, |v, segment| v.as_object()?.get(segment))
 }
 
 #[cfg(test)]
@@ -404,7 +443,13 @@ mod tests {
     /// this is the injection boundary for `kind_schema.toml`.
     #[test]
     fn unsafe_projection_paths_are_refused() {
-        for path in ["a'); DROP TABLE actions; --", "amount)::text, (1", "with space", "", "a.'b"] {
+        for path in [
+            "a'); DROP TABLE actions; --",
+            "amount)::text, (1",
+            "with space",
+            "",
+            "a.'b",
+        ] {
             let toml = format!(
                 r#"
                 [[kind]]
@@ -431,7 +476,10 @@ mod tests {
         assert_eq!(a.index_name(), a.clone().index_name());
 
         // Differing only by cast still has to produce a distinct index.
-        let b = Projection { ty: ProjectionType::Text, ..a.clone() };
+        let b = Projection {
+            ty: ProjectionType::Text,
+            ..a.clone()
+        };
         assert_ne!(a.index_name(), b.index_name());
 
         let long = Projection {
@@ -440,7 +488,10 @@ mod tests {
             ty: ProjectionType::Text,
         };
         let name = long.index_name();
-        assert!(name.len() <= 63, "Postgres truncates identifiers past 63 bytes: {name}");
+        assert!(
+            name.len() <= 63,
+            "Postgres truncates identifiers past 63 bytes: {name}"
+        );
         assert!(
             name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'),
             "index name must be a bare identifier: {name}"
@@ -471,7 +522,10 @@ mod tests {
         .unwrap();
 
         let transfer_payload = serde_json::json!({"to": "addr1", "amount": 5});
-        assert_eq!(schema.resolve("Transfer", &transfer_payload), vec![("addr1".to_string(), &Role::To)]);
+        assert_eq!(
+            schema.resolve("Transfer", &transfer_payload),
+            vec![("addr1".to_string(), &Role::To)]
+        );
 
         let leave_payload = serde_json::Value::Null;
         assert!(schema.resolve("LeaveValidator", &leave_payload).is_empty());
@@ -489,7 +543,10 @@ mod tests {
             .iter()
             .filter(|p| p.segments == ["asset"])
             .count();
-        assert!(asset_projections >= 12, "every asset-naming kind indexes $.asset, got {asset_projections}");
+        assert!(
+            asset_projections >= 12,
+            "every asset-naming kind indexes $.asset, got {asset_projections}"
+        );
     }
 
     #[test]
@@ -505,7 +562,9 @@ mod tests {
             "#,
         )
         .unwrap_err();
-        assert!(err.to_string().contains("unknown role") || format!("{err:#}").contains("unknown role"));
+        assert!(
+            err.to_string().contains("unknown role") || format!("{err:#}").contains("unknown role")
+        );
     }
 
     #[test]
@@ -523,7 +582,13 @@ mod tests {
         .unwrap();
         let payload = serde_json::json!({"counterparty": "addrX"});
         let resolved = schema.resolve("Custom", &payload);
-        assert_eq!(resolved, vec![("addrX".to_string(), &Role::Other("counterparty".to_string()))]);
+        assert_eq!(
+            resolved,
+            vec![(
+                "addrX".to_string(),
+                &Role::Other("counterparty".to_string())
+            )]
+        );
     }
 
     struct FixedExtractor;
@@ -532,7 +597,10 @@ mod tests {
             "Transfer"
         }
         fn resolve(&self, _payload: &serde_json::Value) -> Vec<(String, Role)> {
-            vec![("computed-addr".to_string(), Role::Other("computed".to_string()))]
+            vec![(
+                "computed-addr".to_string(),
+                Role::Other("computed".to_string()),
+            )]
         }
     }
 
@@ -554,7 +622,10 @@ mod tests {
         let payload = serde_json::json!({"to": "addr1"});
         assert_eq!(
             extractor.resolve("Transfer", &payload),
-            vec![("computed-addr".to_string(), Role::Other("computed".to_string()))]
+            vec![(
+                "computed-addr".to_string(),
+                Role::Other("computed".to_string())
+            )]
         );
     }
 
@@ -580,6 +651,9 @@ mod tests {
     #[test]
     #[should_panic(expected = "both claim kind")]
     fn duplicate_tier_b_kind_claim_panics() {
-        AddressExtractor::new(KindSchema::empty(), vec![Box::new(FixedExtractor), Box::new(FixedExtractor)]);
+        AddressExtractor::new(
+            KindSchema::empty(),
+            vec![Box::new(FixedExtractor), Box::new(FixedExtractor)],
+        );
     }
 }

@@ -23,6 +23,11 @@ sha2 = { workspace = true }
 hex = { workspace = true }
 xc-primitives = { workspace = true }
 xc-wire = { workspace = true }
+xc-poe = { workspace = true }
+xc-bls = { workspace = true }
+xc-storage = { workspace = true }
+arxd-finality = { workspace = true }
+reqwest = { workspace = true }
 subtle = { workspace = true }
 
 [dev-dependencies]

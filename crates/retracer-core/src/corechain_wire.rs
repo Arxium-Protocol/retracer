@@ -1,9 +1,11 @@
-use anyhow::{Result, anyhow};
-use ingestion::{ActionPayload, HasHeight, WireDecoder};
+use anyhow::{Context, Result, anyhow};
+use ingestion::{ActionPayload, CertificateVerifier, HasHeight, WireDecoder};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use sha2::{Digest, Sha256};
+use std::collections::{BTreeMap, HashSet};
+use std::sync::Arc;
 use storage::{IndexableAction, IndexableBlock};
-use xc_primitives::{Action, Address, Block, RawAction, RawBlock};
+use xc_primitives::{Action, Address, Block, RawAction, RawBlock, VotingPower, quorum_reached};
 use xc_wire::SyncResponse;
 
 /// CoreChain block normalized for indexing while retaining the hash from its
@@ -94,6 +96,115 @@ pub fn tolerant_decoder() -> WireDecoder<CoreChainBlock> {
     WireDecoder::new(decode_block_tolerant, decode_sync_response_tolerant)
 }
 
+/// Strict CoreChain ingestion decoder. It rejects a block before storage unless
+/// its signed header is intact, every known action signature verifies, and the
+/// action list reproduces the signed transaction root. Full nonce, state-root,
+/// and execution validation remains node-only because it requires pre-state.
+pub fn validated_decoder() -> WireDecoder<CoreChainBlock> {
+    WireDecoder::new(decode_block_validated, decode_sync_response_validated)
+}
+
+/// Verifies wire-v3 certificates using only public, height-scoped node RPC
+/// data. The genesis root is fetched once per certificate and is part of the
+/// signed message, preventing a certificate from another chain being accepted.
+pub fn http_certificate_verifier(
+    node_rpc_url: String,
+    node_rpc_token: Option<String>,
+) -> CertificateVerifier {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .expect("a reqwest client with a fixed timeout must build");
+    Arc::new(move |requested_height, bytes| {
+        let client = client.clone();
+        let base = node_rpc_url.trim_end_matches('/').to_owned();
+        let token = node_rpc_token.clone();
+        Box::pin(async move {
+            let record: xc_storage::FinalityRecord =
+                decode_exact(&bytes).context("invalid finality certificate encoding")?;
+            anyhow::ensure!(
+                record.height == requested_height,
+                "certificate height does not match request"
+            );
+            anyhow::ensure!(!record.signers.is_empty(), "certificate has no signers");
+            let unique: HashSet<_> = record.signers.iter().collect();
+            anyhow::ensure!(
+                unique.len() == record.signers.len(),
+                "certificate repeats a signer"
+            );
+
+            let get_json = |url: String| {
+                let client = client.clone();
+                let token = token.clone();
+                async move {
+                    let mut request = client.get(url);
+                    if let Some(token) = token {
+                        request = request.bearer_auth(token);
+                    }
+                    request
+                        .send()
+                        .await?
+                        .error_for_status()?
+                        .json::<serde_json::Value>()
+                        .await
+                }
+            };
+            let genesis: String = get_json(format!("{base}/genesis-hash"))
+                .await?
+                .get("genesis_hash")
+                .and_then(serde_json::Value::as_str)
+                .context("node RPC genesis-hash response is malformed")?
+                .to_owned();
+            let genesis = genesis.strip_prefix("0x").unwrap_or(&genesis);
+            let genesis: [u8; 32] = hex::decode(genesis)
+                .context("node RPC returned an invalid genesis hash")?
+                .try_into()
+                .map_err(|_| anyhow!("node RPC genesis hash must be 32 bytes"))?;
+            let powers: BTreeMap<String, u32> = serde_json::from_value(
+                get_json(format!("{base}/validators/power?height={requested_height}")).await?,
+            )?;
+            let validators: BTreeMap<Address, VotingPower> = powers
+                .into_iter()
+                .map(|(address, power)| Ok((Address::parse(&address)?, VotingPower(power))))
+                .collect::<Result<_>>()?;
+            anyhow::ensure!(
+                record
+                    .signers
+                    .iter()
+                    .all(|signer| validators.contains_key(signer)),
+                "certificate signer is not a validator at its height"
+            );
+            anyhow::ensure!(
+                quorum_reached(&validators, record.signers.iter()),
+                "certificate lacks quorum"
+            );
+
+            let mut public_keys = Vec::with_capacity(record.signers.len());
+            for signer in &record.signers {
+                let response = get_json(format!(
+                    "{base}/accounts/{signer}/bls-key?height={requested_height}"
+                ))
+                .await?;
+                let key = response
+                    .get("pubkey")
+                    .context("node RPC BLS-key response is malformed")?;
+                public_keys.push(
+                    serde_json::from_value(key.clone())
+                        .context("node RPC returned an invalid BLS key")?,
+                );
+            }
+            let message = arxd_finality::precommit_signing_bytes(
+                &genesis,
+                record.height,
+                &record.block_hash,
+                &record.ep,
+            );
+            xc_bls::verify_aggregate(&message, &public_keys, &record.aggregate_signature)
+                .map_err(|err| anyhow!("invalid aggregate certificate signature: {err}"))
+        })
+    })
+}
+
 fn decode_exact<T: DeserializeOwned>(bytes: &[u8]) -> Result<T> {
     let (value, consumed) = bincode::serde::decode_from_slice(bytes, xc_primitives::wire_config())?;
     anyhow::ensure!(
@@ -116,6 +227,12 @@ fn decode_block(bytes: &[u8]) -> Result<CoreChainBlock> {
     }
 }
 
+fn decode_block_validated(bytes: &[u8]) -> Result<CoreChainBlock> {
+    let block: Block<ActionPayload> = decode_exact(bytes)?;
+    validate_block(&block)?;
+    normalize_current_block(block)
+}
+
 fn decode_sync_response(bytes: &[u8]) -> Result<SyncResponse<CoreChainBlock>> {
     let current = decode_exact::<SyncResponse<Block<ActionPayload>>>(bytes);
     let legacy = decode_exact::<SyncResponse<LegacyBlock>>(bytes);
@@ -133,6 +250,61 @@ fn decode_sync_response(bytes: &[u8]) -> Result<SyncResponse<CoreChainBlock>> {
             "unsupported CoreChain sync wire: current decode failed ({current_err}); legacy decode failed ({legacy_err})"
         )),
     }
+}
+
+fn decode_sync_response_validated(bytes: &[u8]) -> Result<SyncResponse<CoreChainBlock>> {
+    let response: SyncResponse<Block<ActionPayload>> = decode_exact(bytes)?;
+    Ok(match response {
+        SyncResponse::Blocks(blocks) => SyncResponse::Blocks(
+            blocks
+                .into_iter()
+                .map(|block| {
+                    validate_block(&block)?;
+                    normalize_current_block(block)
+                })
+                .collect::<Result<_>>()?,
+        ),
+        SyncResponse::Status { tip_height } => SyncResponse::Status { tip_height },
+        SyncResponse::NodeInfo(info) => SyncResponse::NodeInfo(info),
+        SyncResponse::Hashes(hashes) => SyncResponse::Hashes(hashes),
+        SyncResponse::Certificate { height, record } => {
+            SyncResponse::Certificate { height, record }
+        }
+    })
+}
+
+fn validate_block(block: &Block<ActionPayload>) -> Result<()> {
+    // Genesis has no proposer signature or user actions. Every later block
+    // must prove both its header and each action's author.
+    if block.height > 0 {
+        block.verify_proposer_signature().map_err(|err| {
+            anyhow!(
+                "invalid proposer signature at height {}: {err}",
+                block.height
+            )
+        })?;
+        for (index, action) in block.actions.iter().enumerate() {
+            action.verify_signature().map_err(|err| {
+                anyhow!(
+                    "invalid action signature at height {} index {index}: {err}",
+                    block.height
+                )
+            })?;
+        }
+    }
+
+    let expected_tx_root = xc_poe::tx_root(&block.actions).map_err(|err| {
+        anyhow!(
+            "failed to calculate tx_root at height {}: {err}",
+            block.height
+        )
+    })?;
+    anyhow::ensure!(
+        block.tx_root == expected_tx_root,
+        "tx_root mismatch at height {}",
+        block.height
+    );
+    Ok(())
 }
 
 fn decode_block_tolerant(bytes: &[u8]) -> Result<CoreChainBlock> {
@@ -175,11 +347,17 @@ fn normalize_current_response_tolerant(
 ) -> SyncResponse<CoreChainBlock> {
     match response {
         SyncResponse::Status { tip_height } => SyncResponse::Status { tip_height },
-        SyncResponse::Blocks(blocks) => {
-            SyncResponse::Blocks(blocks.into_iter().map(normalize_current_block_tolerant).collect())
-        }
+        SyncResponse::Blocks(blocks) => SyncResponse::Blocks(
+            blocks
+                .into_iter()
+                .map(normalize_current_block_tolerant)
+                .collect(),
+        ),
         SyncResponse::NodeInfo(info) => SyncResponse::NodeInfo(info),
         SyncResponse::Hashes(hashes) => SyncResponse::Hashes(hashes),
+        SyncResponse::Certificate { height, record } => {
+            SyncResponse::Certificate { height, record }
+        }
     }
 }
 
@@ -213,8 +391,10 @@ fn normalize_current_block_tolerant(raw: RawBlock) -> CoreChainBlock {
 /// explorer that silently shrank a block's action list would misreport what
 /// actually happened on-chain.
 fn normalize_raw_action_tolerant(ra: RawAction) -> CoreChainAction {
-    let decoded =
-        bincode::serde::decode_from_slice::<ActionPayload, _>(&ra.payload, xc_primitives::wire_config());
+    let decoded = bincode::serde::decode_from_slice::<ActionPayload, _>(
+        &ra.payload,
+        xc_primitives::wire_config(),
+    );
     match decoded {
         Ok((payload, consumed)) if consumed == ra.payload.len() => CoreChainAction {
             sender: ra.sender.to_string(),
@@ -271,6 +451,9 @@ fn normalize_current_response(
         ),
         SyncResponse::NodeInfo(info) => SyncResponse::NodeInfo(info),
         SyncResponse::Hashes(hashes) => SyncResponse::Hashes(hashes),
+        SyncResponse::Certificate { height, record } => {
+            SyncResponse::Certificate { height, record }
+        }
     })
 }
 
@@ -287,6 +470,9 @@ fn normalize_legacy_response(
         ),
         SyncResponse::NodeInfo(info) => SyncResponse::NodeInfo(info),
         SyncResponse::Hashes(hashes) => SyncResponse::Hashes(hashes),
+        SyncResponse::Certificate { height, record } => {
+            SyncResponse::Certificate { height, record }
+        }
     })
 }
 
@@ -431,16 +617,14 @@ mod tests {
     // Captured v0.2.0 standard-bincode block. It includes the fields added
     // after the released v0.1.3 wire shape.
     const CURRENT_FIXTURE: &[u8] = &[
-        0x2a, 0x08, 0x30, 0x78, 0x70, 0x61, 0x72, 0x65, 0x6e, 0x74, 0x00, 0x00,
-        0x07, 0x07, 0x07, 0x07, 0x07, 0x07, 0x07, 0x07, 0x07, 0x07, 0x07, 0x07,
-        0x07, 0x07, 0x07, 0x07, 0x07, 0x07, 0x07, 0x07, 0x07, 0x07, 0x07, 0x07,
-        0x07, 0x07, 0x07, 0x07, 0x07, 0x07, 0x07, 0x07, 0x00, 0x00, 0x3d, 0x30,
-        0x78, 0x66, 0x69, 0x78, 0x74, 0x75, 0x72, 0x65, 0x2d, 0x73, 0x74, 0x61,
-        0x74, 0x65, 0x2d, 0x72, 0x6f, 0x6f, 0x74, 0x2d, 0x62, 0x38, 0x31, 0x31,
-        0x62, 0x62, 0x64, 0x31, 0x39, 0x64, 0x38, 0x35, 0x38, 0x36, 0x61, 0x32,
-        0x36, 0x30, 0x33, 0x38, 0x33, 0x33, 0x66, 0x39, 0x38, 0x39, 0x63, 0x65,
-        0x61, 0x33, 0x38, 0x38, 0x32, 0x36, 0x38, 0x34, 0x63, 0x39, 0x34, 0x66,
-        0x00, 0x00,
+        0x2a, 0x08, 0x30, 0x78, 0x70, 0x61, 0x72, 0x65, 0x6e, 0x74, 0x00, 0x00, 0x07, 0x07, 0x07,
+        0x07, 0x07, 0x07, 0x07, 0x07, 0x07, 0x07, 0x07, 0x07, 0x07, 0x07, 0x07, 0x07, 0x07, 0x07,
+        0x07, 0x07, 0x07, 0x07, 0x07, 0x07, 0x07, 0x07, 0x07, 0x07, 0x07, 0x07, 0x07, 0x07, 0x00,
+        0x00, 0x3d, 0x30, 0x78, 0x66, 0x69, 0x78, 0x74, 0x75, 0x72, 0x65, 0x2d, 0x73, 0x74, 0x61,
+        0x74, 0x65, 0x2d, 0x72, 0x6f, 0x6f, 0x74, 0x2d, 0x62, 0x38, 0x31, 0x31, 0x62, 0x62, 0x64,
+        0x31, 0x39, 0x64, 0x38, 0x35, 0x38, 0x36, 0x61, 0x32, 0x36, 0x30, 0x33, 0x38, 0x33, 0x33,
+        0x66, 0x39, 0x38, 0x39, 0x63, 0x65, 0x61, 0x33, 0x38, 0x38, 0x32, 0x36, 0x38, 0x34, 0x63,
+        0x39, 0x34, 0x66, 0x00, 0x00,
     ];
 
     #[test]
@@ -484,6 +668,14 @@ mod tests {
     #[test]
     fn current_decoder_alone_rejects_the_legacy_fixture() {
         assert!(decode_exact::<Block<ActionPayload>>(LEGACY_FIXTURE).is_err());
+    }
+
+    #[test]
+    fn validated_decoder_rejects_unsigned_and_legacy_blocks() {
+        // The captured current fixture is structurally valid, but intentionally
+        // has no proposer signature. It must never enter the indexer path.
+        assert!(validated_decoder().decode_block(CURRENT_FIXTURE).is_err());
+        assert!(validated_decoder().decode_block(LEGACY_FIXTURE).is_err());
     }
 
     #[test]
@@ -554,7 +746,10 @@ mod tests {
         assert_eq!(legacy.actions.len(), 2);
     }
 
-    fn raw_block_with_one_action(action: RawAction, expected_action_count: usize) -> (RawBlock, usize) {
+    fn raw_block_with_one_action(
+        action: RawAction,
+        expected_action_count: usize,
+    ) -> (RawBlock, usize) {
         let sender = action.sender.clone();
         let block = RawBlock {
             height: 5,
@@ -593,7 +788,8 @@ mod tests {
             1,
         );
         let expected_hash = raw_block.hash();
-        let bytes = bincode::serde::encode_to_vec(&raw_block, xc_primitives::wire_config()).unwrap();
+        let bytes =
+            bincode::serde::encode_to_vec(&raw_block, xc_primitives::wire_config()).unwrap();
 
         let decoded = tolerant_decoder()
             .decode_block(&bytes)
@@ -645,7 +841,8 @@ mod tests {
             1,
         );
         let expected_hash = raw_block.hash();
-        let bytes = bincode::serde::encode_to_vec(&raw_block, xc_primitives::wire_config()).unwrap();
+        let bytes =
+            bincode::serde::encode_to_vec(&raw_block, xc_primitives::wire_config()).unwrap();
 
         let decoded = tolerant_decoder().decode_block(&bytes).unwrap();
         assert_eq!(decoded.hash, expected_hash);

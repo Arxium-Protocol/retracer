@@ -12,3 +12,4 @@ bincode = { workspace = true }
 xc-primitives = { workspace = true }
 xc-wire = { workspace = true }
 libp2p = { workspace = true }
+futures = "0.3"

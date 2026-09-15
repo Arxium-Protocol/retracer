@@ -36,7 +36,7 @@ impl NodeRpcToken {
         Ok(Self(token))
     }
 
-    fn expose(&self) -> &str {
+    pub fn expose(&self) -> &str {
         &self.0
     }
 }
