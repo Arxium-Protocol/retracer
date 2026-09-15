@@ -525,3 +525,35 @@ async fn count_proposers_in_range_only_counts_heights_inside_the_bound() {
     assert_eq!(narrowed.get(&addr(1).to_string()), Some(&1));
     assert_eq!(narrowed.get(&addr(2).to_string()), Some(&1));
 }
+
+#[tokio::test]
+async fn insert_block_persists_round() {
+    let pool = skip_without_db!();
+    let chain = chain_id("block-round");
+    let extractor = AddressExtractor::tier_a_only(KindSchema::empty());
+
+    let block = Block::<TestPayload> {
+        height: 0,
+        parent_hash: "0x0".to_string(),
+        timestamp: 1_700_000_000,
+        actions: vec![],
+        tx_root: [0; 32],
+        proposer: Some(addr(1)),
+        signature: None,
+        state_root: String::new(),
+        round: 2,
+        round_certificate: None,
+    };
+    storage::insert_block(&pool, &chain, &block, &extractor)
+        .await
+        .expect("insert block with round 2");
+
+    let (round,): (i64,) =
+        sqlx::query_as("SELECT round FROM blocks WHERE chain_id = $1 AND height = $2")
+            .bind(&chain)
+            .bind(0i64)
+            .fetch_one(&pool)
+            .await
+            .expect("select round");
+    assert_eq!(round, 2);
+}

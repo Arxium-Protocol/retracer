@@ -33,6 +33,12 @@ pub trait IndexableBlock {
     /// inventing a validator called "unknown".
     fn proposer(&self) -> Option<String>;
     fn actions(&self) -> &[Self::Action];
+
+    /// Consensus round the block was produced in; `0` for chains without
+    /// rounds. See `migrations/0002_block_round.sql`.
+    fn round(&self) -> u32 {
+        0
+    }
 }
 
 pub trait IndexableAction {
@@ -91,6 +97,9 @@ mod xc_impls {
         }
         fn actions(&self) -> &[Self::Action] {
             &self.actions
+        }
+        fn round(&self) -> u32 {
+            self.round
         }
     }
 

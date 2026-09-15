@@ -676,8 +676,8 @@ async fn insert_block_in_tx<B: IndexableBlock>(
     let hash = block.hash();
 
     let result = sqlx::query(
-        "INSERT INTO blocks (chain_id, height, hash, parent_hash, timestamp, proposer)
-         VALUES ($1, $2, $3, $4, $5, $6)
+        "INSERT INTO blocks (chain_id, height, hash, parent_hash, timestamp, proposer, round)
+         VALUES ($1, $2, $3, $4, $5, $6, $7)
          ON CONFLICT (chain_id, height) DO NOTHING",
     )
     .bind(chain_id)
@@ -688,6 +688,7 @@ async fn insert_block_in_tx<B: IndexableBlock>(
     // None for genesis, which is unsigned, and for a block from a
     // non-validator solo node. Both are real absences rather than gaps.
     .bind(block.proposer())
+    .bind(i64::from(block.round()))
     .execute(&mut **tx)
     .await?;
 
