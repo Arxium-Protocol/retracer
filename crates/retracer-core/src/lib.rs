@@ -90,6 +90,8 @@ const DEFAULT_DATABASE_URL: &str = "postgres://retracer:retracer@localhost:5433/
 const DEFAULT_CHAIN_ID: &str = "corechain-devnet";
 const DEFAULT_GRPC_PORT: u16 = 50051;
 const DEFAULT_REST_PORT: u16 = 8080;
+/// Loopback-only until an operator opts in — see `--grpc-bind`/`--rest-bind`.
+const DEFAULT_BIND: IpAddr = IpAddr::V4(Ipv4Addr::LOCALHOST);
 const DEFAULT_KIND_SCHEMA: &str = "kind_schema.toml";
 const DEFAULT_WRITE_POOL_SIZE: u32 = 4;
 const DEFAULT_READ_POOL_SIZE: u32 = 16;
@@ -139,6 +141,13 @@ pub struct Args {
     /// HTTP/JSON surface. `None` disables it — gRPC alone is enough between
     /// services we own on both ends; REST exists for external builders.
     pub rest_port: Option<u16>,
+    /// Interface the gRPC surface listens on. Defaults to loopback; set to
+    /// `0.0.0.0` (or a specific interface) only behind a firewall, a private
+    /// network, or `--auth-token` — gRPC is plaintext.
+    pub grpc_bind: IpAddr,
+    /// Interface the REST surface listens on. Same default and caveats as
+    /// `grpc_bind`.
+    pub rest_bind: IpAddr,
     pub write_pool_size: u32,
     pub read_pool_size: u32,
     pub chain: ChainConfig,
@@ -153,6 +162,15 @@ pub struct Args {
     /// attributing rate-limit buckets. `None` (the default) means the socket
     /// peer is always the client.
     pub trusted_proxies: Option<auth::TrustedProxies>,
+}
+
+/// Parses a listen address, naming `source` (a flag or env var) in the error
+/// so a typo like `--grpc-bind localhost` fails with a message pointing at
+/// the right flag instead of a bare "invalid IP address" from the stdlib.
+fn parse_bind(raw: &str, source: &str) -> Result<IpAddr> {
+    raw.parse().with_context(|| {
+        format!("{source} must be an IP address such as 127.0.0.1, 0.0.0.0 or ::1")
+    })
 }
 
 /// Parses a per-second rate limit, rejecting values the guard cannot honour.
@@ -206,6 +224,14 @@ pub fn parse_args() -> Result<Args> {
     let mut chain_id = DEFAULT_CHAIN_ID.to_string();
     let mut grpc_port = DEFAULT_GRPC_PORT;
     let mut rest_port = Some(DEFAULT_REST_PORT);
+    let mut grpc_bind = match std::env::var("RETRACER_GRPC_BIND") {
+        Ok(value) if !value.is_empty() => parse_bind(&value, "RETRACER_GRPC_BIND")?,
+        _ => DEFAULT_BIND,
+    };
+    let mut rest_bind = match std::env::var("RETRACER_REST_BIND") {
+        Ok(value) if !value.is_empty() => parse_bind(&value, "RETRACER_REST_BIND")?,
+        _ => DEFAULT_BIND,
+    };
     let mut kind_schema = DEFAULT_KIND_SCHEMA.to_string();
     let mut blocks_topic = None;
     let mut sync_protocol = None;
@@ -280,6 +306,14 @@ pub fn parse_args() -> Result<Args> {
                 let value = args.next().context("--grpc-port requires a value")?;
                 grpc_port = value.parse().context("--grpc-port must be a u16")?;
             }
+            "--grpc-bind" => {
+                let value = args.next().context("--grpc-bind requires a value")?;
+                grpc_bind = parse_bind(&value, "--grpc-bind")?;
+            }
+            "--rest-bind" => {
+                let value = args.next().context("--rest-bind requires a value")?;
+                rest_bind = parse_bind(&value, "--rest-bind")?;
+            }
             "--kind-schema" => {
                 kind_schema = args.next().context("--kind-schema requires a value")?;
             }
@@ -346,6 +380,8 @@ pub fn parse_args() -> Result<Args> {
         database_url,
         grpc_port,
         rest_port,
+        grpc_bind,
+        rest_bind,
         write_pool_size,
         read_pool_size,
         chain: ChainConfig {
@@ -397,6 +433,8 @@ where
     )
     .await?
     .with_rest_port(args.rest_port)
+    .with_grpc_bind(args.grpc_bind)
+    .with_rest_bind(args.rest_bind)
     .with_auth_token(args.auth_token)
     .with_rate_limit_rps(args.rate_limit_rps)
     .with_trusted_proxies(args.trusted_proxies);
@@ -435,6 +473,8 @@ where
     )
     .await?
     .with_rest_port(args.rest_port)
+    .with_grpc_bind(args.grpc_bind)
+    .with_rest_bind(args.rest_bind)
     .with_auth_token(args.auth_token)
     .with_rate_limit_rps(args.rate_limit_rps)
     .with_trusted_proxies(args.trusted_proxies);
@@ -464,6 +504,8 @@ pub struct Runner {
     read_pool: PgPool,
     grpc_port: u16,
     rest_port: Option<u16>,
+    grpc_bind: IpAddr,
+    rest_bind: IpAddr,
     auth_token: Option<String>,
     rate_limit_rps: Option<u32>,
     trusted_proxies: Option<auth::TrustedProxies>,
@@ -498,6 +540,8 @@ impl Runner {
             read_pool,
             grpc_port,
             rest_port: None,
+            grpc_bind: DEFAULT_BIND,
+            rest_bind: DEFAULT_BIND,
             auth_token: None,
             rate_limit_rps: None,
             trusted_proxies: None,
@@ -510,6 +554,21 @@ impl Runner {
     /// Serve the HTTP/JSON surface too. `None` leaves it off.
     pub fn with_rest_port(mut self, port: Option<u16>) -> Self {
         self.rest_port = port;
+        self
+    }
+
+    /// Interface the gRPC surface listens on. Defaults to loopback; set to
+    /// `0.0.0.0` (or a specific interface) only behind a firewall, a private
+    /// network, or `--auth-token` — gRPC is plaintext.
+    pub fn with_grpc_bind(mut self, addr: IpAddr) -> Self {
+        self.grpc_bind = addr;
+        self
+    }
+
+    /// Interface the REST surface listens on. Same default and caveats as
+    /// [`Self::with_grpc_bind`].
+    pub fn with_rest_bind(mut self, addr: IpAddr) -> Self {
+        self.rest_bind = addr;
         self
     }
 
@@ -731,16 +790,20 @@ impl Runner {
                 "request guard active on both surfaces"
             );
         } else {
+            let grpc_bind = self.grpc_bind;
+            let rest_bind = self.rest_bind;
             warn!(
+                %grpc_bind, %rest_bind,
                 "no --auth-token and no --rate-limit-rps: both API surfaces are \
-                 open to anyone who can reach them; only run like this on a closed network"
+                 open to anyone who can reach {grpc_bind}/{rest_bind}; only bind \
+                 a non-loopback address on a closed network"
             );
         }
 
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
         let mut servers: tokio::task::JoinSet<Result<()>> = tokio::task::JoinSet::new();
 
-        let grpc_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), self.grpc_port);
+        let grpc_addr = SocketAddr::new(self.grpc_bind, self.grpc_port);
         let grpc_listener = bind_listener(grpc_addr, "gRPC").await?;
         let grpc_service = grpc_service::server(self.read_pool.clone(), self.runtimes);
         let grpc_service = tonic::service::interceptor::InterceptedService::new(
@@ -763,7 +826,7 @@ impl Runner {
         });
 
         if let Some(rest_port) = self.rest_port {
-            let rest_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), rest_port);
+            let rest_addr = SocketAddr::new(self.rest_bind, rest_port);
             let listener = bind_listener(rest_addr, "REST").await?;
             let router = rest_service::router(self.read_pool.clone(), self.rest_chains).layer(
                 axum::middleware::from_fn_with_state(guard, auth::rest_guard),
@@ -1111,6 +1174,24 @@ mod tests {
         assert!(parse_rate_limit_rps("4294967295", "test").is_err());
         assert!(parse_rate_limit_rps("many", "test").is_err());
         assert!(parse_rate_limit_rps("", "test").is_err());
+    }
+
+    #[test]
+    fn parse_bind_accepts_ips_and_names_the_source() {
+        assert_eq!(
+            parse_bind("127.0.0.1", "test").unwrap(),
+            IpAddr::V4(Ipv4Addr::LOCALHOST)
+        );
+        assert_eq!(
+            parse_bind("0.0.0.0", "test").unwrap(),
+            IpAddr::V4(Ipv4Addr::UNSPECIFIED)
+        );
+        assert!(parse_bind("::1", "test").is_ok());
+
+        let err = parse_bind("localhost", "--grpc-bind").unwrap_err();
+        assert!(format!("{err:#}").contains("--grpc-bind"));
+        let err = parse_bind("10.0.0.1:80", "RETRACER_REST_BIND").unwrap_err();
+        assert!(format!("{err:#}").contains("RETRACER_REST_BIND"));
     }
 
     #[tokio::test]

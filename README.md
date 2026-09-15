@@ -88,11 +88,11 @@ answers — "not connected" and "caught up" are different states.
 
 All flags are optional; the defaults match a local devnet. `--bootnodes`,
 `--database-url`, `--node-rpc-url`, `--node-rpc-token`, `--auth-token`, `--rate-limit-rps`,
-and `--trusted-proxies`
+`--trusted-proxies`, `--grpc-bind` and `--rest-bind`
 can also come from a `.env` file (copy `.env.example`) via
 `RETRACER_BOOTNODES`/`RETRACER_DATABASE_URL`/`RETRACER_NODE_RPC_URL`/`RETRACER_NODE_RPC_TOKEN`/
-`RETRACER_AUTH_TOKEN`/`RETRACER_RATE_LIMIT_RPS`/`RETRACER_TRUSTED_PROXIES` — a flag always overrides
-the env value.
+`RETRACER_AUTH_TOKEN`/`RETRACER_RATE_LIMIT_RPS`/`RETRACER_TRUSTED_PROXIES`/`RETRACER_GRPC_BIND`/
+`RETRACER_REST_BIND` — a flag always overrides the env value.
 
 | Flag | Default | Description |
 | --- | --- | --- |
@@ -114,10 +114,19 @@ the env value.
 | `--auth-token` | none | Shared secret required as `Authorization: Bearer <token>` on both surfaces (`/health` and `/ready` stay open). Unset = both surfaces stay open, same as today |
 | `--rate-limit-rps` | none | Per-IP request budget, both surfaces. Unset = no rate limiting |
 | `--trusted-proxies` | none | Comma-separated IPs/CIDRs (e.g. `10.0.0.8,10.0.0.0/8`) whose `X-Forwarded-For` the limiter may believe. Unset = the socket peer is always the client; only set addresses you operate |
+| `--grpc-bind` | `127.0.0.1` | Interface the gRPC surface listens on |
+| `--rest-bind` | `127.0.0.1` | Interface the REST surface listens on |
 
 `--blocks-topic` and `--sync-protocol` are a wire agreement with the node you're
 following, so they must match what *it* publishes — they're not derived from
 `--chain-id`.
+
+### Exposure
+
+Both surfaces listen on loopback by default. Set `--grpc-bind`/`--rest-bind`
+(or the matching env vars) to a private or WireGuard address — never a public
+one — and turn on `--auth-token` before doing so: both surfaces are plaintext,
+and auth defaults off.
 
 ### CoreChain wire compatibility
 
