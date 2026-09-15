@@ -24,11 +24,52 @@ pub use rest_service::NodeRpcToken;
 use anyhow::{Context, Result};
 use libp2p::Multiaddr;
 use sqlx::PgPool;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
+use std::time::Duration;
 use storage::{ActionIndexable, AddressValidator};
 use tip::{Tip, TipAction};
 use tokio::task::JoinHandle;
 use tracing::{error, info, warn};
+
+/// How long API servers get to finish in-flight requests after shutdown starts.
+const SHUTDOWN_GRACE: Duration = Duration::from_secs(10);
+
+/// Binds before anything is spawned, so a port conflict fails startup loudly
+/// instead of leaving a process that looks healthy and serves nothing.
+async fn bind_listener(addr: SocketAddr, surface: &str) -> Result<tokio::net::TcpListener> {
+    tokio::net::TcpListener::bind(addr)
+        .await
+        .with_context(|| format!("{surface}: failed to bind {addr}"))
+}
+
+/// Resolves on Ctrl+C, or SIGTERM on Unix (what `systemctl stop` sends).
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        if let Err(err) = tokio::signal::ctrl_c().await {
+            warn!("cannot listen for Ctrl+C: {err}");
+            std::future::pending::<()>().await;
+        }
+    };
+    #[cfg(unix)]
+    let terminate = async {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut signal) => {
+                signal.recv().await;
+            }
+            Err(err) => {
+                warn!("cannot listen for SIGTERM: {err}");
+                std::future::pending::<()>().await;
+            }
+        }
+    };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+    tokio::select! {
+        () = ctrl_c => {}
+        () = terminate => {}
+    }
+}
 
 /// The chain-specific pieces that can't be expressed as a CLI flag because they
 /// are Rust code. Both have working defaults, so an embedder that needs neither
@@ -659,12 +700,16 @@ impl Runner {
         Ok(())
     }
 
-    /// Serves gRPC and runs until the first chain task finishes or fails.
+    /// Serves gRPC (and REST, if configured) and runs until a chain task or an
+    /// API server finishes or fails, or a shutdown signal arrives.
     ///
-    /// One task ending takes the process down rather than leaving the rest
-    /// running: a half-dead multi-chain indexer still answers queries for the
-    /// chain that died, with data that silently stops advancing. Failing
-    /// visibly is the better outcome — a supervisor restarts it.
+    /// One chain task ending takes the process down rather than leaving the
+    /// rest running: a half-dead multi-chain indexer still answers queries for
+    /// the chain that died, with data that silently stops advancing. Failing
+    /// visibly is the better outcome — a supervisor restarts it. An API server
+    /// dying is fatal for the same reason: if gRPC dies while REST keeps
+    /// answering `/health`, a supervisor never restarts the process and
+    /// clients relying on gRPC lose service silently.
     pub async fn run(self) -> Result<()> {
         anyhow::ensure!(
             !self.runtimes.is_empty(),
@@ -692,47 +737,69 @@ impl Runner {
             );
         }
 
-        let grpc_addr = format!("0.0.0.0:{}", self.grpc_port)
-            .parse()
-            .context("invalid gRPC port")?;
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let mut servers: tokio::task::JoinSet<Result<()>> = tokio::task::JoinSet::new();
+
+        let grpc_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), self.grpc_port);
+        let grpc_listener = bind_listener(grpc_addr, "gRPC").await?;
         let grpc_service = grpc_service::server(self.read_pool.clone(), self.runtimes);
         let grpc_service = tonic::service::interceptor::InterceptedService::new(
             grpc_service,
             auth::GrpcGuard(guard.clone()),
         );
-        tokio::spawn(async move {
-            info!(%grpc_addr, "gRPC listening");
-            if let Err(err) = tonic::transport::Server::builder()
+        info!(%grpc_addr, "gRPC listening");
+        let mut grpc_stop = shutdown_rx.clone();
+        servers.spawn(async move {
+            tonic::transport::Server::builder()
                 .add_service(grpc_service)
-                .serve(grpc_addr)
+                .serve_with_incoming_shutdown(
+                    tokio_stream::wrappers::TcpListenerStream::new(grpc_listener),
+                    async move {
+                        let _ = grpc_stop.wait_for(|stop| *stop).await;
+                    },
+                )
                 .await
-            {
-                warn!("gRPC server exited: {err}");
-            }
+                .context("gRPC server failed")
         });
 
         if let Some(rest_port) = self.rest_port {
+            let rest_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), rest_port);
+            let listener = bind_listener(rest_addr, "REST").await?;
             let router = rest_service::router(self.read_pool.clone(), self.rest_chains).layer(
                 axum::middleware::from_fn_with_state(guard, auth::rest_guard),
             );
-            tokio::spawn(async move {
-                let addr = format!("0.0.0.0:{rest_port}");
-                match tokio::net::TcpListener::bind(&addr).await {
-                    Ok(listener) => {
-                        info!(%addr, "REST listening");
-                        let service =
-                            router.into_make_service_with_connect_info::<std::net::SocketAddr>();
-                        if let Err(err) = axum::serve(listener, service).await {
-                            warn!("REST server exited: {err}");
-                        }
-                    }
-                    Err(err) => warn!("REST server could not bind {addr}: {err}"),
-                }
+            info!(%rest_addr, "REST listening");
+            let service = router.into_make_service_with_connect_info::<SocketAddr>();
+            let mut rest_stop = shutdown_rx.clone();
+            servers.spawn(async move {
+                axum::serve(listener, service)
+                    .with_graceful_shutdown(async move {
+                        let _ = rest_stop.wait_for(|stop| *stop).await;
+                    })
+                    .await
+                    .context("REST server failed")
             });
         }
 
-        let (result, _, _) = futures::future::select_all(self.tasks).await;
-        result.context("a chain task panicked")?
+        let chains = futures::future::select_all(self.tasks);
+        let outcome = tokio::select! {
+            (result, _, _) = chains => result.context("a chain task panicked").and_then(|inner| inner),
+            Some(joined) = servers.join_next() => match joined {
+                Ok(Ok(())) => Err(anyhow::anyhow!("an API server stopped unexpectedly")),
+                Ok(Err(err)) => Err(err),
+                Err(err) => Err(anyhow::Error::new(err).context("an API server task panicked")),
+            },
+            () = shutdown_signal() => {
+                info!("shutdown signal received; draining API servers");
+                Ok(())
+            }
+        };
+        let _ = shutdown_tx.send(true);
+        let _ = tokio::time::timeout(SHUTDOWN_GRACE, async {
+            while servers.join_next().await.is_some() {}
+        })
+        .await;
+        outcome
     }
 }
 
@@ -1044,5 +1111,18 @@ mod tests {
         assert!(parse_rate_limit_rps("4294967295", "test").is_err());
         assert!(parse_rate_limit_rps("many", "test").is_err());
         assert!(parse_rate_limit_rps("", "test").is_err());
+    }
+
+    #[tokio::test]
+    async fn bind_listener_names_the_surface_when_the_port_is_taken() {
+        let occupied = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind an ephemeral port");
+        let addr = occupied.local_addr().expect("local addr");
+
+        let err = bind_listener(addr, "REST")
+            .await
+            .expect_err("the port is already taken");
+        assert!(format!("{err:#}").contains("REST"));
     }
 }
