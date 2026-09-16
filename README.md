@@ -30,7 +30,7 @@ your bootnodes/database URL/auth token, and offers to install it as a
 systemd service. Read it before piping to `bash` if you'd rather:
 
 ```bash
-curl -fsSL .../install.sh -o install.sh && less install.sh && bash install.sh
+curl -fsSL https://raw.githubusercontent.com/Arxium-Protocol/retracer/main/scripts/install.sh -o install.sh && less install.sh && bash install.sh
 ```
 
 Non-interactive install with defaults: `install.sh --yes`. See
@@ -57,6 +57,8 @@ cargo run -p retracerd -- \
   --bootnodes /ip4/127.0.0.1/tcp/30334/p2p/<peer-id> \
   --database-url postgres://retracer:retracer@localhost:5433/retracer
 ```
+
+See every flag with `cargo run -p retracerd -- --help`.
 
 Migrations run automatically on startup against whatever database you pointed
 `--database-url` at. You now have:
@@ -88,11 +90,11 @@ answers — "not connected" and "caught up" are different states.
 
 All flags are optional; the defaults match a local devnet. `--bootnodes`,
 `--database-url`, `--node-rpc-url`, `--node-rpc-token`, `--auth-token`, `--rate-limit-rps`,
-and `--trusted-proxies`
+`--trusted-proxies`, `--grpc-bind` and `--rest-bind`
 can also come from a `.env` file (copy `.env.example`) via
 `RETRACER_BOOTNODES`/`RETRACER_DATABASE_URL`/`RETRACER_NODE_RPC_URL`/`RETRACER_NODE_RPC_TOKEN`/
-`RETRACER_AUTH_TOKEN`/`RETRACER_RATE_LIMIT_RPS`/`RETRACER_TRUSTED_PROXIES` — a flag always overrides
-the env value.
+`RETRACER_AUTH_TOKEN`/`RETRACER_RATE_LIMIT_RPS`/`RETRACER_TRUSTED_PROXIES`/`RETRACER_GRPC_BIND`/
+`RETRACER_REST_BIND` — a flag always overrides the env value.
 
 | Flag | Default | Description |
 | --- | --- | --- |
@@ -114,10 +116,19 @@ the env value.
 | `--auth-token` | none | Shared secret required as `Authorization: Bearer <token>` on both surfaces (`/health` and `/ready` stay open). Unset = both surfaces stay open, same as today |
 | `--rate-limit-rps` | none | Per-IP request budget, both surfaces. Unset = no rate limiting |
 | `--trusted-proxies` | none | Comma-separated IPs/CIDRs (e.g. `10.0.0.8,10.0.0.0/8`) whose `X-Forwarded-For` the limiter may believe. Unset = the socket peer is always the client; only set addresses you operate |
+| `--grpc-bind` | `127.0.0.1` | Interface the gRPC surface listens on |
+| `--rest-bind` | `127.0.0.1` | Interface the REST surface listens on |
 
 `--blocks-topic` and `--sync-protocol` are a wire agreement with the node you're
 following, so they must match what *it* publishes — they're not derived from
 `--chain-id`.
+
+### Exposure
+
+Both surfaces listen on loopback by default. Set `--grpc-bind`/`--rest-bind`
+(or the matching env vars) to a private or WireGuard address — never a public
+one — and turn on `--auth-token` before doing so: both surfaces are plaintext,
+and auth defaults off.
 
 ### CoreChain wire compatibility
 
@@ -148,6 +159,7 @@ serves.
 ```
 GET  /health
 GET  /ready
+GET  /metrics
 GET  /v1/chains
 
 GET  /v1/chains/{chain}/status
@@ -162,6 +174,8 @@ GET  /v1/chains/{chain}/actions/{action_hash}
 
 GET  /v1/chains/{chain}/accounts/{address}/actions?limit=&role=
 GET  /v1/chains/{chain}/search?q=
+
+GET  /v1/chains/{chain}/validators/uptime?from=&to=
 ```
 
 `/health` is process liveness only. `/ready` returns 200 only when PostgreSQL
@@ -171,6 +185,11 @@ has a fixed timeout; otherwise it returns 503 with per-chain dependency state.
 Both probes stay open when inbound API authentication is enabled, while
 configured rate limiting still applies to `/ready` (but never `/health`).
 
+`/metrics` is Prometheus text exposition, unlike `/health` and `/ready` it
+stays behind `--auth-token`/`--rate-limit-rps` like every other route. A
+database failure still returns 200 with `retracer_database_up 0`, so a scrape
+always has a body to alert on. See [Monitoring](#monitoring) below.
+
 Pages are newest-first and cap at 100. Action cursors are a
 `(before_height, before_index)` pair and both halves must be sent together — a
 block holds many actions, so half a cursor would silently repeat or skip the
@@ -178,7 +197,7 @@ rest of one.
 
 ```bash
 curl "localhost:8080/v1/chains/corechain-devnet/blocks?limit=5"
-curl "localhost:8080/v1/chains/corechain-devnet/accounts/arx1.../actions?role=to"
+curl "localhost:8080/v1/chains/corechain-devnet/accounts/<address>/actions?role=to"
 curl "localhost:8080/v1/chains/corechain-devnet/search?q=42"
 ```
 
@@ -194,6 +213,13 @@ HTTP, plus two server-streaming RPCs HTTP doesn't offer:
 - `SubscribeAccountActions` — live tail of any action where an address holds a
   role (sender, recipient, or any role your schema defines).
 
+Both streams can fall behind the broadcast buffer if a subscriber reads too
+slowly. When that happens the stream ends with a `DataLoss` status rather than
+silently skipping the gap. `SubscribeBlocks` clients should resubscribe with
+`from_height` set to resume the replay. `SubscribeAccountActions` has no
+replay of its own — read the missed history with `GetAccountActions`, then
+resubscribe.
+
 The chain is selected by the `x-chain-id` header; omit it for the default chain.
 
 ```bash
@@ -201,6 +227,47 @@ grpcurl -plaintext -proto proto/retracer.proto \
   -H 'x-chain-id: corechain-devnet' \
   -d '{"height": 1}' \
   localhost:50051 retracer.Retracer/GetBlock
+```
+
+---
+
+## Monitoring
+
+`GET /metrics` is Prometheus text: per-chain lag and finality, plus database
+and per-table size (see [What it deliberately doesn't do](#what-it-deliberately-doesnt-do)
+below — the intent is to measure growth, not prune it). It requires the same
+`--auth-token` as every other route once one is set.
+
+```yaml
+scrape_configs:
+  - job_name: retracer
+    # Each scrape re-runs the database and per-table size queries; don't
+    # inherit a sub-second global interval meant for cheaper endpoints.
+    scrape_interval: 30s
+    static_configs:
+      - targets: ["127.0.0.1:8080"]
+    authorization:
+      credentials_file: /etc/retracer/metrics-token
+```
+
+Starter alerts:
+
+```yaml
+- alert: RetracerDown
+  expr: up{job="retracer"} == 0
+  for: 2m
+- alert: RetracerDatabaseDown   # up==1 alone misses this: a DB outage still
+  expr: retracer_database_up == 0   # returns 200 with retracer_database_up 0
+  for: 2m
+- alert: RetracerLagging
+  expr: retracer_blocks_behind > 30
+  for: 5m
+- alert: RetracerChainStalled   # node stopped producing, lag stays 0
+  expr: retracer_tip_age_seconds > 120
+  for: 5m
+- alert: RetracerDiskGrowth     # set the budget to the host's disk allowance
+  expr: predict_linear(retracer_database_size_bytes[6h], 7 * 24 * 3600) > 20e9
+  for: 30m
 ```
 
 ---
@@ -238,8 +305,8 @@ Removing an entry doesn't drop its index — do that with `DROP INDEX` when you
 mean it.
 
 For roles a dotted path can't express (conditional or computed), implement
-`storage::ActionIndexable` in Rust and pass it to `run`. See
-[Design notes](../Retracer_Design.md#tier-a--tier-b-address-extraction).
+`storage::ActionIndexable` in Rust and pass it to `run`. See the
+`ActionIndexable` rustdoc (`cargo doc -p storage --open`).
 
 ---
 
@@ -286,7 +353,7 @@ they share one database and one API endpoint.
 
 If your chain *isn't* on the Arxium stack, implement `storage::IndexableBlock`
 and `ingestion::HasHeight` for your own block type — see
-[Design notes](../Retracer_Design.md#following-a-different-chain).
+[`crates/storage/src/wire.rs`](crates/storage/src/wire.rs).
 
 ---
 
@@ -295,27 +362,34 @@ and `ingestion::HasHeight` for your own block type — see
 - **Account balances and nonces.** Not derivable from indexed actions; ask the
   node directly.
 - **Validator set membership.** Live membership comes from the node's
-  `/validators`. Retracer reports who has actually *proposed* blocks — and,
-  since 2026-08-25, who *should have*: `GET
-  /v1/chains/{chain_id}/validators/uptime?from=&to=` backfills turns owed
-  (the primary round-robin designee per height, a pure function of the
-  node's own `/validators?height=N` — not a replay of chain-specific
-  dispatch logic) against turns actually proposed. One node call per height,
-  so it's a bounded on-demand backfill (`MAX_UPTIME_RANGE`), not a live
-  figure. Needs `--node-rpc-url`/`RETRACER_NODE_RPC_URL` configured per
+  `/validators`. Retracer reports who has actually *proposed* blocks — and
+  who *should have*: `GET /v1/chains/{chain_id}/validators/uptime?from=&to=`
+  compares each indexed height's round-0 designee (a pure function of the
+  node's own `/validators?height=N`, mirroring the node's own
+  `eligible_proposer` formula, not a replay of chain-specific dispatch logic)
+  against who actually proposed it. A block produced at round > 0 (a backup
+  taking over after the primary missed) is attributed to the primary as a
+  missed turn and to the backup as a `backup_proposals` count, never as extra
+  uptime for the backup. Only indexed heights with a known proposer are
+  counted; `heights_counted` in the response says how many of the requested
+  heights that was, so a range reaching past the indexed tip is visible
+  rather than silently under-counted. Node calls are cached per
+  `(chain, height)` for `UPTIME_CACHE_TTL` (5 minutes) and capped per request
+  by `MAX_UPTIME_RANGE`; this is a backfill endpoint, not a live figure.
+  Needs `--node-rpc-url`/`RETRACER_NODE_RPC_URL` configured per
     chain; without it the route 400s rather than guessing an address. Protected
     node RPCs also require `--node-rpc-token`/`RETRACER_NODE_RPC_TOKEN`; the
     credential is sent as `Authorization: Bearer` and is redacted from Debug output.
     Send bearer-authenticated requests only over loopback, HTTPS, or the encrypted
     WireGuard network; ordinary remote HTTP exposes the credential in transit.
+    Rows indexed before migration `0002` report round 0 regardless of the
+    block's real round, since that column did not exist yet.
 - **Mempool / pending actions.** Confirmed blocks only.
 - **Auth or rate limiting.** Off by default (unchanged trusted-consumer
   behavior), now opt-in via `--auth-token`/`RETRACER_AUTH_TOKEN` (a shared
   `Authorization: Bearer` secret) and `--rate-limit-rps`/
   `RETRACER_RATE_LIMIT_RPS` (per-IP), enforced identically on both the gRPC
   and REST surfaces. `/health` stays open for liveness probes either way.
-
-Reasoning for each is in [Design notes](../Retracer_Design.md#boundary-rules).
 
 ---
 
@@ -373,6 +447,6 @@ SQLx verifies applied migrations by hashing their exact bytes.
 
 | | |
 | --- | --- |
-| [Design notes](../Retracer_Design.md) | Why it's built this way, boundary rules, internals |
-| [Open items](../Retracer_OpenItems.md) | Known gaps and deferred work |
-| `../Implementation_log_*.md` | Change history |
+| `cargo doc --workspace --open` | Rustdoc for every crate: internals, boundary rules, module docs |
+| [`examples/spoke-indexer/README.md`](examples/spoke-indexer/README.md) | Worked multi-chain example |
+| [`proto/retracer.proto`](proto/retracer.proto) | The gRPC schema |

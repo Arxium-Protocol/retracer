@@ -1,0 +1,91 @@
+name: CI
+
+# Runs the same test job as .github/workflows/release.yml, but on every push
+# and pull request instead of only on a release tag — release.yml's `test`
+# job only ran when someone tagged a release, so a regression on `main` or in
+# a PR went unnoticed until then. The two job definitions must stay
+# identical: if you change one (steps, Postgres service, checkout pin), make
+# the same change to the other.
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  SQLX_OFFLINE: 'true'
+
+jobs:
+  test:
+    name: Test the workspace
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: retracer
+          POSTGRES_PASSWORD: retracer
+          POSTGRES_DB: retracer
+        ports:
+          - 5433:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 5
+
+    env:
+      DATABASE_URL: postgres://retracer:retracer@localhost:5433/retracer
+      RETRACER_TEST_DATABASE_URL: postgres://retracer:retracer@localhost:5433/retracer
+
+    steps:
+      - name: Check out Retracer
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - name: Install protoc
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends protobuf-compiler
+
+      - name: Show the Rust toolchain
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          rustc --version
+          cargo --version
+
+      - name: Validate the installer
+        shell: bash
+        run: bash -n scripts/install.sh
+
+      - name: Test the workspace
+        shell: bash
+        run: cargo test --workspace --locked
+
+      - name: Clippy with warnings denied
+        shell: bash
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+      # The `.sqlx/` cache lets offline builds type-check queries without a
+      # database, but a stale entry for a removed query lingers silently.
+      # This fails the PR when the cache drifts from the queries or schema.
+      - name: Verify the sqlx query cache is fresh
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          cargo install sqlx-cli --version 0.8.6 --no-default-features --features postgres --locked
+          sqlx database setup
+          cargo sqlx prepare --check --workspace

@@ -24,11 +24,52 @@ pub use rest_service::NodeRpcToken;
 use anyhow::{Context, Result};
 use libp2p::Multiaddr;
 use sqlx::PgPool;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
+use std::time::Duration;
 use storage::{ActionIndexable, AddressValidator};
 use tip::{Tip, TipAction};
 use tokio::task::JoinHandle;
 use tracing::{error, info, warn};
+
+/// How long API servers get to finish in-flight requests after shutdown starts.
+const SHUTDOWN_GRACE: Duration = Duration::from_secs(10);
+
+/// Binds before anything is spawned, so a port conflict fails startup loudly
+/// instead of leaving a process that looks healthy and serves nothing.
+async fn bind_listener(addr: SocketAddr, surface: &str) -> Result<tokio::net::TcpListener> {
+    tokio::net::TcpListener::bind(addr)
+        .await
+        .with_context(|| format!("{surface}: failed to bind {addr}"))
+}
+
+/// Resolves on Ctrl+C, or SIGTERM on Unix (what `systemctl stop` sends).
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        if let Err(err) = tokio::signal::ctrl_c().await {
+            warn!("cannot listen for Ctrl+C: {err}");
+            std::future::pending::<()>().await;
+        }
+    };
+    #[cfg(unix)]
+    let terminate = async {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut signal) => {
+                signal.recv().await;
+            }
+            Err(err) => {
+                warn!("cannot listen for SIGTERM: {err}");
+                std::future::pending::<()>().await;
+            }
+        }
+    };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+    tokio::select! {
+        () = ctrl_c => {}
+        () = terminate => {}
+    }
+}
 
 /// The chain-specific pieces that can't be expressed as a CLI flag because they
 /// are Rust code. Both have working defaults, so an embedder that needs neither
@@ -49,6 +90,8 @@ const DEFAULT_DATABASE_URL: &str = "postgres://retracer:retracer@localhost:5433/
 const DEFAULT_CHAIN_ID: &str = "corechain-devnet";
 const DEFAULT_GRPC_PORT: u16 = 50051;
 const DEFAULT_REST_PORT: u16 = 8080;
+/// Loopback-only until an operator opts in — see `--grpc-bind`/`--rest-bind`.
+const DEFAULT_BIND: IpAddr = IpAddr::V4(Ipv4Addr::LOCALHOST);
 const DEFAULT_KIND_SCHEMA: &str = "kind_schema.toml";
 const DEFAULT_WRITE_POOL_SIZE: u32 = 4;
 const DEFAULT_READ_POOL_SIZE: u32 = 16;
@@ -98,6 +141,13 @@ pub struct Args {
     /// HTTP/JSON surface. `None` disables it — gRPC alone is enough between
     /// services we own on both ends; REST exists for external builders.
     pub rest_port: Option<u16>,
+    /// Interface the gRPC surface listens on. Defaults to loopback; set to
+    /// `0.0.0.0` (or a specific interface) only behind a firewall, a private
+    /// network, or `--auth-token` — gRPC is plaintext.
+    pub grpc_bind: IpAddr,
+    /// Interface the REST surface listens on. Same default and caveats as
+    /// `grpc_bind`.
+    pub rest_bind: IpAddr,
     pub write_pool_size: u32,
     pub read_pool_size: u32,
     pub chain: ChainConfig,
@@ -112,6 +162,15 @@ pub struct Args {
     /// attributing rate-limit buckets. `None` (the default) means the socket
     /// peer is always the client.
     pub trusted_proxies: Option<auth::TrustedProxies>,
+}
+
+/// Parses a listen address, naming `source` (a flag or env var) in the error
+/// so a typo like `--grpc-bind localhost` fails with a message pointing at
+/// the right flag instead of a bare "invalid IP address" from the stdlib.
+fn parse_bind(raw: &str, source: &str) -> Result<IpAddr> {
+    raw.parse().with_context(|| {
+        format!("{source} must be an IP address such as 127.0.0.1, 0.0.0.0 or ::1")
+    })
 }
 
 /// Parses a per-second rate limit, rejecting values the guard cannot honour.
@@ -141,6 +200,68 @@ fn validate_rate_limit_rps(rps: u32, source: &str) -> Result<()> {
     Ok(())
 }
 
+/// `retracerd --help` text. Kept in sync with `parse_args`'s match arms by
+/// the `usage_lists_every_flag` test below — add a flag to both or neither.
+pub const USAGE: &str = "\
+retracerd - a Retracer indexer for one chain
+
+USAGE:
+    retracerd [OPTIONS]
+
+OPTIONS:
+    --bootnodes <multiaddrs>       Comma-separated peer multiaddrs to dial on startup.
+                                   [default: none] [env: RETRACER_BOOTNODES]
+    --port <u16>                   P2P listen port; 0 picks a free one.
+                                   [default: 0]
+    --database-url <url>           Postgres connection string.
+                                   [default: postgres://retracer:retracer@localhost:5433/retracer]
+                                   [env: RETRACER_DATABASE_URL]
+    --chain-id <string>            Label for this chain's rows; not read off the wire.
+                                   [default: corechain-devnet]
+    --rest-port <u16>              HTTP API port; 0 disables it.
+                                   [default: 8080]
+    --grpc-port <u16>              gRPC API port.
+                                   [default: 50051]
+    --grpc-bind <ip>               Interface the gRPC surface listens on.
+                                   [default: 127.0.0.1] [env: RETRACER_GRPC_BIND]
+    --rest-bind <ip>               Interface the REST surface listens on.
+                                   [default: 127.0.0.1] [env: RETRACER_REST_BIND]
+    --kind-schema <path>           Payload field configuration file.
+                                   [default: kind_schema.toml]
+    --blocks-topic <topic>         Must match the node's gossip topic.
+                                   [default: derived from --chain-id]
+    --sync-protocol <protocol>     Must match the node's sync protocol.
+                                   [default: derived from --chain-id]
+    --max-pending-blocks <usize>   Gap-fill buffer cap; must be at least 1.
+                                   [default: 4096]
+    --write-pool-size <u32>        Postgres connections for the writer; must be at least 1.
+                                   [default: 4]
+    --read-pool-size <u32>        Postgres connections for reads; must be at least 1.
+                                   [default: 16]
+    --finality-depth <u64>         Fallback rollback limit, used only when the node reports no
+                                   finality.
+                                   [default: 250]
+    --node-rpc-url <url>           This chain's node HTTP RPC base URL. Only used for the
+                                   validator-uptime endpoint; unset disables it.
+                                   [default: none] [env: RETRACER_NODE_RPC_URL]
+    --node-rpc-token <token>       Bearer token sent on every HTTP request to this chain's node
+                                   RPC. Prefer RETRACER_NODE_RPC_TOKEN so the value is not
+                                   visible in process arguments.
+                                   [default: none] [env: RETRACER_NODE_RPC_TOKEN]
+    --auth-token <token>           Shared secret required as \"Authorization: Bearer <token>\" on
+                                   both API surfaces (/health and /ready stay open). Unset means
+                                   both surfaces stay open to anyone who can reach them.
+                                   [default: none] [env: RETRACER_AUTH_TOKEN]
+    --rate-limit-rps <u32>         Per-IP request budget, both surfaces. Unset disables rate
+                                   limiting.
+                                   [default: none] [env: RETRACER_RATE_LIMIT_RPS]
+    --trusted-proxies <list>       Comma-separated IPs/CIDRs whose X-Forwarded-For the limiter
+                                   may believe. Unset means the socket peer is always the client.
+                                   [default: none] [env: RETRACER_TRUSTED_PROXIES]
+    -h, --help                     Print this help and exit.
+    -V, --version                  Print the version and exit.
+";
+
 /// Minimal manual flag parsing — a handful of flags, not worth a clap
 /// dependency for. Describes exactly one chain; multi-chain deployments build
 /// [`ChainConfig`]s themselves and drive a [`Runner`], because each chain needs
@@ -165,6 +286,14 @@ pub fn parse_args() -> Result<Args> {
     let mut chain_id = DEFAULT_CHAIN_ID.to_string();
     let mut grpc_port = DEFAULT_GRPC_PORT;
     let mut rest_port = Some(DEFAULT_REST_PORT);
+    let mut grpc_bind = match std::env::var("RETRACER_GRPC_BIND") {
+        Ok(value) if !value.is_empty() => parse_bind(&value, "RETRACER_GRPC_BIND")?,
+        _ => DEFAULT_BIND,
+    };
+    let mut rest_bind = match std::env::var("RETRACER_REST_BIND") {
+        Ok(value) if !value.is_empty() => parse_bind(&value, "RETRACER_REST_BIND")?,
+        _ => DEFAULT_BIND,
+    };
     let mut kind_schema = DEFAULT_KIND_SCHEMA.to_string();
     let mut blocks_topic = None;
     let mut sync_protocol = None;
@@ -239,6 +368,14 @@ pub fn parse_args() -> Result<Args> {
                 let value = args.next().context("--grpc-port requires a value")?;
                 grpc_port = value.parse().context("--grpc-port must be a u16")?;
             }
+            "--grpc-bind" => {
+                let value = args.next().context("--grpc-bind requires a value")?;
+                grpc_bind = parse_bind(&value, "--grpc-bind")?;
+            }
+            "--rest-bind" => {
+                let value = args.next().context("--rest-bind requires a value")?;
+                rest_bind = parse_bind(&value, "--rest-bind")?;
+            }
             "--kind-schema" => {
                 kind_schema = args.next().context("--kind-schema requires a value")?;
             }
@@ -295,7 +432,7 @@ pub fn parse_args() -> Result<Args> {
                         .map_err(|err| anyhow::anyhow!("--trusted-proxies: {err}"))?,
                 );
             }
-            other => anyhow::bail!("unknown flag: {other}"),
+            other => anyhow::bail!("unknown flag: {other} (run with --help to list flags)"),
         }
     }
     let blocks_topic = blocks_topic.unwrap_or_else(|| ingestion::default_blocks_topic(&chain_id));
@@ -305,6 +442,8 @@ pub fn parse_args() -> Result<Args> {
         database_url,
         grpc_port,
         rest_port,
+        grpc_bind,
+        rest_bind,
         write_pool_size,
         read_pool_size,
         chain: ChainConfig {
@@ -356,6 +495,8 @@ where
     )
     .await?
     .with_rest_port(args.rest_port)
+    .with_grpc_bind(args.grpc_bind)
+    .with_rest_bind(args.rest_bind)
     .with_auth_token(args.auth_token)
     .with_rate_limit_rps(args.rate_limit_rps)
     .with_trusted_proxies(args.trusted_proxies);
@@ -394,6 +535,8 @@ where
     )
     .await?
     .with_rest_port(args.rest_port)
+    .with_grpc_bind(args.grpc_bind)
+    .with_rest_bind(args.rest_bind)
     .with_auth_token(args.auth_token)
     .with_rate_limit_rps(args.rate_limit_rps)
     .with_trusted_proxies(args.trusted_proxies);
@@ -423,6 +566,8 @@ pub struct Runner {
     read_pool: PgPool,
     grpc_port: u16,
     rest_port: Option<u16>,
+    grpc_bind: IpAddr,
+    rest_bind: IpAddr,
     auth_token: Option<String>,
     rate_limit_rps: Option<u32>,
     trusted_proxies: Option<auth::TrustedProxies>,
@@ -457,6 +602,8 @@ impl Runner {
             read_pool,
             grpc_port,
             rest_port: None,
+            grpc_bind: DEFAULT_BIND,
+            rest_bind: DEFAULT_BIND,
             auth_token: None,
             rate_limit_rps: None,
             trusted_proxies: None,
@@ -469,6 +616,21 @@ impl Runner {
     /// Serve the HTTP/JSON surface too. `None` leaves it off.
     pub fn with_rest_port(mut self, port: Option<u16>) -> Self {
         self.rest_port = port;
+        self
+    }
+
+    /// Interface the gRPC surface listens on. Defaults to loopback; set to
+    /// `0.0.0.0` (or a specific interface) only behind a firewall, a private
+    /// network, or `--auth-token` — gRPC is plaintext.
+    pub fn with_grpc_bind(mut self, addr: IpAddr) -> Self {
+        self.grpc_bind = addr;
+        self
+    }
+
+    /// Interface the REST surface listens on. Same default and caveats as
+    /// [`Self::with_grpc_bind`].
+    pub fn with_rest_bind(mut self, addr: IpAddr) -> Self {
+        self.rest_bind = addr;
         self
     }
 
@@ -659,12 +821,16 @@ impl Runner {
         Ok(())
     }
 
-    /// Serves gRPC and runs until the first chain task finishes or fails.
+    /// Serves gRPC (and REST, if configured) and runs until a chain task or an
+    /// API server finishes or fails, or a shutdown signal arrives.
     ///
-    /// One task ending takes the process down rather than leaving the rest
-    /// running: a half-dead multi-chain indexer still answers queries for the
-    /// chain that died, with data that silently stops advancing. Failing
-    /// visibly is the better outcome — a supervisor restarts it.
+    /// One chain task ending takes the process down rather than leaving the
+    /// rest running: a half-dead multi-chain indexer still answers queries for
+    /// the chain that died, with data that silently stops advancing. Failing
+    /// visibly is the better outcome — a supervisor restarts it. An API server
+    /// dying is fatal for the same reason: if gRPC dies while REST keeps
+    /// answering `/health`, a supervisor never restarts the process and
+    /// clients relying on gRPC lose service silently.
     pub async fn run(self) -> Result<()> {
         anyhow::ensure!(
             !self.runtimes.is_empty(),
@@ -686,53 +852,79 @@ impl Runner {
                 "request guard active on both surfaces"
             );
         } else {
+            let grpc_bind = self.grpc_bind;
+            let rest_bind = self.rest_bind;
             warn!(
+                %grpc_bind, %rest_bind,
                 "no --auth-token and no --rate-limit-rps: both API surfaces are \
-                 open to anyone who can reach them; only run like this on a closed network"
+                 open to anyone who can reach {grpc_bind}/{rest_bind}; only bind \
+                 a non-loopback address on a closed network"
             );
         }
 
-        let grpc_addr = format!("0.0.0.0:{}", self.grpc_port)
-            .parse()
-            .context("invalid gRPC port")?;
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let mut servers: tokio::task::JoinSet<Result<()>> = tokio::task::JoinSet::new();
+
+        let grpc_addr = SocketAddr::new(self.grpc_bind, self.grpc_port);
+        let grpc_listener = bind_listener(grpc_addr, "gRPC").await?;
         let grpc_service = grpc_service::server(self.read_pool.clone(), self.runtimes);
         let grpc_service = tonic::service::interceptor::InterceptedService::new(
             grpc_service,
             auth::GrpcGuard(guard.clone()),
         );
-        tokio::spawn(async move {
-            info!(%grpc_addr, "gRPC listening");
-            if let Err(err) = tonic::transport::Server::builder()
+        info!(%grpc_addr, "gRPC listening");
+        let mut grpc_stop = shutdown_rx.clone();
+        servers.spawn(async move {
+            tonic::transport::Server::builder()
                 .add_service(grpc_service)
-                .serve(grpc_addr)
+                .serve_with_incoming_shutdown(
+                    tokio_stream::wrappers::TcpListenerStream::new(grpc_listener),
+                    async move {
+                        let _ = grpc_stop.wait_for(|stop| *stop).await;
+                    },
+                )
                 .await
-            {
-                warn!("gRPC server exited: {err}");
-            }
+                .context("gRPC server failed")
         });
 
         if let Some(rest_port) = self.rest_port {
+            let rest_addr = SocketAddr::new(self.rest_bind, rest_port);
+            let listener = bind_listener(rest_addr, "REST").await?;
             let router = rest_service::router(self.read_pool.clone(), self.rest_chains).layer(
                 axum::middleware::from_fn_with_state(guard, auth::rest_guard),
             );
-            tokio::spawn(async move {
-                let addr = format!("0.0.0.0:{rest_port}");
-                match tokio::net::TcpListener::bind(&addr).await {
-                    Ok(listener) => {
-                        info!(%addr, "REST listening");
-                        let service =
-                            router.into_make_service_with_connect_info::<std::net::SocketAddr>();
-                        if let Err(err) = axum::serve(listener, service).await {
-                            warn!("REST server exited: {err}");
-                        }
-                    }
-                    Err(err) => warn!("REST server could not bind {addr}: {err}"),
-                }
+            info!(%rest_addr, "REST listening");
+            let service = router.into_make_service_with_connect_info::<SocketAddr>();
+            let mut rest_stop = shutdown_rx.clone();
+            servers.spawn(async move {
+                axum::serve(listener, service)
+                    .with_graceful_shutdown(async move {
+                        let _ = rest_stop.wait_for(|stop| *stop).await;
+                    })
+                    .await
+                    .context("REST server failed")
             });
         }
 
-        let (result, _, _) = futures::future::select_all(self.tasks).await;
-        result.context("a chain task panicked")?
+        let chains = futures::future::select_all(self.tasks);
+        let outcome = tokio::select! {
+            (result, _, _) = chains => result.context("a chain task panicked").and_then(|inner| inner),
+            Some(joined) = servers.join_next() => match joined {
+                Ok(Ok(())) => Err(anyhow::anyhow!("an API server stopped unexpectedly")),
+                Ok(Err(err)) => Err(err),
+                Err(err) => Err(anyhow::Error::new(err).context("an API server task panicked")),
+            },
+            () = shutdown_signal() => {
+                info!("shutdown signal received; draining API servers");
+                Ok(())
+            }
+        };
+        let _ = shutdown_tx.send(true);
+        let _ = tokio::time::timeout(SHUTDOWN_GRACE, async {
+            while servers.join_next().await.is_some() {}
+        })
+        .await;
+        outcome
     }
 }
 
@@ -1026,6 +1218,41 @@ async fn durable_tip(pool: &sqlx::PgPool, chain_id: &str) -> Option<Tip> {
 mod tests {
     use super::*;
 
+    /// Every flag `parse_args` matches on, kept in sync with `USAGE` by this
+    /// test — add a flag to both `parse_args`'s match arms and here, or
+    /// neither.
+    const FLAGS: &[&str] = &[
+        "--bootnodes",
+        "--port",
+        "--database-url",
+        "--chain-id",
+        "--rest-port",
+        "--grpc-port",
+        "--grpc-bind",
+        "--rest-bind",
+        "--kind-schema",
+        "--blocks-topic",
+        "--sync-protocol",
+        "--max-pending-blocks",
+        "--write-pool-size",
+        "--read-pool-size",
+        "--finality-depth",
+        "--node-rpc-url",
+        "--node-rpc-token",
+        "--auth-token",
+        "--rate-limit-rps",
+        "--trusted-proxies",
+    ];
+
+    #[test]
+    fn usage_lists_every_flag() {
+        for flag in FLAGS {
+            assert!(USAGE.contains(flag), "USAGE is missing {flag}");
+        }
+        assert!(USAGE.contains("--help"));
+        assert!(USAGE.contains("--version"));
+    }
+
     #[test]
     fn rate_limit_parsing_accepts_sane_values() {
         assert_eq!(parse_rate_limit_rps("1", "test").unwrap(), 1);
@@ -1044,5 +1271,36 @@ mod tests {
         assert!(parse_rate_limit_rps("4294967295", "test").is_err());
         assert!(parse_rate_limit_rps("many", "test").is_err());
         assert!(parse_rate_limit_rps("", "test").is_err());
+    }
+
+    #[test]
+    fn parse_bind_accepts_ips_and_names_the_source() {
+        assert_eq!(
+            parse_bind("127.0.0.1", "test").unwrap(),
+            IpAddr::V4(Ipv4Addr::LOCALHOST)
+        );
+        assert_eq!(
+            parse_bind("0.0.0.0", "test").unwrap(),
+            IpAddr::V4(Ipv4Addr::UNSPECIFIED)
+        );
+        assert!(parse_bind("::1", "test").is_ok());
+
+        let err = parse_bind("localhost", "--grpc-bind").unwrap_err();
+        assert!(format!("{err:#}").contains("--grpc-bind"));
+        let err = parse_bind("10.0.0.1:80", "RETRACER_REST_BIND").unwrap_err();
+        assert!(format!("{err:#}").contains("RETRACER_REST_BIND"));
+    }
+
+    #[tokio::test]
+    async fn bind_listener_names_the_surface_when_the_port_is_taken() {
+        let occupied = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind an ephemeral port");
+        let addr = occupied.local_addr().expect("local addr");
+
+        let err = bind_listener(addr, "REST")
+            .await
+            .expect_err("the port is already taken");
+        assert!(format!("{err:#}").contains("REST"));
     }
 }

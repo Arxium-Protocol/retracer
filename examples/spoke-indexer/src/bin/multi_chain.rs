@@ -37,6 +37,7 @@ async fn main() -> Result<()> {
     // Pools, migrations and the API ports are process-level, shared by every
     // chain. Connection counts are a property of the database, not of how many
     // chains you happen to follow, so they aren't multiplied per chain.
+    // `with_grpc_bind`/`with_rest_bind` default to loopback if not called.
     let mut runner = Runner::new(DATABASE_URL, 4, 16, 50051)
         .await?
         .with_rest_port(Some(8080));

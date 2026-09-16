@@ -578,19 +578,30 @@ impl Retracer for Service {
                 let lag_chain_id = lag_chain_id.clone();
                 async move {
                     match item {
-                        Ok(row) => Some(row),
+                        Ok(row) => Some(Ok(row)),
+                        // Unlike SubscribeBlocks (which replays from storage),
+                        // this stream has no local persistence to recover a
+                        // gap from — surface DataLoss so the client knows to
+                        // re-read history (`GetAccountActions`) and
+                        // resubscribe, rather than silently missing events.
                         Err(BroadcastStreamRecvError::Lagged(skipped)) => {
                             tracing::warn!(
                                 chain_id = %lag_chain_id,
                                 skipped,
                                 "SubscribeAccountActions subscriber lagged"
                             );
-                            None
+                            Some(Err(Status::data_loss(format!(
+                                "SubscribeAccountActions lagged and skipped {skipped} blocks"
+                            ))))
                         }
                     }
                 }
             })
-            .flat_map(move |row| {
+            .flat_map(move |item| {
+                let row = match item {
+                    Ok(row) => row,
+                    Err(status) => return futures::stream::iter(vec![Err(status)]),
+                };
                 let actions: Vec<Result<Action, Status>> = row
                     .actions
                     .into_iter()
@@ -636,9 +647,13 @@ fn replay_ceiling(from_height: Option<u64>, replayed_through: Option<i64>) -> i6
 
 #[cfg(test)]
 mod tests {
-    use super::{CHAIN_HEADER, ChainRuntime, Service, action_matches_address, postgres_action_cursor, public_network_tip, replay_ceiling};
+    use super::{
+        CHAIN_HEADER, ChainRuntime, Retracer, Service, SubscribeAccountActionsRequest,
+        action_matches_address, postgres_action_cursor, public_network_tip, replay_ceiling,
+    };
+    use futures::StreamExt;
     use std::sync::Arc;
-    use storage::{ActionRow, AddressExtractor, KindSchema};
+    use storage::{ActionRow, AddressExtractor, BlockRow, KindSchema};
     use tonic::Request;
 
     fn runtime(chain_id: &str) -> ChainRuntime {
@@ -812,5 +827,44 @@ mod tests {
         let action = transfer_action("sender", serde_json::json!({"to": "recipient"}));
         assert!(action_matches_address(&extractor, &action, "recipient"));
         assert!(!action_matches_address(&extractor, &action, "unrelated"));
+    }
+
+    /// A subscriber that falls behind the broadcast buffer (capacity 4 here)
+    /// must see `DataLoss`, not a silently truncated stream.
+    #[tokio::test]
+    async fn subscribe_account_actions_reports_lag_as_data_loss() {
+        let svc = service(&["hub"]);
+        let mut req = Request::new(SubscribeAccountActionsRequest {
+            address: "arx1x".to_string(),
+        });
+        req.metadata_mut().insert(CHAIN_HEADER, "hub".parse().unwrap());
+
+        let mut stream = svc
+            .subscribe_account_actions(req)
+            .await
+            .unwrap()
+            .into_inner();
+
+        let blocks_tx = svc.chains.get("hub").unwrap().blocks_tx.clone();
+        for height in 0..10 {
+            blocks_tx
+                .send(BlockRow {
+                    height,
+                    hash: format!("hash-{height}"),
+                    parent_hash: format!("hash-{}", height - 1),
+                    timestamp: 1_700_000_000 + height,
+                    proposer: None,
+                    undecoded_action_count: 0,
+                    actions: vec![],
+                })
+                .unwrap();
+        }
+
+        let err = stream
+            .next()
+            .await
+            .expect("stream must yield the lag error")
+            .expect_err("a lagged subscriber must see DataLoss");
+        assert_eq!(err.code(), tonic::Code::DataLoss);
     }
 }

@@ -115,6 +115,55 @@ impl IndexStatus {
     }
 }
 
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct TableSize {
+    pub table: String,
+    pub total_bytes: i64,
+    pub rows_estimate: i64,
+}
+
+/// Total on-disk size of the database, for a disk-growth metric/alert.
+pub async fn database_size_bytes(pool: &PgPool) -> Result<i64> {
+    let (bytes,): (i64,) = sqlx::query_as("SELECT pg_database_size(current_database())")
+        .fetch_one(pool)
+        .await?;
+    Ok(bytes)
+}
+
+/// Per-table size and row estimate for the tables this crate owns. Row counts
+/// are `pg_class.reltuples`, a planner estimate refreshed by autovacuum/analyze
+/// rather than an exact `COUNT(*)` — exact would mean a full scan of tables
+/// this is meant to monitor the growth of, which defeats the purpose.
+pub async fn table_sizes(pool: &PgPool) -> Result<Vec<TableSize>> {
+    let tables = [
+        "account_actions",
+        "action_addresses",
+        "actions",
+        "blocks",
+        "chains",
+        "ingestion_cursor",
+    ];
+    let rows: Vec<(String, i64, i64)> = sqlx::query_as(
+        "SELECT c.relname, pg_total_relation_size(c.oid), GREATEST(c.reltuples, 0)::BIGINT
+         FROM pg_class c
+         JOIN pg_namespace n ON n.oid = c.relnamespace
+         WHERE n.nspname = current_schema() AND c.relkind = 'r' AND c.relname = ANY($1)
+         ORDER BY c.relname",
+    )
+    .bind(&tables[..])
+    .fetch_all(pool)
+    .await?;
+
+    Ok(rows
+        .into_iter()
+        .map(|(table, total_bytes, rows_estimate)| TableSize {
+            table,
+            total_bytes,
+            rows_estimate,
+        })
+        .collect())
+}
+
 /// Newest-first page of blocks, without their actions.
 ///
 /// `action_count` is a correlated subquery rather than a `LEFT JOIN ... GROUP
@@ -325,24 +374,32 @@ pub struct ProposerRow {
     pub last_proposed_height: i64,
 }
 
-/// Blocks actually proposed per address within `[from_height, to_height]`,
-/// keyed by address. Companion to [`list_proposers`], scoped to a height
-/// range instead of the whole chain — the numerator side of validator
-/// uptime, where the denominator (turns *owed*) comes from the node's own
-/// `GET /validators?height=N` (see `rest-service::get_validator_uptime`;
-/// see also `Retracer_Design.md`'s boundary rules on why that computation
-/// doesn't live here).
-pub async fn count_proposers_in_range(
+/// One indexed block's height, proposer and round. The uptime endpoint
+/// (`rest-service::get_validator_uptime`) uses these rows as the numerator
+/// side of validator uptime — the denominator (turns *owed*) comes from the
+/// node's own `GET /validators?height=N`, which this crate deliberately
+/// doesn't call or replay locally.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProposedHeight {
+    pub height: i64,
+    pub proposer: String,
+    pub round: i64,
+}
+
+/// Every indexed block with a known proposer in `[from_height, to_height]`,
+/// ascending. The uptime denominator is built from these rows, so a height
+/// that is not indexed yet (or has no proposer) is never counted as owed.
+pub async fn list_proposed_heights(
     pool: &PgPool,
     chain_id: &str,
     from_height: i64,
     to_height: i64,
-) -> Result<std::collections::HashMap<String, i64>> {
-    let rows: Vec<(String, i64)> = sqlx::query_as(
-        "SELECT proposer, COUNT(*)
+) -> Result<Vec<ProposedHeight>> {
+    let rows: Vec<(i64, String, i64)> = sqlx::query_as(
+        "SELECT height, proposer, round
          FROM blocks
          WHERE chain_id = $1 AND proposer IS NOT NULL AND height BETWEEN $2 AND $3
-         GROUP BY proposer",
+         ORDER BY height",
     )
     .bind(chain_id)
     .bind(from_height)
@@ -350,7 +407,14 @@ pub async fn count_proposers_in_range(
     .fetch_all(pool)
     .await?;
 
-    Ok(rows.into_iter().collect())
+    Ok(rows
+        .into_iter()
+        .map(|(height, proposer, round)| ProposedHeight {
+            height,
+            proposer,
+            round,
+        })
+        .collect())
 }
 
 /// A block without its actions. Separate from `BlockRow` on purpose: the two
@@ -676,8 +740,8 @@ async fn insert_block_in_tx<B: IndexableBlock>(
     let hash = block.hash();
 
     let result = sqlx::query(
-        "INSERT INTO blocks (chain_id, height, hash, parent_hash, timestamp, proposer)
-         VALUES ($1, $2, $3, $4, $5, $6)
+        "INSERT INTO blocks (chain_id, height, hash, parent_hash, timestamp, proposer, round)
+         VALUES ($1, $2, $3, $4, $5, $6, $7)
          ON CONFLICT (chain_id, height) DO NOTHING",
     )
     .bind(chain_id)
@@ -688,6 +752,7 @@ async fn insert_block_in_tx<B: IndexableBlock>(
     // None for genesis, which is unsigned, and for a block from a
     // non-validator solo node. Both are real absences rather than gaps.
     .bind(block.proposer())
+    .bind(i64::from(block.round()))
     .execute(&mut **tx)
     .await?;
 

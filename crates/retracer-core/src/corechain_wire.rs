@@ -17,6 +17,7 @@ pub struct CoreChainBlock {
     timestamp: u64,
     proposer: Option<String>,
     actions: Vec<CoreChainAction>,
+    round: u32,
 }
 
 pub struct CoreChainAction {
@@ -56,6 +57,10 @@ impl IndexableBlock for CoreChainBlock {
 
     fn actions(&self) -> &[Self::Action] {
         &self.actions
+    }
+
+    fn round(&self) -> u32 {
+        self.round
     }
 }
 
@@ -380,6 +385,7 @@ fn normalize_current_block_tolerant(raw: RawBlock) -> CoreChainBlock {
             .into_iter()
             .map(normalize_raw_action_tolerant)
             .collect(),
+        round: raw.round,
     }
 }
 
@@ -484,6 +490,7 @@ fn normalize_current_block(block: Block<ActionPayload>) -> Result<CoreChainBlock
         timestamp,
         actions,
         proposer,
+        round,
         ..
     } = block;
     Ok(CoreChainBlock {
@@ -496,6 +503,7 @@ fn normalize_current_block(block: Block<ActionPayload>) -> Result<CoreChainBlock
             .into_iter()
             .map(normalize_action)
             .collect::<Result<_>>()?,
+        round,
     })
 }
 
@@ -519,6 +527,9 @@ fn normalize_legacy_block(block: LegacyBlock) -> Result<CoreChainBlock> {
             .into_iter()
             .map(normalize_legacy_action)
             .collect::<Result<_>>()?,
+        // The v0.1.x wire predates round-based backup takeover; every legacy
+        // block was produced by the primary designee.
+        round: 0,
     })
 }
 
@@ -744,6 +755,32 @@ mod tests {
             .expect("v0.1.3 fixture must decode under tolerant_decoder");
         assert_eq!(legacy.height, 42);
         assert_eq!(legacy.actions.len(), 2);
+    }
+
+    #[test]
+    fn normalize_current_block_tolerant_keeps_the_round() {
+        let sender = Address::from_pubkey_bytes(&[5u8; 32]).unwrap();
+        let raw = RawBlock {
+            height: 5,
+            parent_hash: "0xparent".to_string(),
+            timestamp: 1000,
+            actions: vec![],
+            tx_root: [1u8; 32],
+            proposer: Some(sender),
+            signature: None,
+            state_root: "0xstate".to_string(),
+            round: 3,
+            round_certificate: None,
+        };
+        let normalized = normalize_current_block_tolerant(raw);
+        assert_eq!(IndexableBlock::round(&normalized), 3);
+    }
+
+    #[test]
+    fn legacy_blocks_normalize_to_round_zero() {
+        let legacy: LegacyBlock = decode_exact(LEGACY_FIXTURE).unwrap();
+        let normalized = normalize_legacy_block(legacy).unwrap();
+        assert_eq!(IndexableBlock::round(&normalized), 0);
     }
 
     fn raw_block_with_one_action(

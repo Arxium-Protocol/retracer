@@ -115,6 +115,10 @@ jobs:
 
     env:
       DATABASE_URL: postgres://retracer:retracer@localhost:5433/retracer
+      # Without this, storage/tests/postgres.rs's `skip_without_db!` macro
+      # treats the Postgres integration tests as opt-in and silently no-ops
+      # them — `DATABASE_URL` above is only for `cargo sqlx prepare`.
+      RETRACER_TEST_DATABASE_URL: postgres://retracer:retracer@localhost:5433/retracer
 
     steps:
       - name: Check out Retracer
@@ -188,6 +192,8 @@ jobs:
 
       - name: Build retracerd (release)
         shell: bash
+        env:
+          RETRACER_VERSION: ${{ github.ref_name }}
         run: cargo build --release --locked -p retracerd
 
       - name: Package binary
@@ -201,6 +207,7 @@ jobs:
           cp kind_schema.toml "dist/${out}/"
           tar -C dist -czf "dist/${out}.tar.gz" "${out}"
           rm -rf "dist/${out}"
+          cp proto/retracer.proto "dist/retracer-${tag}.proto"
 
       # scripts/install.sh verifies the release archive against this file.
       # The binary and schema checksums are exported as well so Arxium-Ops can
@@ -214,7 +221,7 @@ jobs:
           binary_sha256="$(sha256sum target/release/retracerd | awk '{print $1}')"
           schema_sha256="$(sha256sum kind_schema.toml | awk '{print $1}')"
           cd dist
-          sha256sum *.tar.gz > SHA256SUMS
+          sha256sum *.tar.gz *.proto > SHA256SUMS
           grep -Eq "^[0-9a-f]{64}  retracerd-${GITHUB_REF_NAME}-x86_64-linux-gnu[.]tar[.]gz$" SHA256SUMS
           cat SHA256SUMS
           archive_sha256="$(awk -v f="retracerd-${GITHUB_REF_NAME}-x86_64-linux-gnu.tar.gz" \
@@ -237,7 +244,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -Eeuo pipefail
-          gh release create "${GITHUB_REF_NAME}" dist/*.tar.gz dist/SHA256SUMS \
+          gh release create "${GITHUB_REF_NAME}" dist/*.tar.gz dist/*.proto dist/SHA256SUMS \
             --repo "${GITHUB_REPOSITORY}" \
             --title "${GITHUB_REF_NAME}" \
             --generate-notes
