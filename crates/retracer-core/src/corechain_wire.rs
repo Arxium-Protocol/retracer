@@ -275,6 +275,10 @@ fn decode_sync_response_validated(bytes: &[u8]) -> Result<SyncResponse<CoreChain
         SyncResponse::Certificate { height, record } => {
             SyncResponse::Certificate { height, record }
         }
+        SyncResponse::SnapshotManifest(manifest) => SyncResponse::SnapshotManifest(manifest),
+        SyncResponse::SnapshotChunk { height, index, entries } => {
+            SyncResponse::SnapshotChunk { height, index, entries }
+        }
     })
 }
 
@@ -362,6 +366,10 @@ fn normalize_current_response_tolerant(
         SyncResponse::Hashes(hashes) => SyncResponse::Hashes(hashes),
         SyncResponse::Certificate { height, record } => {
             SyncResponse::Certificate { height, record }
+        }
+        SyncResponse::SnapshotManifest(manifest) => SyncResponse::SnapshotManifest(manifest),
+        SyncResponse::SnapshotChunk { height, index, entries } => {
+            SyncResponse::SnapshotChunk { height, index, entries }
         }
     }
 }
@@ -460,6 +468,10 @@ fn normalize_current_response(
         SyncResponse::Certificate { height, record } => {
             SyncResponse::Certificate { height, record }
         }
+        SyncResponse::SnapshotManifest(manifest) => SyncResponse::SnapshotManifest(manifest),
+        SyncResponse::SnapshotChunk { height, index, entries } => {
+            SyncResponse::SnapshotChunk { height, index, entries }
+        }
     })
 }
 
@@ -478,6 +490,10 @@ fn normalize_legacy_response(
         SyncResponse::Hashes(hashes) => SyncResponse::Hashes(hashes),
         SyncResponse::Certificate { height, record } => {
             SyncResponse::Certificate { height, record }
+        }
+        SyncResponse::SnapshotManifest(manifest) => SyncResponse::SnapshotManifest(manifest),
+        SyncResponse::SnapshotChunk { height, index, entries } => {
+            SyncResponse::SnapshotChunk { height, index, entries }
         }
     })
 }

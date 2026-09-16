@@ -272,12 +272,21 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d3fb67a6e08acf24fdeccbac2cb6ac4305825bd1f117462e0e6f2f193345ad56"
 
 [[package]]
+name = "arxd-payload"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "xc-primitives",
+]
+
+[[package]]
 name = "arxd-runtime"
 version = "0.1.0"
 dependencies = [
  "anyhow",
  "ark-bls12-381",
  "ark-serialize",
+ "arxd-payload",
  "bincode",
  "blst",
  "circuit-account",
@@ -1978,6 +1987,7 @@ dependencies = [
  "thiserror",
  "tracing",
  "xc-bls",
+ "xc-circuit",
  "xc-poe",
  "xc-primitives",
  "xc-storage",

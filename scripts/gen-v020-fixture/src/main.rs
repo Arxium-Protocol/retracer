@@ -110,15 +110,17 @@ fn main() {
         action(ActionPayload::RegisterAttestor {
             attestor: addr(0x06),
             name: "n".to_string(),
+            reason: "r".to_string(),
         }),
         action(ActionPayload::DeregisterAttestor {
             attestor: addr(0x06),
+            reason: "r".to_string(),
         }),
         action(ActionPayload::SubmitExecutionFault {
             artifact_json: "{}".to_string(),
         }),
-        action(ActionPayload::FreezeAsset { asset: asset() }),
-        action(ActionPayload::UnfreezeAsset { asset: asset() }),
+        action(ActionPayload::FreezeAsset { asset: asset(), reason: "r".to_string() }),
+        action(ActionPayload::UnfreezeAsset { asset: asset(), reason: "r".to_string() }),
         action(ActionPayload::ForcedTransfer {
             asset: asset(),
             from: addr(0x04),
