@@ -241,6 +241,9 @@ below — the intent is to measure growth, not prune it). It requires the same
 ```yaml
 scrape_configs:
   - job_name: retracer
+    # Each scrape re-runs the database and per-table size queries; don't
+    # inherit a sub-second global interval meant for cheaper endpoints.
+    scrape_interval: 30s
     static_configs:
       - targets: ["127.0.0.1:8080"]
     authorization:
@@ -252,6 +255,9 @@ Starter alerts:
 ```yaml
 - alert: RetracerDown
   expr: up{job="retracer"} == 0
+  for: 2m
+- alert: RetracerDatabaseDown   # up==1 alone misses this: a DB outage still
+  expr: retracer_database_up == 0   # returns 200 with retracer_database_up 0
   for: 2m
 - alert: RetracerLagging
   expr: retracer_blocks_behind > 30

@@ -374,13 +374,11 @@ pub struct ProposerRow {
     pub last_proposed_height: i64,
 }
 
-/// Blocks actually proposed per address within `[from_height, to_height]`,
-/// keyed by address. Companion to [`list_proposers`], scoped to a height
-/// range instead of the whole chain — the numerator side of validator
-/// uptime, where the denominator (turns *owed*) comes from the node's own
-/// `GET /validators?height=N` (see `rest-service::get_validator_uptime`;
-/// see also `Retracer_Design.md`'s boundary rules on why that computation
-/// doesn't live here).
+/// One indexed block's height, proposer and round. The uptime endpoint
+/// (`rest-service::get_validator_uptime`) uses these rows as the numerator
+/// side of validator uptime — the denominator (turns *owed*) comes from the
+/// node's own `GET /validators?height=N`, which this crate deliberately
+/// doesn't call or replay locally.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProposedHeight {
     pub height: i64,

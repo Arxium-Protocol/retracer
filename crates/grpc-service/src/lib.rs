@@ -830,8 +830,7 @@ mod tests {
     }
 
     /// A subscriber that falls behind the broadcast buffer (capacity 4 here)
-    /// must see `DataLoss`, not a silently truncated stream — see T5 in
-    /// `Retracer_Tasks.md`.
+    /// must see `DataLoss`, not a silently truncated stream.
     #[tokio::test]
     async fn subscribe_account_actions_reports_lag_as_data_loss() {
         let svc = service(&["hub"]);

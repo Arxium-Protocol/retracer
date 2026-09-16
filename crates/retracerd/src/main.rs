@@ -9,11 +9,16 @@ async fn main() -> Result<()> {
         if first == "-h" || first == "--help" {
             print!("{}", retracer_core::USAGE);
         } else {
-            // Release builds set RETRACER_VERSION to the tag; local builds fall back.
-            println!(
-                "retracerd {}",
-                option_env!("RETRACER_VERSION").unwrap_or(env!("CARGO_PKG_VERSION"))
-            );
+            // Release builds set RETRACER_VERSION to the tag. A local build has
+            // no tag to report — CARGO_PKG_VERSION is not bumped per release —
+            // so say so explicitly rather than print a stale-looking "0.1.0".
+            match option_env!("RETRACER_VERSION") {
+                Some(tag) => println!("retracerd {tag}"),
+                None => println!(
+                    "retracerd {} (dev build, not a release)",
+                    env!("CARGO_PKG_VERSION")
+                ),
+            }
         }
         return Ok(());
     }
