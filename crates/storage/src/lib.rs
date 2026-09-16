@@ -115,6 +115,55 @@ impl IndexStatus {
     }
 }
 
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct TableSize {
+    pub table: String,
+    pub total_bytes: i64,
+    pub rows_estimate: i64,
+}
+
+/// Total on-disk size of the database, for a disk-growth metric/alert.
+pub async fn database_size_bytes(pool: &PgPool) -> Result<i64> {
+    let (bytes,): (i64,) = sqlx::query_as("SELECT pg_database_size(current_database())")
+        .fetch_one(pool)
+        .await?;
+    Ok(bytes)
+}
+
+/// Per-table size and row estimate for the tables this crate owns. Row counts
+/// are `pg_class.reltuples`, a planner estimate refreshed by autovacuum/analyze
+/// rather than an exact `COUNT(*)` — exact would mean a full scan of tables
+/// this is meant to monitor the growth of, which defeats the purpose.
+pub async fn table_sizes(pool: &PgPool) -> Result<Vec<TableSize>> {
+    let tables = [
+        "account_actions",
+        "action_addresses",
+        "actions",
+        "blocks",
+        "chains",
+        "ingestion_cursor",
+    ];
+    let rows: Vec<(String, i64, i64)> = sqlx::query_as(
+        "SELECT c.relname, pg_total_relation_size(c.oid), GREATEST(c.reltuples, 0)::BIGINT
+         FROM pg_class c
+         JOIN pg_namespace n ON n.oid = c.relnamespace
+         WHERE n.nspname = current_schema() AND c.relkind = 'r' AND c.relname = ANY($1)
+         ORDER BY c.relname",
+    )
+    .bind(&tables[..])
+    .fetch_all(pool)
+    .await?;
+
+    Ok(rows
+        .into_iter()
+        .map(|(table, total_bytes, rows_estimate)| TableSize {
+            table,
+            total_bytes,
+            rows_estimate,
+        })
+        .collect())
+}
+
 /// Newest-first page of blocks, without their actions.
 ///
 /// `action_count` is a correlated subquery rather than a `LEFT JOIN ... GROUP

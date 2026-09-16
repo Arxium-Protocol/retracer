@@ -579,3 +579,18 @@ async fn insert_block_persists_round() {
             .expect("select round");
     assert_eq!(round, 2);
 }
+
+#[tokio::test]
+async fn table_sizes_and_database_size_report_every_table() {
+    let pool = skip_without_db!();
+
+    let sizes = storage::table_sizes(&pool)
+        .await
+        .expect("table sizes query");
+    assert_eq!(sizes.len(), 6);
+
+    let db_size = storage::database_size_bytes(&pool)
+        .await
+        .expect("database size query");
+    assert!(db_size > 0);
+}

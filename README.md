@@ -159,6 +159,7 @@ serves.
 ```
 GET  /health
 GET  /ready
+GET  /metrics
 GET  /v1/chains
 
 GET  /v1/chains/{chain}/status
@@ -183,6 +184,11 @@ connected peer plus an indexed cursor caught up to that tip. Its database work
 has a fixed timeout; otherwise it returns 503 with per-chain dependency state.
 Both probes stay open when inbound API authentication is enabled, while
 configured rate limiting still applies to `/ready` (but never `/health`).
+
+`/metrics` is Prometheus text exposition, unlike `/health` and `/ready` it
+stays behind `--auth-token`/`--rate-limit-rps` like every other route. A
+database failure still returns 200 with `retracer_database_up 0`, so a scrape
+always has a body to alert on. See [Monitoring](#monitoring) below.
 
 Pages are newest-first and cap at 100. Action cursors are a
 `(before_height, before_index)` pair and both halves must be sent together — a
@@ -221,6 +227,41 @@ grpcurl -plaintext -proto proto/retracer.proto \
   -H 'x-chain-id: corechain-devnet' \
   -d '{"height": 1}' \
   localhost:50051 retracer.Retracer/GetBlock
+```
+
+---
+
+## Monitoring
+
+`GET /metrics` is Prometheus text: per-chain lag and finality, plus database
+and per-table size (see [What it deliberately doesn't do](#what-it-deliberately-doesnt-do)
+below — the intent is to measure growth, not prune it). It requires the same
+`--auth-token` as every other route once one is set.
+
+```yaml
+scrape_configs:
+  - job_name: retracer
+    static_configs:
+      - targets: ["127.0.0.1:8080"]
+    authorization:
+      credentials_file: /etc/retracer/metrics-token
+```
+
+Starter alerts:
+
+```yaml
+- alert: RetracerDown
+  expr: up{job="retracer"} == 0
+  for: 2m
+- alert: RetracerLagging
+  expr: retracer_blocks_behind > 30
+  for: 5m
+- alert: RetracerChainStalled   # node stopped producing, lag stays 0
+  expr: retracer_tip_age_seconds > 120
+  for: 5m
+- alert: RetracerDiskGrowth     # set the budget to the host's disk allowance
+  expr: predict_linear(retracer_database_size_bytes[6h], 7 * 24 * 3600) > 20e9
+  for: 30m
 ```
 
 ---

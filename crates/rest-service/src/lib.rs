@@ -24,7 +24,7 @@ use sqlx::PgPool;
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use storage::AddressValidator;
 
 #[derive(Clone, PartialEq, Eq)]
@@ -204,6 +204,7 @@ pub fn router(pool: PgPool, chains: Vec<RestChain>) -> Router {
         .route("/v1/chains/{chain_id}/search", get(search))
         .route("/health", get(health))
         .route("/ready", get(readiness))
+        .route("/metrics", get(metrics))
         .with_state(state)
 }
 
@@ -374,6 +375,223 @@ fn readiness_status(report: &Readiness) -> StatusCode {
     } else {
         StatusCode::SERVICE_UNAVAILABLE
     }
+}
+
+/// Prometheus text exposition. Unlike `/ready`, a database failure here still
+/// returns 200 with `retracer_database_up 0` and whatever chain gauges don't
+/// need Postgres — a monitoring scrape should always get a body to alert on,
+/// not a 503 that looks identical to "server is down".
+async fn metrics(State(state): State<AppState>) -> Response {
+    let now_unix = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+
+    let db_check = bounded_db_check(READINESS_DB_TIMEOUT, async {
+        let statuses = load_index_statuses(&state.pool, &state.chains).await?;
+        let db_size = storage::database_size_bytes(&state.pool).await?;
+        let table_sizes = storage::table_sizes(&state.pool).await?;
+        Ok::<_, anyhow::Error>((statuses, db_size, table_sizes))
+    })
+    .await;
+
+    let (statuses, db) = match db_check {
+        DbCheck::Ready((statuses, size, tables)) => (Some(statuses), Some((size, tables))),
+        DbCheck::Failed(error) => {
+            tracing::error!("metrics database check failed: {error:#}");
+            (None, None)
+        }
+        DbCheck::TimedOut => {
+            tracing::warn!("metrics database check timed out");
+            (None, None)
+        }
+    };
+
+    let body = render_metrics(
+        &state.chains,
+        statuses.as_ref(),
+        db.as_ref().map(|(size, tables)| (*size, tables.as_slice())),
+        now_unix,
+    );
+    (
+        [(
+            axum::http::header::CONTENT_TYPE,
+            "text/plain; version=0.0.4; charset=utf-8",
+        )],
+        body,
+    )
+        .into_response()
+}
+
+struct ChainMetrics {
+    chain_id: String,
+    indexed_height: Option<i64>,
+    node_tip_height: Option<u64>,
+    blocks_behind: Option<i64>,
+    finalized_height: Option<u64>,
+    tip_age_seconds: Option<i64>,
+    network_fresh: bool,
+}
+
+fn render_metrics(
+    chains: &[RestChain],
+    statuses: Option<&HashMap<String, storage::IndexStatus>>,
+    db: Option<(i64, &[storage::TableSize])>,
+    now_unix: i64,
+) -> String {
+    let mut out = String::new();
+
+    out.push_str("# HELP retracer_database_up Whether the last database check for this scrape succeeded.\n");
+    out.push_str("# TYPE retracer_database_up gauge\n");
+    out.push_str(&format!(
+        "retracer_database_up {}\n",
+        if db.is_some() { 1 } else { 0 }
+    ));
+
+    if let Some((size, tables)) = db {
+        out.push_str("# HELP retracer_database_size_bytes Total on-disk size of the database.\n");
+        out.push_str("# TYPE retracer_database_size_bytes gauge\n");
+        out.push_str(&format!("retracer_database_size_bytes {size}\n"));
+
+        out.push_str(
+            "# HELP retracer_table_size_bytes Total on-disk size of one table, including indexes.\n",
+        );
+        out.push_str("# TYPE retracer_table_size_bytes gauge\n");
+        for table in tables {
+            out.push_str(&format!(
+                "retracer_table_size_bytes{{table=\"{}\"}} {}\n",
+                escape_label(&table.table),
+                table.total_bytes
+            ));
+        }
+
+        out.push_str(
+            "# HELP retracer_table_rows_estimate Planner row-count estimate for one table.\n",
+        );
+        out.push_str("# TYPE retracer_table_rows_estimate gauge\n");
+        for table in tables {
+            out.push_str(&format!(
+                "retracer_table_rows_estimate{{table=\"{}\"}} {}\n",
+                escape_label(&table.table),
+                table.rows_estimate
+            ));
+        }
+    }
+
+    let per_chain: Vec<ChainMetrics> = chains
+        .iter()
+        .map(|chain| {
+            let network = *chain.network_view.borrow();
+            let network_fresh = network.has_fresh_status();
+            let fresh_tip = if network_fresh {
+                network.tip_height
+            } else {
+                None
+            };
+            let status = statuses
+                .and_then(|m| m.get(&chain.chain_id))
+                .copied()
+                .map(|status| status.with_network_tip(fresh_tip));
+            ChainMetrics {
+                chain_id: chain.chain_id.clone(),
+                indexed_height: status.and_then(|s| s.indexed_height),
+                node_tip_height: fresh_tip,
+                blocks_behind: status.and_then(|s| s.blocks_behind),
+                finalized_height: network.finalized_height,
+                tip_age_seconds: status
+                    .and_then(|s| s.tip_timestamp)
+                    .map(|ts| now_unix - ts),
+                network_fresh,
+            }
+        })
+        .collect();
+
+    out.push_str("# HELP retracer_indexed_height Highest block height written to storage.\n");
+    out.push_str("# TYPE retracer_indexed_height gauge\n");
+    for chain in &per_chain {
+        if let Some(height) = chain.indexed_height {
+            out.push_str(&format!(
+                "retracer_indexed_height{{chain_id=\"{}\"}} {height}\n",
+                escape_label(&chain.chain_id)
+            ));
+        }
+    }
+
+    out.push_str(
+        "# HELP retracer_node_tip_height Highest tip height reported by a currently connected, fresh peer.\n",
+    );
+    out.push_str("# TYPE retracer_node_tip_height gauge\n");
+    for chain in &per_chain {
+        if let Some(height) = chain.node_tip_height {
+            out.push_str(&format!(
+                "retracer_node_tip_height{{chain_id=\"{}\"}} {height}\n",
+                escape_label(&chain.chain_id)
+            ));
+        }
+    }
+
+    out.push_str(
+        "# HELP retracer_blocks_behind Gap between the indexed height and the network tip.\n",
+    );
+    out.push_str("# TYPE retracer_blocks_behind gauge\n");
+    for chain in &per_chain {
+        if let Some(behind) = chain.blocks_behind {
+            out.push_str(&format!(
+                "retracer_blocks_behind{{chain_id=\"{}\"}} {behind}\n",
+                escape_label(&chain.chain_id)
+            ));
+        }
+    }
+
+    out.push_str(
+        "# HELP retracer_finalized_height Highest height a connected peer holds a finality certificate for.\n",
+    );
+    out.push_str("# TYPE retracer_finalized_height gauge\n");
+    for chain in &per_chain {
+        if let Some(height) = chain.finalized_height {
+            out.push_str(&format!(
+                "retracer_finalized_height{{chain_id=\"{}\"}} {height}\n",
+                escape_label(&chain.chain_id)
+            ));
+        }
+    }
+
+    out.push_str(
+        "# HELP retracer_tip_age_seconds Age in seconds of the indexed tip's own on-chain timestamp.\n",
+    );
+    out.push_str("# TYPE retracer_tip_age_seconds gauge\n");
+    for chain in &per_chain {
+        if let Some(age) = chain.tip_age_seconds {
+            out.push_str(&format!(
+                "retracer_tip_age_seconds{{chain_id=\"{}\"}} {age}\n",
+                escape_label(&chain.chain_id)
+            ));
+        }
+    }
+
+    out.push_str(
+        "# HELP retracer_network_fresh Whether this chain's network view is fresh (1) or stale/absent (0).\n",
+    );
+    out.push_str("# TYPE retracer_network_fresh gauge\n");
+    for chain in &per_chain {
+        out.push_str(&format!(
+            "retracer_network_fresh{{chain_id=\"{}\"}} {}\n",
+            escape_label(&chain.chain_id),
+            i32::from(chain.network_fresh)
+        ));
+    }
+
+    out
+}
+
+/// Escapes a Prometheus label value per the text exposition format: a
+/// backslash or double quote must be escaped, and a literal newline is not
+/// allowed at all.
+fn escape_label(value: &str) -> String {
+    value
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\n', "\\n")
 }
 
 #[derive(Serialize)]
@@ -1126,6 +1344,34 @@ mod tests {
             readiness_status(&database_down),
             StatusCode::SERVICE_UNAVAILABLE
         );
+    }
+
+    #[test]
+    fn render_metrics_reports_lag_and_omits_absent_gauges_when_db_is_down() {
+        let chain = rest_chain(fresh_network(4));
+        let body = render_metrics(&[chain], Some(&statuses(Some(3))), None, 1_000);
+
+        assert!(body.contains("retracer_database_up 0"));
+        assert!(body.contains("retracer_indexed_height{chain_id=\"test-chain\"} 3"));
+        assert!(body.contains("retracer_blocks_behind{chain_id=\"test-chain\"} 1"));
+        assert!(
+            !body.contains("retracer_finalized_height{"),
+            "finalized_height must be omitted when the network view has none: {body}"
+        );
+
+        for line in body.lines().filter(|l| l.starts_with("# TYPE")) {
+            assert_eq!(
+                body.matches(line).count(),
+                1,
+                "TYPE line appeared more than once: {line}"
+            );
+        }
+    }
+
+    #[test]
+    fn escape_label_escapes_backslash_quote_and_newline() {
+        assert_eq!(escape_label("a\"b\\c"), "a\\\"b\\\\c");
+        assert_eq!(escape_label("line1\nline2"), "line1\\nline2");
     }
 
     #[tokio::test]
