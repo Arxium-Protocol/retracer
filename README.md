@@ -30,7 +30,7 @@ your bootnodes/database URL/auth token, and offers to install it as a
 systemd service. Read it before piping to `bash` if you'd rather:
 
 ```bash
-curl -fsSL .../install.sh -o install.sh && less install.sh && bash install.sh
+curl -fsSL https://raw.githubusercontent.com/Arxium-Protocol/retracer/main/scripts/install.sh -o install.sh && less install.sh && bash install.sh
 ```
 
 Non-interactive install with defaults: `install.sh --yes`. See
@@ -57,6 +57,8 @@ cargo run -p retracerd -- \
   --bootnodes /ip4/127.0.0.1/tcp/30334/p2p/<peer-id> \
   --database-url postgres://retracer:retracer@localhost:5433/retracer
 ```
+
+See every flag with `cargo run -p retracerd -- --help`.
 
 Migrations run automatically on startup against whatever database you pointed
 `--database-url` at. You now have:
@@ -189,7 +191,7 @@ rest of one.
 
 ```bash
 curl "localhost:8080/v1/chains/corechain-devnet/blocks?limit=5"
-curl "localhost:8080/v1/chains/corechain-devnet/accounts/arx1.../actions?role=to"
+curl "localhost:8080/v1/chains/corechain-devnet/accounts/<address>/actions?role=to"
 curl "localhost:8080/v1/chains/corechain-devnet/search?q=42"
 ```
 
@@ -256,8 +258,8 @@ Removing an entry doesn't drop its index — do that with `DROP INDEX` when you
 mean it.
 
 For roles a dotted path can't express (conditional or computed), implement
-`storage::ActionIndexable` in Rust and pass it to `run`. See
-[Design notes](../Retracer_Design.md#tier-a--tier-b-address-extraction).
+`storage::ActionIndexable` in Rust and pass it to `run`. See the
+`ActionIndexable` rustdoc (`cargo doc -p storage --open`).
 
 ---
 
@@ -304,7 +306,7 @@ they share one database and one API endpoint.
 
 If your chain *isn't* on the Arxium stack, implement `storage::IndexableBlock`
 and `ingestion::HasHeight` for your own block type — see
-[Design notes](../Retracer_Design.md#following-a-different-chain).
+[`crates/storage/src/wire.rs`](crates/storage/src/wire.rs).
 
 ---
 
@@ -341,8 +343,6 @@ and `ingestion::HasHeight` for your own block type — see
   `Authorization: Bearer` secret) and `--rate-limit-rps`/
   `RETRACER_RATE_LIMIT_RPS` (per-IP), enforced identically on both the gRPC
   and REST surfaces. `/health` stays open for liveness probes either way.
-
-Reasoning for each is in [Design notes](../Retracer_Design.md#boundary-rules).
 
 ---
 
@@ -400,6 +400,6 @@ SQLx verifies applied migrations by hashing their exact bytes.
 
 | | |
 | --- | --- |
-| [Design notes](../Retracer_Design.md) | Why it's built this way, boundary rules, internals |
-| [Open items](../Retracer_OpenItems.md) | Known gaps and deferred work |
-| `../Implementation_log_*.md` | Change history |
+| `cargo doc --workspace --open` | Rustdoc for every crate: internals, boundary rules, module docs |
+| [`examples/spoke-indexer/README.md`](examples/spoke-indexer/README.md) | Worked multi-chain example |
+| [`proto/retracer.proto`](proto/retracer.proto) | The gRPC schema |

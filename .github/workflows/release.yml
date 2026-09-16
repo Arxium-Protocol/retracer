@@ -192,6 +192,8 @@ jobs:
 
       - name: Build retracerd (release)
         shell: bash
+        env:
+          RETRACER_VERSION: ${{ github.ref_name }}
         run: cargo build --release --locked -p retracerd
 
       - name: Package binary

@@ -200,6 +200,68 @@ fn validate_rate_limit_rps(rps: u32, source: &str) -> Result<()> {
     Ok(())
 }
 
+/// `retracerd --help` text. Kept in sync with `parse_args`'s match arms by
+/// the `usage_lists_every_flag` test below — add a flag to both or neither.
+pub const USAGE: &str = "\
+retracerd - a Retracer indexer for one chain
+
+USAGE:
+    retracerd [OPTIONS]
+
+OPTIONS:
+    --bootnodes <multiaddrs>       Comma-separated peer multiaddrs to dial on startup.
+                                   [default: none] [env: RETRACER_BOOTNODES]
+    --port <u16>                   P2P listen port; 0 picks a free one.
+                                   [default: 0]
+    --database-url <url>           Postgres connection string.
+                                   [default: postgres://retracer:retracer@localhost:5433/retracer]
+                                   [env: RETRACER_DATABASE_URL]
+    --chain-id <string>            Label for this chain's rows; not read off the wire.
+                                   [default: corechain-devnet]
+    --rest-port <u16>              HTTP API port; 0 disables it.
+                                   [default: 8080]
+    --grpc-port <u16>              gRPC API port.
+                                   [default: 50051]
+    --grpc-bind <ip>               Interface the gRPC surface listens on.
+                                   [default: 127.0.0.1] [env: RETRACER_GRPC_BIND]
+    --rest-bind <ip>               Interface the REST surface listens on.
+                                   [default: 127.0.0.1] [env: RETRACER_REST_BIND]
+    --kind-schema <path>           Payload field configuration file.
+                                   [default: kind_schema.toml]
+    --blocks-topic <topic>         Must match the node's gossip topic.
+                                   [default: derived from --chain-id]
+    --sync-protocol <protocol>     Must match the node's sync protocol.
+                                   [default: derived from --chain-id]
+    --max-pending-blocks <usize>   Gap-fill buffer cap; must be at least 1.
+                                   [default: 4096]
+    --write-pool-size <u32>        Postgres connections for the writer; must be at least 1.
+                                   [default: 4]
+    --read-pool-size <u32>        Postgres connections for reads; must be at least 1.
+                                   [default: 16]
+    --finality-depth <u64>         Fallback rollback limit, used only when the node reports no
+                                   finality.
+                                   [default: 250]
+    --node-rpc-url <url>           This chain's node HTTP RPC base URL. Only used for the
+                                   validator-uptime endpoint; unset disables it.
+                                   [default: none] [env: RETRACER_NODE_RPC_URL]
+    --node-rpc-token <token>       Bearer token sent on every HTTP request to this chain's node
+                                   RPC. Prefer RETRACER_NODE_RPC_TOKEN so the value is not
+                                   visible in process arguments.
+                                   [default: none] [env: RETRACER_NODE_RPC_TOKEN]
+    --auth-token <token>           Shared secret required as \"Authorization: Bearer <token>\" on
+                                   both API surfaces (/health and /ready stay open). Unset means
+                                   both surfaces stay open to anyone who can reach them.
+                                   [default: none] [env: RETRACER_AUTH_TOKEN]
+    --rate-limit-rps <u32>         Per-IP request budget, both surfaces. Unset disables rate
+                                   limiting.
+                                   [default: none] [env: RETRACER_RATE_LIMIT_RPS]
+    --trusted-proxies <list>       Comma-separated IPs/CIDRs whose X-Forwarded-For the limiter
+                                   may believe. Unset means the socket peer is always the client.
+                                   [default: none] [env: RETRACER_TRUSTED_PROXIES]
+    -h, --help                     Print this help and exit.
+    -V, --version                  Print the version and exit.
+";
+
 /// Minimal manual flag parsing — a handful of flags, not worth a clap
 /// dependency for. Describes exactly one chain; multi-chain deployments build
 /// [`ChainConfig`]s themselves and drive a [`Runner`], because each chain needs
@@ -370,7 +432,7 @@ pub fn parse_args() -> Result<Args> {
                         .map_err(|err| anyhow::anyhow!("--trusted-proxies: {err}"))?,
                 );
             }
-            other => anyhow::bail!("unknown flag: {other}"),
+            other => anyhow::bail!("unknown flag: {other} (run with --help to list flags)"),
         }
     }
     let blocks_topic = blocks_topic.unwrap_or_else(|| ingestion::default_blocks_topic(&chain_id));
@@ -1155,6 +1217,41 @@ async fn durable_tip(pool: &sqlx::PgPool, chain_id: &str) -> Option<Tip> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every flag `parse_args` matches on, kept in sync with `USAGE` by this
+    /// test — add a flag to both `parse_args`'s match arms and here, or
+    /// neither.
+    const FLAGS: &[&str] = &[
+        "--bootnodes",
+        "--port",
+        "--database-url",
+        "--chain-id",
+        "--rest-port",
+        "--grpc-port",
+        "--grpc-bind",
+        "--rest-bind",
+        "--kind-schema",
+        "--blocks-topic",
+        "--sync-protocol",
+        "--max-pending-blocks",
+        "--write-pool-size",
+        "--read-pool-size",
+        "--finality-depth",
+        "--node-rpc-url",
+        "--node-rpc-token",
+        "--auth-token",
+        "--rate-limit-rps",
+        "--trusted-proxies",
+    ];
+
+    #[test]
+    fn usage_lists_every_flag() {
+        for flag in FLAGS {
+            assert!(USAGE.contains(flag), "USAGE is missing {flag}");
+        }
+        assert!(USAGE.contains("--help"));
+        assert!(USAGE.contains("--version"));
+    }
 
     #[test]
     fn rate_limit_parsing_accepts_sane_values() {

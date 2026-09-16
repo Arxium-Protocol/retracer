@@ -4,6 +4,20 @@ use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    let mut argv = std::env::args().skip(1);
+    if let Some(first) = argv.find(|a| matches!(a.as_str(), "-h" | "--help" | "-V" | "--version")) {
+        if first == "-h" || first == "--help" {
+            print!("{}", retracer_core::USAGE);
+        } else {
+            // Release builds set RETRACER_VERSION to the tag; local builds fall back.
+            println!(
+                "retracerd {}",
+                option_env!("RETRACER_VERSION").unwrap_or(env!("CARGO_PKG_VERSION"))
+            );
+        }
+        return Ok(());
+    }
+
     // Missing .env is fine — flags and the hardcoded defaults still work; this
     // only saves builders from retyping --database-url/--bootnodes every run.
     dotenvy::dotenv().ok();
