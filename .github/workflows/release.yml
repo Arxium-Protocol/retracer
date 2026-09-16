@@ -115,6 +115,10 @@ jobs:
 
     env:
       DATABASE_URL: postgres://retracer:retracer@localhost:5433/retracer
+      # Without this, storage/tests/postgres.rs's `skip_without_db!` macro
+      # treats the Postgres integration tests as opt-in and silently no-ops
+      # them — `DATABASE_URL` above is only for `cargo sqlx prepare`.
+      RETRACER_TEST_DATABASE_URL: postgres://retracer:retracer@localhost:5433/retracer
 
     steps:
       - name: Check out Retracer
