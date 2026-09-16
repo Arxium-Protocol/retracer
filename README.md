@@ -205,6 +205,13 @@ HTTP, plus two server-streaming RPCs HTTP doesn't offer:
 - `SubscribeAccountActions` — live tail of any action where an address holds a
   role (sender, recipient, or any role your schema defines).
 
+Both streams can fall behind the broadcast buffer if a subscriber reads too
+slowly. When that happens the stream ends with a `DataLoss` status rather than
+silently skipping the gap. `SubscribeBlocks` clients should resubscribe with
+`from_height` set to resume the replay. `SubscribeAccountActions` has no
+replay of its own — read the missed history with `GetAccountActions`, then
+resubscribe.
+
 The chain is selected by the `x-chain-id` header; omit it for the default chain.
 
 ```bash
