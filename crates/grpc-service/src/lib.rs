@@ -451,7 +451,7 @@ impl Retracer for Service {
             }
         };
 
-        let rows = storage::list_actions(&self.pool, &chain.chain_id, limit as i64, before)
+        let rows = storage::list_actions(&self.pool, &chain.chain_id, limit as i64, before, None)
             .await
             .map_err(|err| Status::internal(err.to_string()))?;
 

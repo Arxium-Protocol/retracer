@@ -214,32 +214,64 @@ pub async fn list_blocks(
 /// Height alone would be wrong in both directions: a block holding more than
 /// one action would either repeat its remaining actions on the next page (with
 /// `<=`) or skip them (with `<`), and both look like ordinary output.
+///
+/// `filter` narrows by `kind`, and optionally by one declared payload
+/// projection — the same expression `create_projection_indexes` built an index
+/// for, so the filter is an index scan rather than a JSONB crawl.
 pub async fn list_actions(
     pool: &PgPool,
     chain_id: &str,
     limit: i64,
     before: Option<(i64, i32)>,
+    filter: Option<&ActionFilter<'_>>,
 ) -> Result<Vec<ActionRow>> {
     let (before_height, before_index) = match before {
         Some((h, i)) => (Some(h), Some(i)),
         None => (None, None),
     };
 
-    Ok(sqlx::query_as(
+    // The projection fragment is interpolated, not bound: the accessor and
+    // cast were validated at schema parse time and are the exact text the
+    // partial index was created with, so the planner can match it. The
+    // *value* is always a bind parameter.
+    let projection_clause = match filter.and_then(|f| f.projection) {
+        Some(projection) => format!(
+            " AND (({accessor})::{cast}) = ($6::TEXT)::{cast}",
+            accessor = projection.json_accessor(),
+            cast = projection.ty.sql_cast()
+        ),
+        None => String::new(),
+    };
+    let sql = format!(
         "SELECT action_hash, block_height, index_in_block, kind, from_address, payload
          FROM actions
          WHERE chain_id = $1
            AND ($2::BIGINT IS NULL
                 OR (block_height, index_in_block) < ($2::BIGINT, $3::INT))
+           AND ($5::TEXT IS NULL OR kind = $5::TEXT){projection_clause}
          ORDER BY block_height DESC, index_in_block DESC
-         LIMIT $4",
-    )
-    .bind(chain_id)
-    .bind(before_height)
-    .bind(before_index)
-    .bind(limit)
-    .fetch_all(pool)
-    .await?)
+         LIMIT $4"
+    );
+
+    Ok(sqlx::query_as(&sql)
+        .bind(chain_id)
+        .bind(before_height)
+        .bind(before_index)
+        .bind(limit)
+        .bind(filter.map(|f| f.kind))
+        .bind(filter.and_then(|f| f.value))
+        .fetch_all(pool)
+        .await?)
+}
+
+/// A `kind` restriction, optionally with one projected payload field equal
+/// to `value`. `projection` must be one of the chain's declared projections
+/// for that `kind` — the caller looks it up; this type never builds one from
+/// user input.
+pub struct ActionFilter<'a> {
+    pub kind: &'a str,
+    pub projection: Option<&'a Projection>,
+    pub value: Option<&'a str>,
 }
 
 /// Aggregates over the whole index.
@@ -449,6 +481,71 @@ pub async fn get_block_hash(pool: &PgPool, chain_id: &str, height: i64) -> Resul
 /// `ingestion_cursor`. Idempotent (`ON CONFLICT DO NOTHING`/guarded update)
 /// so re-delivery of an already-seen block is a no-op rather than an error.
 /// Confirmed on write, no provisional/finality state — see plan.md §6.
+/// Re-runs role extraction over every stored action and adds any
+/// `action_addresses` rows the current schema implies that are missing —
+/// what you run after adding a role to `kind_schema.toml`, since ingestion
+/// only extracts at insert time. Purely additive: a role *removed* from the
+/// schema leaves its old rows in place (dropping them is a deliberate
+/// `DELETE ... WHERE role = ...`). Pages by `(block_height, index_in_block)`
+/// so memory stays flat on a chain with millions of actions. Returns the
+/// number of rows added.
+pub async fn reindex_action_addresses(
+    pool: &PgPool,
+    chain_id: &str,
+    extractor: &AddressExtractor,
+) -> Result<u64> {
+    const PAGE: i64 = 5_000;
+    let mut after: (i64, i32) = (-1, -1);
+    let mut added = 0u64;
+    loop {
+        let rows: Vec<(String, i64, i32, String, serde_json::Value)> = sqlx::query_as(
+            "SELECT action_hash, block_height, index_in_block, kind, payload
+             FROM actions
+             WHERE chain_id = $1 AND (block_height, index_in_block) > ($2, $3)
+             ORDER BY block_height, index_in_block
+             LIMIT $4",
+        )
+        .bind(chain_id)
+        .bind(after.0)
+        .bind(after.1)
+        .bind(PAGE)
+        .fetch_all(pool)
+        .await?;
+        let Some(last) = rows.last() else { break };
+        after = (last.1, last.2);
+
+        let (mut hashes, mut heights, mut addresses, mut roles) =
+            (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        for (action_hash, height, _, kind, payload) in &rows {
+            for (address, role) in extractor.resolve(kind, payload) {
+                hashes.push(action_hash.clone());
+                heights.push(*height);
+                addresses.push(address);
+                roles.push(role.as_str().to_string());
+            }
+        }
+        if !hashes.is_empty() {
+            let result = sqlx::query(
+                "INSERT INTO action_addresses (chain_id, action_hash, address, role, block_height)
+                 SELECT $1, u.action_hash, u.address, u.role, u.block_height
+                 FROM UNNEST($2::TEXT[], $3::TEXT[], $4::TEXT[], $5::BIGINT[])
+                      AS u(action_hash, address, role, block_height)
+                 ON CONFLICT DO NOTHING",
+            )
+            .bind(chain_id)
+            .bind(&hashes[..])
+            .bind(&addresses[..])
+            .bind(&roles[..])
+            .bind(&heights[..])
+            .execute(pool)
+            .await?;
+            added += result.rows_affected();
+        }
+        tracing::info!(chain_id, through_height = after.0, added, "reindexing action_addresses");
+    }
+    Ok(added)
+}
+
 /// Creates a Postgres expression index for each projection the chain's
 /// `kind_schema.toml` declares, so a builder can filter on a payload field
 /// without that field ever becoming a column.

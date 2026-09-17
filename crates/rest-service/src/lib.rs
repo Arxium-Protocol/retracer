@@ -129,6 +129,9 @@ pub struct RestChain {
     pub sync_protocol: String,
     pub finality_depth: u64,
     pub address_validator: Option<AddressValidator>,
+    /// The chain's declared `kind_schema.toml` projections — the only payload
+    /// fields `GET .../actions?field=` may filter on.
+    pub projections: Vec<storage::Projection>,
     pub network_view: tokio::sync::watch::Receiver<ingestion::NetworkView>,
     /// Base URL of this chain's node HTTP RPC, for `GET /validators?height=N`
     /// — used only by [`get_validator_uptime`]. `None` disables that route
@@ -146,7 +149,17 @@ struct AppState {
     known: Arc<HashSet<String>>,
     http: reqwest::Client,
     uptime_cache: Arc<UptimeCache>,
+    /// `get_stats` is four full-table aggregates; an explorer home page calls
+    /// it on every load. Cached per chain for `STATS_CACHE_TTL` — the numbers
+    /// are totals, a few seconds stale is not visible.
+    stats_cache: Arc<Mutex<HashMap<String, (Instant, storage::Stats)>>>,
+    /// Per chain, the node's `/genesis-hash` once it has answered. A genesis
+    /// hash never changes, so this is fetched once and kept for the life of
+    /// the process; a chain with no `node_rpc_url` never gets an entry.
+    genesis_cache: Arc<Mutex<HashMap<String, String>>>,
 }
+
+const STATS_CACHE_TTL: Duration = Duration::from_secs(15);
 
 impl AppState {
     /// Unknown chain is 404, never a fall back to a default. Unlike the gRPC
@@ -179,6 +192,8 @@ pub fn router(pool: PgPool, chains: Vec<RestChain>) -> Router {
         known: Arc::new(known),
         http,
         uptime_cache: Arc::new(UptimeCache::new()),
+        stats_cache: Arc::new(Mutex::new(HashMap::new())),
+        genesis_cache: Arc::new(Mutex::new(HashMap::new())),
     };
 
     Router::new()
@@ -305,10 +320,12 @@ fn readiness_report(
             }
         })
         .collect();
-    let ready = postgres
-        && chains
-            .iter()
-            .all(|chain| chain.network_fresh && chain.caught_up);
+    // Ready means "reads work", which only needs Postgres. Lag and peer
+    // visibility are still reported per chain (and as `retracer_blocks_behind`
+    // on /metrics) but no longer flip the status: a stalled chain or a peer
+    // restart used to pull a perfectly serviceable read replica out of the
+    // load balancer.
+    let ready = postgres;
     Readiness {
         ready,
         postgres,
@@ -601,22 +618,52 @@ struct ChainInfo {
     blocks_topic: String,
     sync_protocol: String,
     finality_depth: u64,
+    /// The network's identity, from the node's own `/genesis-hash`.
+    /// `chain_id` is only this deployment's label for it; two indexers can
+    /// call the same network different things, and this is how a client
+    /// tells. `null` until the node has answered, or when no `--node-rpc-url`
+    /// is configured for the chain.
+    genesis_hash: Option<String>,
 }
 
 async fn list_chains(State(state): State<AppState>) -> ApiResult<Vec<ChainInfo>> {
-    Ok(Json(
-        state
-            .chains
-            .iter()
-            .map(|c| ChainInfo {
-                chain_id: c.chain_id.clone(),
-                display_name: c.display_name.clone(),
-                blocks_topic: c.blocks_topic.clone(),
-                sync_protocol: c.sync_protocol.clone(),
-                finality_depth: c.finality_depth,
-            })
-            .collect(),
-    ))
+    let mut out = Vec::with_capacity(state.chains.len());
+    for c in state.chains.iter() {
+        out.push(ChainInfo {
+            chain_id: c.chain_id.clone(),
+            display_name: c.display_name.clone(),
+            blocks_topic: c.blocks_topic.clone(),
+            sync_protocol: c.sync_protocol.clone(),
+            finality_depth: c.finality_depth,
+            genesis_hash: genesis_hash(&state, c).await,
+        });
+    }
+    Ok(Json(out))
+}
+
+async fn genesis_hash(state: &AppState, chain: &RestChain) -> Option<String> {
+    if let Some(hash) = state.genesis_cache.lock().unwrap().get(&chain.chain_id) {
+        return Some(hash.clone());
+    }
+    let node_rpc_url = chain.node_rpc_url.as_deref()?;
+    #[derive(Deserialize)]
+    struct Body {
+        genesis_hash: String,
+    }
+    let url = format!("{node_rpc_url}/genesis-hash");
+    let mut request = state.http.get(&url).timeout(Duration::from_secs(2));
+    if let Some(token) = &chain.node_rpc_token {
+        request = request.bearer_auth(token.expose());
+    }
+    // A node that isn't answering is a `null` here, not an error: this is a
+    // listing, and the node's state is already reported by `/status`.
+    let body: Body = request.send().await.ok()?.error_for_status().ok()?.json().await.ok()?;
+    state
+        .genesis_cache
+        .lock()
+        .unwrap()
+        .insert(chain.chain_id.clone(), body.genesis_hash.clone());
+    Some(body.genesis_hash)
 }
 
 async fn get_status(
@@ -636,7 +683,18 @@ async fn get_stats(
     Path(chain_id): Path<String>,
 ) -> ApiResult<storage::Stats> {
     state.chain(&chain_id)?;
-    Ok(Json(storage::get_stats(&state.pool, &chain_id).await?))
+    if let Some((at, stats)) = state.stats_cache.lock().unwrap().get(&chain_id)
+        && at.elapsed() < STATS_CACHE_TTL
+    {
+        return Ok(Json(*stats));
+    }
+    let stats = storage::get_stats(&state.pool, &chain_id).await?;
+    state
+        .stats_cache
+        .lock()
+        .unwrap()
+        .insert(chain_id, (Instant::now(), stats));
+    Ok(Json(stats))
 }
 
 #[derive(Deserialize)]
@@ -680,6 +738,11 @@ struct ActionPage {
     before_height: Option<i64>,
     before_index: Option<i32>,
     role: Option<String>,
+    kind: Option<String>,
+    /// A projected payload path, `$.asset` — must be declared for `kind` in
+    /// the chain's `kind_schema.toml`, since that's what makes it indexed.
+    field: Option<String>,
+    value: Option<String>,
 }
 
 impl ActionPage {
@@ -702,11 +765,69 @@ async fn list_actions(
     Path(chain_id): Path<String>,
     Query(page): Query<ActionPage>,
 ) -> ApiResult<Vec<storage::ActionRow>> {
-    state.chain(&chain_id)?;
+    let chain = state.chain(&chain_id)?;
     let limit = clamp_limit(page.limit)?;
+    let filter = action_filter(chain, &page)?;
     Ok(Json(
-        storage::list_actions(&state.pool, &chain_id, limit, page.cursor()?).await?,
+        storage::list_actions(&state.pool, &chain_id, limit, page.cursor()?, filter.as_ref())
+            .await?,
     ))
+}
+
+/// `kind` alone, or `kind` + `field` + `value` where `field` is a projection
+/// the schema declares for that kind. Anything else is a 400 with the list of
+/// fields that *are* filterable, so a builder learns the schema from the
+/// error instead of from reading TOML.
+fn action_filter<'a>(
+    chain: &'a RestChain,
+    page: &'a ActionPage,
+) -> Result<Option<storage::ActionFilter<'a>>, ApiError> {
+    let Some(kind) = page.kind.as_deref() else {
+        if page.field.is_some() || page.value.is_some() {
+            return Err(ApiError::BadRequest("field/value require kind".into()));
+        }
+        return Ok(None);
+    };
+    let (projection, value) = match (page.field.as_deref(), page.value.as_deref()) {
+        (None, None) => (None, None),
+        (Some(field), Some(value)) => {
+            let projection = chain
+                .projections
+                .iter()
+                .find(|p| p.kind == kind && p.path() == field)
+                .ok_or_else(|| {
+                    let declared: Vec<String> = chain
+                        .projections
+                        .iter()
+                        .filter(|p| p.kind == kind)
+                        .map(|p| p.path())
+                        .collect();
+                    ApiError::BadRequest(format!(
+                        "{field} is not an indexed field of {kind}; indexed: {declared:?}"
+                    ))
+                })?;
+            // Reject up front what the cast would reject in Postgres, so a
+            // typo is a 400 and not a 500.
+            let numeric_ok = match projection.ty {
+                storage::ProjectionType::Text => true,
+                storage::ProjectionType::Numeric => value.parse::<f64>().is_ok(),
+                storage::ProjectionType::BigInt => value.parse::<i64>().is_ok(),
+            };
+            if !numeric_ok {
+                return Err(ApiError::BadRequest(format!(
+                    "value {value:?} is not a {}",
+                    projection.ty.sql_cast()
+                )));
+            }
+            (Some(projection), Some(value))
+        }
+        _ => {
+            return Err(ApiError::BadRequest(
+                "field and value must be sent together".into(),
+            ));
+        }
+    };
+    Ok(Some(storage::ActionFilter { kind, projection, value }))
 }
 
 async fn get_action(
@@ -1067,6 +1188,7 @@ mod tests {
             sync_protocol: "sync".into(),
             finality_depth: 0,
             address_validator: None,
+            projections: Vec::new(),
             network_view,
             node_rpc_url: None,
             node_rpc_token: None,
@@ -1177,6 +1299,9 @@ mod tests {
             before_height: Some(5),
             before_index: Some(2),
             role: None,
+            kind: None,
+            field: None,
+            value: None,
         };
         assert_eq!(both.cursor().ok().flatten(), Some((5, 2)));
 
@@ -1185,6 +1310,9 @@ mod tests {
             before_height: None,
             before_index: None,
             role: None,
+            kind: None,
+            field: None,
+            value: None,
         };
         assert_eq!(neither.cursor().ok().flatten(), None);
 
@@ -1196,6 +1324,9 @@ mod tests {
             before_height: Some(5),
             before_index: None,
             role: None,
+            kind: None,
+            field: None,
+            value: None,
         };
         assert!(half.cursor().is_err());
     }
@@ -1281,21 +1412,16 @@ mod tests {
         );
     }
 
+    /// Readiness is "reads work": Postgres up. Peer and lag state are still
+    /// reported per chain for whoever is looking, but a stalled chain or a
+    /// peer restart must not pull a serviceable read replica out of rotation.
     #[test]
-    fn readiness_rejects_a_chain_that_never_connected() {
-        let chain = rest_chain(ingestion::NetworkView::default());
-        let report = readiness_report(true, &[chain], &statuses(Some(0)));
-
-        assert!(!report.ready);
+    fn readiness_reports_network_state_without_gating_on_it() {
+        let never_connected = rest_chain(ingestion::NetworkView::default());
+        let report = readiness_report(true, &[never_connected], &statuses(Some(0)));
+        assert!(report.ready);
         assert!(!report.chains[0].network_visible);
         assert!(!report.chains[0].network_fresh);
-    }
-
-    #[test]
-    fn readiness_rejects_disconnected_or_stale_status() {
-        let disconnected = rest_chain(ingestion::NetworkView::default());
-        let disconnected_report = readiness_report(true, &[disconnected], &statuses(Some(4)));
-        assert!(!disconnected_report.ready);
 
         let stale = rest_chain(ingestion::NetworkView {
             active_peer_count: 1,
@@ -1305,28 +1431,15 @@ mod tests {
             last_status_at: Some(Instant::now() - Duration::from_secs(60)),
         });
         let stale_report = readiness_report(true, &[stale], &statuses(Some(4)));
-        assert!(!stale_report.ready);
+        assert!(stale_report.ready);
         assert!(stale_report.chains[0].network_visible);
         assert!(!stale_report.chains[0].network_fresh);
         assert!(!stale_report.chains[0].caught_up);
-    }
-
-    #[test]
-    fn readiness_rejects_no_indexed_data_and_lag() {
-        let empty = rest_chain(fresh_network(4));
-        let empty_report = readiness_report(true, &[empty], &statuses(None));
-        assert!(!empty_report.ready);
-        assert_eq!(empty_report.chains[0].indexed_height, None);
 
         let lagging = rest_chain(fresh_network(4));
         let lagging_report = readiness_report(true, &[lagging], &statuses(Some(3)));
-        assert!(!lagging_report.ready);
+        assert!(lagging_report.ready);
         assert!(!lagging_report.chains[0].caught_up);
-
-        let ahead = rest_chain(fresh_network(4));
-        let ahead_report = readiness_report(true, &[ahead], &statuses(Some(5)));
-        assert!(!ahead_report.ready);
-        assert!(!ahead_report.chains[0].caught_up);
     }
 
     #[test]

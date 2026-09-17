@@ -134,6 +134,12 @@ pub struct Projection {
 }
 
 impl Projection {
+    /// The `$.a.b.c` form this projection was declared with, for matching a
+    /// caller's `field=` against the schema.
+    pub fn path(&self) -> String {
+        format!("$.{}", self.segments.join("."))
+    }
+
     /// `payload->'a'->'b'->>'c'` for path `a.b.c` — the JSON accessor this
     /// projection indexes. Safe to interpolate because every segment was
     /// checked against [`is_safe_segment`] at parse time.

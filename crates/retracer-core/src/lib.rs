@@ -162,6 +162,9 @@ pub struct Args {
     /// attributing rate-limit buckets. `None` (the default) means the socket
     /// peer is always the client.
     pub trusted_proxies: Option<auth::TrustedProxies>,
+    /// Re-run `kind_schema.toml` role extraction over already-indexed actions
+    /// before following the chain. See `storage::reindex_action_addresses`.
+    pub reindex_addresses: bool,
 }
 
 /// Parses a listen address, naming `source` (a flag or env var) in the error
@@ -228,6 +231,9 @@ OPTIONS:
                                    [default: 127.0.0.1] [env: RETRACER_REST_BIND]
     --kind-schema <path>           Payload field configuration file.
                                    [default: kind_schema.toml]
+    --reindex-addresses            Re-run the kind schema's role extraction over
+                                   every stored action at startup (after editing
+                                   kind_schema.toml), then follow the chain as usual.
     --blocks-topic <topic>         Must match the node's gossip topic.
                                    [default: derived from --chain-id]
     --sync-protocol <protocol>     Must match the node's sync protocol.
@@ -295,6 +301,7 @@ pub fn parse_args() -> Result<Args> {
         _ => DEFAULT_BIND,
     };
     let mut kind_schema = DEFAULT_KIND_SCHEMA.to_string();
+    let mut reindex_addresses = false;
     let mut blocks_topic = None;
     let mut sync_protocol = None;
     let mut max_pending_blocks = ingestion::DEFAULT_MAX_PENDING_BLOCKS;
@@ -379,6 +386,7 @@ pub fn parse_args() -> Result<Args> {
             "--kind-schema" => {
                 kind_schema = args.next().context("--kind-schema requires a value")?;
             }
+            "--reindex-addresses" => reindex_addresses = true,
             "--blocks-topic" => {
                 blocks_topic = Some(args.next().context("--blocks-topic requires a value")?);
             }
@@ -462,6 +470,7 @@ pub fn parse_args() -> Result<Args> {
         auth_token,
         rate_limit_rps,
         trusted_proxies,
+        reindex_addresses,
     })
 }
 
@@ -540,6 +549,7 @@ where
     .with_auth_token(args.auth_token)
     .with_rate_limit_rps(args.rate_limit_rps)
     .with_trusted_proxies(args.trusted_proxies);
+    let chain_id = args.chain.chain_id.clone();
     runner
         .add_chain_with_decoder_and_certificate_verifier(
             args.chain,
@@ -548,6 +558,17 @@ where
             certificate_verifier,
         )
         .await?;
+    if args.reindex_addresses {
+        let extractor = runner
+            .runtimes
+            .iter()
+            .find(|r| r.chain_id == chain_id)
+            .map(|r| r.address_extractor.clone())
+            .expect("chain was just added");
+        let added =
+            storage::reindex_action_addresses(&runner.write_pool, &chain_id, &extractor).await?;
+        info!(chain_id, added, "action_addresses reindex complete");
+    }
     runner.run().await
 }
 
@@ -737,6 +758,7 @@ impl Runner {
 
         // Shared with grpc-service so SubscribeAccountActions can resolve roles
         // (e.g. a Transfer's recipient) the same way insert_block does.
+        let projections = kind_schema.projections().to_vec();
         let address_extractor = Arc::new(storage::AddressExtractor::new(kind_schema, hooks.tier_b));
 
         storage::register_chain(
@@ -803,6 +825,7 @@ impl Runner {
             sync_protocol: config.sync_protocol.clone(),
             finality_depth: config.finality_depth,
             address_validator: hooks.address_validator.clone(),
+            projections,
             network_view: network_view.clone(),
             node_rpc_url: config.node_rpc_url.clone(),
             node_rpc_token: config.node_rpc_token.clone(),

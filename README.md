@@ -107,6 +107,7 @@ can also come from a `.env` file (copy `.env.example`) via
 | `--rest-port` | `8080` | HTTP API port; `0` disables it |
 | `--grpc-port` | `50051` | gRPC API port |
 | `--kind-schema` | `kind_schema.toml` | Payload field configuration |
+| `--reindex-addresses` | off | Re-run the kind schema's role extraction over every stored action at startup, then follow the chain as usual. Run once after adding a role to `kind_schema.toml` |
 | `--blocks-topic` | `arxium/blocks/v1` | Must match the node's gossip topic |
 | `--sync-protocol` | `/arxium/sync/1` | Must match the node's sync protocol |
 | `--finality-depth` | `250` | Fallback rollback limit, used only when the node reports no finality |
@@ -169,7 +170,7 @@ GET  /v1/chains/{chain}/proposers
 GET  /v1/chains/{chain}/blocks?limit=&before=
 GET  /v1/chains/{chain}/blocks/{height|hash}
 
-GET  /v1/chains/{chain}/actions?limit=&before_height=&before_index=
+GET  /v1/chains/{chain}/actions?limit=&before_height=&before_index=&kind=&field=&value=
 GET  /v1/chains/{chain}/actions/{action_hash}
 
 GET  /v1/chains/{chain}/accounts/{address}/actions?limit=&role=
@@ -178,10 +179,12 @@ GET  /v1/chains/{chain}/search?q=
 GET  /v1/chains/{chain}/validators/uptime?from=&to=
 ```
 
-`/health` is process liveness only. `/ready` returns 200 only when PostgreSQL
-answers and every configured chain has a fresh node tip from a currently
-connected peer plus an indexed cursor caught up to that tip. Its database work
-has a fixed timeout; otherwise it returns 503 with per-chain dependency state.
+`/health` is process liveness only. `/ready` returns 200 when PostgreSQL
+answers within a fixed timeout — that is, when reads work — and 503 otherwise.
+The body also reports each chain's peer visibility, node tip and whether the
+index has caught up, but those don't affect the status: a stalled chain or a
+peer restart shouldn't take a serviceable read replica out of rotation. Alert
+on lag through `/metrics` (`retracer_blocks_behind`) instead.
 Both probes stay open when inbound API authentication is enabled, while
 configured rate limiting still applies to `/ready` (but never `/health`).
 
@@ -189,6 +192,16 @@ configured rate limiting still applies to `/ready` (but never `/health`).
 stays behind `--auth-token`/`--rate-limit-rps` like every other route. A
 database failure still returns 200 with `retracer_database_up 0`, so a scrape
 always has a body to alert on. See [Monitoring](#monitoring) below.
+
+`/v1/chains` includes each chain's `genesis_hash` from the node's own
+`/genesis-hash` (when `--node-rpc-url` is set) — `chain_id` is only this
+deployment's label; the genesis hash is the network's identity.
+
+`/actions` filters by `kind`, and by one indexed payload field with
+`field=$.path&value=` — the field must be declared as a `[[kind.index]]` for
+that kind in `kind_schema.toml` (see [Indexing your payload
+fields](#indexing-your-payload-fields)); anything else is a 400 naming the
+fields that are indexed. `/stats` is served from a 15-second cache.
 
 Pages are newest-first and cap at 100. Action cursors are a
 `(before_height, before_index)` pair and both halves must be sent together — a
@@ -199,6 +212,7 @@ rest of one.
 curl "localhost:8080/v1/chains/corechain-devnet/blocks?limit=5"
 curl "localhost:8080/v1/chains/corechain-devnet/accounts/<address>/actions?role=to"
 curl "localhost:8080/v1/chains/corechain-devnet/search?q=42"
+curl "localhost:8080/v1/chains/corechain-devnet/actions?kind=TransferAsset&field=\$.asset&value=arxasset1..."
 ```
 
 ---
@@ -298,11 +312,18 @@ name = "Transfer"
   type = "numeric"   # text | numeric | bigint
 ```
 
-That becomes a Postgres expression index at startup. Paths must be plain dotted
-field names; anything else is rejected at startup rather than escaped.
+That becomes a Postgres expression index at startup, and the field becomes
+filterable: `GET .../actions?kind=<kind>&field=$.amount&value=...`. Paths must
+be plain dotted field names; anything else is rejected at startup rather than
+escaped.
 
 Removing an entry doesn't drop its index — do that with `DROP INDEX` when you
 mean it.
+
+Roles are extracted when a block is indexed, so adding a `[[kind.roles]]`
+entry only covers new blocks. Start once with `--reindex-addresses` to
+backfill it over everything already stored (additive — a removed role's old
+rows stay until you `DELETE` them).
 
 For roles a dotted path can't express (conditional or computed), implement
 `storage::ActionIndexable` in Rust and pass it to `run`. See the
@@ -437,9 +458,8 @@ result whenever you add, change or remove one of those macros; the build fails
 loudly if the cache is missing an entry, but a *stale* entry for a query that no
 longer exists just lingers.
 
-The schema is a single `migrations/0001_init.sql` while nothing has shipped.
-Once it has, that file is frozen — add a new numbered migration instead, since
-SQLx verifies applied migrations by hashing their exact bytes.
+Applied migrations are frozen — SQLx verifies them by hashing their exact
+bytes — so a schema change is always a new numbered file under `migrations/`.
 
 ---
 

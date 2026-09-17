@@ -594,3 +594,93 @@ async fn table_sizes_and_database_size_report_every_table() {
         .expect("database size query");
     assert!(db_size > 0);
 }
+
+/// The `?kind=&field=&value=` path: the filter must use the same expression
+/// the projection index was declared with, and `reindex_action_addresses`
+/// must add the rows a newly declared role implies without touching the
+/// ones already there.
+#[tokio::test]
+async fn kind_field_filter_and_reindex() {
+    let pool = skip_without_db!();
+    let chain = chain_id("filter");
+
+    // Ingest with a schema that indexes `$.amount` but declares no roles.
+    let path = std::env::temp_dir().join(format!("retracer_filter_{}.toml", std::process::id()));
+    std::fs::write(
+        &path,
+        r#"
+        [[kind]]
+        name = "Transfer"
+          [[kind.index]]
+          path = "$.amount"
+          type = "numeric"
+        "#,
+    )
+    .expect("write schema");
+    let schema = KindSchema::load(&path).expect("load schema");
+    let projection = schema.projections()[0].clone();
+    storage::create_projection_indexes(&pool, &schema).await.expect("indexes");
+    let extractor = AddressExtractor::new(schema, Vec::new());
+
+    let to = addr(7).to_string();
+    let b1 = block(
+        1,
+        "0x00",
+        vec![
+            action(1, Some("s1"), TestPayload::Transfer { to: to.clone(), amount: 5 }),
+            action(1, Some("s2"), TestPayload::Transfer { to: to.clone(), amount: 9 }),
+            action(2, Some("s3"), TestPayload::Noop),
+        ],
+    );
+    storage::insert_block(&pool, &chain, &b1, &extractor).await.expect("insert");
+
+    let all = storage::list_actions(&pool, &chain, 10, None, None).await.expect("all");
+    assert_eq!(all.len(), 3);
+
+    let by_kind = storage::ActionFilter { kind: "Transfer", projection: None, value: None };
+    let transfers = storage::list_actions(&pool, &chain, 10, None, Some(&by_kind)).await.expect("kind");
+    assert_eq!(transfers.len(), 2);
+
+    let by_field = storage::ActionFilter {
+        kind: "Transfer",
+        projection: Some(&projection),
+        value: Some("9"),
+    };
+    let nine = storage::list_actions(&pool, &chain, 10, None, Some(&by_field)).await.expect("field");
+    assert_eq!(nine.len(), 1);
+    assert_eq!(nine[0].action_hash, "s2");
+
+    // No roles declared, so nothing in action_addresses yet.
+    assert_eq!(count(&pool, "action_addresses", &chain).await, 0);
+
+    // Operator adds a `to` role and reindexes: the two transfers gain rows,
+    // the Noop does not, and running it again adds nothing.
+    std::fs::write(
+        &path,
+        r#"
+        [[kind]]
+        name = "Transfer"
+          [[kind.roles]]
+          path = "$.to"
+          role = "to"
+        "#,
+    )
+    .expect("write schema");
+    let extractor = AddressExtractor::new(KindSchema::load(&path).expect("reload"), Vec::new());
+    let added = storage::reindex_action_addresses(&pool, &chain, &extractor).await.expect("reindex");
+    assert_eq!(added, 2);
+    assert_eq!(count(&pool, "action_addresses", &chain).await, 2);
+    let again = storage::reindex_action_addresses(&pool, &chain, &extractor).await.expect("reindex again");
+    assert_eq!(again, 0);
+
+    let received = storage::get_account_actions(&pool, &chain, &to, 10, None, Some("to"))
+        .await
+        .expect("received");
+    assert_eq!(received.len(), 2);
+
+    sqlx::query(&format!("DROP INDEX IF EXISTS {}", projection.index_name()))
+        .execute(&pool)
+        .await
+        .ok();
+    std::fs::remove_file(&path).ok();
+}
