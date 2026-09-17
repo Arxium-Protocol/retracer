@@ -205,6 +205,12 @@ fn validate_rate_limit_rps(rps: u32, source: &str) -> Result<()> {
 
 /// `retracerd --help` text. Kept in sync with `parse_args`'s match arms by
 /// the `usage_lists_every_flag` test below — add a flag to both or neither.
+/// The Arxium git rev this build's wire types are pinned to — set by
+/// `build.rs` from the workspace `Cargo.toml`. A node on a different rev may
+/// produce blocks this Retracer silently misdecodes (bincode carries no
+/// version tag), so every surface that identifies the build reports it.
+pub const ARXIUM_NODE_REV: &str = env!("ARXIUM_NODE_REV");
+
 pub const USAGE: &str = "\
 retracerd - a Retracer indexer for one chain
 
@@ -913,7 +919,7 @@ impl Runner {
         if let Some(rest_port) = self.rest_port {
             let rest_addr = SocketAddr::new(self.rest_bind, rest_port);
             let listener = bind_listener(rest_addr, "REST").await?;
-            let router = rest_service::router(self.read_pool.clone(), self.rest_chains).layer(
+            let router = rest_service::router(self.read_pool.clone(), self.rest_chains, ARXIUM_NODE_REV).layer(
                 axum::middleware::from_fn_with_state(guard, auth::rest_guard),
             );
             info!(%rest_addr, "REST listening");

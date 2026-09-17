@@ -12,10 +12,11 @@ async fn main() -> Result<()> {
             // Release builds set RETRACER_VERSION to the tag. A local build has
             // no tag to report — CARGO_PKG_VERSION is not bumped per release —
             // so say so explicitly rather than print a stale-looking "0.1.0".
+            let node = retracer_core::ARXIUM_NODE_REV;
             match option_env!("RETRACER_VERSION") {
-                Some(tag) => println!("retracerd {tag}"),
+                Some(tag) => println!("retracerd {tag} (arxium node rev {node})"),
                 None => println!(
-                    "retracerd {} (dev build, not a release)",
+                    "retracerd {} (dev build, not a release; arxium node rev {node})",
                     env!("CARGO_PKG_VERSION")
                 ),
             }

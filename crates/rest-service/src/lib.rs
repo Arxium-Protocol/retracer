@@ -157,6 +157,9 @@ struct AppState {
     /// hash never changes, so this is fetched once and kept for the life of
     /// the process; a chain with no `node_rpc_url` never gets an entry.
     genesis_cache: Arc<Mutex<HashMap<String, String>>>,
+    /// See `ChainInfo::arxium_node_rev`; supplied by the binary, which is
+    /// where the pin is known.
+    arxium_node_rev: &'static str,
 }
 
 const STATS_CACHE_TTL: Duration = Duration::from_secs(15);
@@ -180,7 +183,7 @@ impl AppState {
     }
 }
 
-pub fn router(pool: PgPool, chains: Vec<RestChain>) -> Router {
+pub fn router(pool: PgPool, chains: Vec<RestChain>, arxium_node_rev: &'static str) -> Router {
     let known = chains.iter().map(|c| c.chain_id.clone()).collect();
     let http = reqwest::Client::builder()
         .timeout(NODE_RPC_TIMEOUT)
@@ -194,6 +197,7 @@ pub fn router(pool: PgPool, chains: Vec<RestChain>) -> Router {
         uptime_cache: Arc::new(UptimeCache::new()),
         stats_cache: Arc::new(Mutex::new(HashMap::new())),
         genesis_cache: Arc::new(Mutex::new(HashMap::new())),
+        arxium_node_rev,
     };
 
     Router::new()
@@ -624,6 +628,10 @@ struct ChainInfo {
     /// tells. `null` until the node has answered, or when no `--node-rpc-url`
     /// is configured for the chain.
     genesis_hash: Option<String>,
+    /// The Arxium git rev this Retracer's wire types are pinned to. A node
+    /// on a different rev is not guaranteed to decode; compare against the
+    /// node's own build before trusting a deployment.
+    arxium_node_rev: &'static str,
 }
 
 async fn list_chains(State(state): State<AppState>) -> ApiResult<Vec<ChainInfo>> {
@@ -636,6 +644,7 @@ async fn list_chains(State(state): State<AppState>) -> ApiResult<Vec<ChainInfo>>
             sync_protocol: c.sync_protocol.clone(),
             finality_depth: c.finality_depth,
             genesis_hash: genesis_hash(&state, c).await,
+            arxium_node_rev: state.arxium_node_rev,
         });
     }
     Ok(Json(out))

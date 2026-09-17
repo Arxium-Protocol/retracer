@@ -195,7 +195,12 @@ always has a body to alert on. See [Monitoring](#monitoring) below.
 
 `/v1/chains` includes each chain's `genesis_hash` from the node's own
 `/genesis-hash` (when `--node-rpc-url` is set) — `chain_id` is only this
-deployment's label; the genesis hash is the network's identity.
+deployment's label; the genesis hash is the network's identity. It also
+carries `arxium_node_rev`, the Arxium git rev this build's wire types are
+pinned to (also printed by `retracerd --version`). The P2P wire is bincode
+with no version tag, so a node on a different rev can produce blocks this
+Retracer misdecodes without an error — check the rev before trusting a
+deployment against a node you didn't pin it to.
 
 `/actions` filters by `kind`, and by one indexed payload field with
 `field=$.path&value=` — the field must be declared as a `[[kind.index]]` for
