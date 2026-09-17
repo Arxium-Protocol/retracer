@@ -384,15 +384,25 @@ async fn rollback_below_genesis_clears_the_cursor_entirely() {
 async fn projection_indexes_are_created_and_recreating_them_is_safe() {
     let pool = skip_without_db!();
 
-    let path = std::env::temp_dir().join(format!("retracer_proj_{}.toml", std::process::id()));
+    // Exercises the create/verify/drop mechanics only, not filtering, so the
+    // kind and field are synthetic and unique to this test. `index_name()`
+    // hashes kind+path+type into a name on the shared `actions` table, not
+    // scoped by chain_id like the rows are — reusing `Transfer`/`$.amount`
+    // (as `kind_field_filter_and_reindex` does) raced against that test's
+    // own create/reindex/drop under the default parallel test runner.
+    let path = std::env::temp_dir().join(format!(
+        "retracer_proj_{}_{:?}.toml",
+        std::process::id(),
+        std::thread::current().id()
+    ));
     std::fs::write(
         &path,
         r#"
         [[kind]]
-        name = "Transfer"
+        name = "ProjectionLifecycleTestKind"
           [[kind.index]]
-          path = "$.amount"
-          type = "numeric"
+          path = "$.marker"
+          type = "text"
         "#,
     )
     .expect("write schema");
