@@ -192,11 +192,13 @@ pub fn http_certificate_verifier(
                 .await?;
                 let key = response
                     .get("pubkey")
+                    .and_then(|k| k.as_str())
                     .context("node RPC BLS-key response is malformed")?;
-                public_keys.push(
-                    serde_json::from_value(key.clone())
-                        .context("node RPC returned an invalid BLS key")?,
-                );
+                let key: [u8; 48] = hex::decode(key.strip_prefix("0x").unwrap_or(key))
+                    .ok()
+                    .and_then(|bytes| bytes.try_into().ok())
+                    .context("node RPC returned an invalid BLS key")?;
+                public_keys.push(xc_bls::BlsPublicKey(key));
             }
             let message = arxd_finality::precommit_signing_bytes(
                 &genesis,
