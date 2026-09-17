@@ -450,13 +450,9 @@ Layout:
 Only `retracer-core` depends on the others; the service crates never depend
 on each other.
 
-`.sqlx/` holds cached query metadata so the four `sqlx::query!` macros in
-`storage` can be type-checked without a live database — that's what lets
-`SQLX_OFFLINE=true cargo build` compile with no Postgres reachable at all. Run
-`cargo sqlx prepare --workspace` against a migrated database and commit the
-result whenever you add, change or remove one of those macros; the build fails
-loudly if the cache is missing an entry, but a *stale* entry for a query that no
-longer exists just lingers.
+Queries are plain `sqlx::query` / `query_as` (runtime-checked), so the build
+needs no database and there is no `.sqlx/` cache to keep in sync; the Postgres
+integration tests are what catch a query/schema mismatch.
 
 Applied migrations are frozen — SQLx verifies them by hashing their exact
 bytes — so a schema change is always a new numbered file under `migrations/`.

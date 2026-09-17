@@ -1027,13 +1027,12 @@ fn count_undecoded(actions: &[ActionRow]) -> usize {
 }
 
 async fn actions_for_block(pool: &PgPool, chain_id: &str, height: i64) -> Result<Vec<ActionRow>> {
-    Ok(sqlx::query_as!(
-        ActionRow,
-        r#"SELECT action_hash, block_height, index_in_block, kind, from_address, payload as "payload!"
-           FROM actions WHERE chain_id = $1 AND block_height = $2 ORDER BY index_in_block"#,
-        chain_id,
-        height,
+    Ok(sqlx::query_as::<_, ActionRow>(
+        "SELECT action_hash, block_height, index_in_block, kind, from_address, payload
+         FROM actions WHERE chain_id = $1 AND block_height = $2 ORDER BY index_in_block",
     )
+    .bind(chain_id)
+    .bind(height)
     .fetch_all(pool)
     .await?)
 }
@@ -1043,23 +1042,24 @@ pub async fn get_block_by_height(
     chain_id: &str,
     height: i64,
 ) -> Result<Option<BlockRow>> {
-    let Some(row) = sqlx::query!(
-        "SELECT hash, parent_hash, timestamp, proposer FROM blocks WHERE chain_id = $1 AND height = $2",
-        chain_id,
-        height,
-    )
-    .fetch_optional(pool)
-    .await?
+    let Some((hash, parent_hash, timestamp, proposer)) =
+        sqlx::query_as::<_, (String, String, i64, Option<String>)>(
+            "SELECT hash, parent_hash, timestamp, proposer FROM blocks WHERE chain_id = $1 AND height = $2",
+        )
+        .bind(chain_id)
+        .bind(height)
+        .fetch_optional(pool)
+        .await?
     else {
         return Ok(None);
     };
     let actions = actions_for_block(pool, chain_id, height).await?;
     Ok(Some(BlockRow {
         height,
-        hash: row.hash,
-        parent_hash: row.parent_hash,
-        timestamp: row.timestamp,
-        proposer: row.proposer,
+        hash,
+        parent_hash,
+        timestamp,
+        proposer,
         undecoded_action_count: count_undecoded(&actions),
         actions,
     }))
@@ -1070,23 +1070,24 @@ pub async fn get_block_by_hash(
     chain_id: &str,
     hash: &str,
 ) -> Result<Option<BlockRow>> {
-    let Some(row) = sqlx::query!(
-        "SELECT height, parent_hash, timestamp, proposer FROM blocks WHERE chain_id = $1 AND hash = $2",
-        chain_id,
-        hash,
-    )
-    .fetch_optional(pool)
-    .await?
+    let Some((height, parent_hash, timestamp, proposer)) =
+        sqlx::query_as::<_, (i64, String, i64, Option<String>)>(
+            "SELECT height, parent_hash, timestamp, proposer FROM blocks WHERE chain_id = $1 AND hash = $2",
+        )
+        .bind(chain_id)
+        .bind(hash)
+        .fetch_optional(pool)
+        .await?
     else {
         return Ok(None);
     };
-    let actions = actions_for_block(pool, chain_id, row.height).await?;
+    let actions = actions_for_block(pool, chain_id, height).await?;
     Ok(Some(BlockRow {
-        height: row.height,
+        height,
         hash: hash.to_string(),
-        parent_hash: row.parent_hash,
-        timestamp: row.timestamp,
-        proposer: row.proposer,
+        parent_hash,
+        timestamp,
+        proposer,
         undecoded_action_count: count_undecoded(&actions),
         actions,
     }))
@@ -1097,13 +1098,12 @@ pub async fn get_action_by_hash(
     chain_id: &str,
     action_hash: &str,
 ) -> Result<Option<ActionRow>> {
-    Ok(sqlx::query_as!(
-        ActionRow,
-        r#"SELECT action_hash, block_height, index_in_block, kind, from_address, payload as "payload!"
-           FROM actions WHERE chain_id = $1 AND action_hash = $2"#,
-        chain_id,
-        action_hash,
+    Ok(sqlx::query_as::<_, ActionRow>(
+        "SELECT action_hash, block_height, index_in_block, kind, from_address, payload
+         FROM actions WHERE chain_id = $1 AND action_hash = $2",
     )
+    .bind(chain_id)
+    .bind(action_hash)
     .fetch_optional(pool)
     .await?)
 }

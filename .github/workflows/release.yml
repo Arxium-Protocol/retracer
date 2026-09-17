@@ -19,7 +19,6 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  SQLX_OFFLINE: 'true'
   SOURCE_REPOSITORY: Arxium-Protocol/retracer
 
 jobs:
@@ -114,10 +113,9 @@ jobs:
           --health-retries 5
 
     env:
-      DATABASE_URL: postgres://retracer:retracer@localhost:5433/retracer
       # Without this, storage/tests/postgres.rs's `skip_without_db!` macro
       # treats the Postgres integration tests as opt-in and silently no-ops
-      # them — `DATABASE_URL` above is only for `cargo sqlx prepare`.
+      # them.
       RETRACER_TEST_DATABASE_URL: postgres://retracer:retracer@localhost:5433/retracer
 
     steps:
@@ -152,16 +150,6 @@ jobs:
         shell: bash
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
-      # The `.sqlx/` cache lets offline builds type-check queries without a
-      # database, but a stale entry for a removed query lingers silently.
-      # This fails the PR when the cache drifts from the queries or schema.
-      - name: Verify the sqlx query cache is fresh
-        shell: bash
-        run: |
-          set -Eeuo pipefail
-          cargo install sqlx-cli --version 0.8.6 --no-default-features --features postgres --locked
-          sqlx database setup
-          cargo sqlx prepare --check --workspace
 
   release:
     name: Build and publish release

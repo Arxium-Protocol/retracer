@@ -20,7 +20,6 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  SQLX_OFFLINE: 'true'
 
 jobs:
   test:
@@ -44,7 +43,6 @@ jobs:
           --health-retries 5
 
     env:
-      DATABASE_URL: postgres://retracer:retracer@localhost:5433/retracer
       RETRACER_TEST_DATABASE_URL: postgres://retracer:retracer@localhost:5433/retracer
 
     steps:
@@ -79,13 +77,3 @@ jobs:
         shell: bash
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
-      # The `.sqlx/` cache lets offline builds type-check queries without a
-      # database, but a stale entry for a removed query lingers silently.
-      # This fails the PR when the cache drifts from the queries or schema.
-      - name: Verify the sqlx query cache is fresh
-        shell: bash
-        run: |
-          set -Eeuo pipefail
-          cargo install sqlx-cli --version 0.8.6 --no-default-features --features postgres --locked
-          sqlx database setup
-          cargo sqlx prepare --check --workspace
