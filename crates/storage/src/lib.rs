@@ -85,7 +85,7 @@ pub async fn get_status(pool: &PgPool, chain_id: &str) -> Result<IndexStatus> {
     })
 }
 
-#[derive(Debug, Clone, Copy, serde::Serialize)]
+#[derive(Debug, Clone, Copy, serde::Serialize, utoipa::ToSchema)]
 pub struct IndexStatus {
     pub indexed_height: Option<i64>,
     pub tip_timestamp: Option<i64>,
@@ -352,7 +352,7 @@ pub async fn get_stats(pool: &PgPool, chain_id: &str) -> Result<Stats> {
     })
 }
 
-#[derive(Debug, Clone, Copy, serde::Serialize)]
+#[derive(Debug, Clone, Copy, serde::Serialize, utoipa::ToSchema)]
 pub struct Stats {
     pub total_blocks: i64,
     pub total_actions: i64,
@@ -398,7 +398,7 @@ pub async fn list_proposers(pool: &PgPool, chain_id: &str) -> Result<Vec<Propose
         .collect())
 }
 
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, utoipa::ToSchema)]
 pub struct ProposerRow {
     pub address: String,
     pub blocks_proposed: i64,
@@ -453,7 +453,7 @@ pub async fn list_proposed_heights(
 /// carry different things, and letting `BlockRow` hold an empty action list
 /// would mean a caller could not tell "this block has no actions" from "this
 /// query did not fetch them".
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, utoipa::ToSchema)]
 pub struct BlockSummary {
     pub height: i64,
     pub hash: String,
@@ -995,7 +995,7 @@ pub fn block_row_from_wire<B: IndexableBlock>(block: &B) -> Result<BlockRow> {
     })
 }
 
-#[derive(Debug, Clone, serde::Serialize, sqlx::FromRow)]
+#[derive(Debug, Clone, serde::Serialize, sqlx::FromRow, utoipa::ToSchema)]
 pub struct ActionRow {
     pub action_hash: String,
     pub block_height: i64,
@@ -1005,7 +1005,7 @@ pub struct ActionRow {
     pub payload: serde_json::Value,
 }
 
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, utoipa::ToSchema)]
 pub struct BlockRow {
     pub height: i64,
     pub hash: String,

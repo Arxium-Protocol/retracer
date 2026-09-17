@@ -155,12 +155,17 @@ change is independent of the block encoding and cannot be inferred from
 ## HTTP API
 
 Every path is scoped to a chain. `GET /v1/chains` lists the ones this deployment
-serves.
+serves. The full contract — every parameter and response schema — is the
+OpenAPI 3.1 document at `GET /openapi.json`, browsable at `GET /docs`; it is
+generated from the handlers at compile time, and a test fails if a route is
+registered without being in it.
 
 ```
 GET  /health
 GET  /ready
 GET  /metrics
+GET  /openapi.json
+GET  /docs
 GET  /v1/chains
 
 GET  /v1/chains/{chain}/status

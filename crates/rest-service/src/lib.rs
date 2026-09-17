@@ -26,6 +26,8 @@ use std::future::Future;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use storage::AddressValidator;
+use utoipa::{IntoParams, OpenApi, ToSchema};
+use utoipa_redoc::{Redoc, Servable};
 
 #[derive(Clone, PartialEq, Eq)]
 pub struct NodeRpcToken(String);
@@ -183,6 +185,24 @@ impl AppState {
     }
 }
 
+#[derive(OpenApi)]
+#[openapi(
+    info(
+        title = "Retracer",
+        description = "Indexed block and action history for an Arxium-stack chain. \
+            `chain_id` is this deployment's label; `GET /v1/chains` maps it to the network's genesis hash.",
+    ),
+    paths(
+        list_chains, get_status, get_stats, list_blocks, get_block, list_actions, get_action,
+        get_account_actions, list_proposers, get_validator_uptime, search, health, readiness, metrics,
+    ),
+    tags(
+        (name = "chains"), (name = "blocks"), (name = "actions"), (name = "validators"),
+        (name = "search"), (name = "ops"),
+    )
+)]
+struct ApiDoc;
+
 pub fn router(pool: PgPool, chains: Vec<RestChain>, arxium_node_rev: &'static str) -> Router {
     let known = chains.iter().map(|c| c.chain_id.clone()).collect();
     let http = reqwest::Client::builder()
@@ -224,6 +244,8 @@ pub fn router(pool: PgPool, chains: Vec<RestChain>, arxium_node_rev: &'static st
         .route("/health", get(health))
         .route("/ready", get(readiness))
         .route("/metrics", get(metrics))
+        .route("/openapi.json", get(|| async { Json(ApiDoc::openapi()) }))
+        .merge(Redoc::with_url("/docs", ApiDoc::openapi()))
         .with_state(state)
 }
 
@@ -241,7 +263,7 @@ impl From<anyhow::Error> for ApiError {
     }
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, ToSchema)]
 struct ErrorBody {
     error: String,
 }
@@ -270,11 +292,12 @@ type ApiResult<T> = Result<Json<T>, ApiError>;
 
 // ---------------------------------------------------------------- handlers
 
+#[utoipa::path(get, path = "/health", tag = "ops", responses((status = 200, description = "Process is up", body = String)))]
 async fn health() -> &'static str {
     "ok"
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 struct ChainReadiness {
     chain_id: String,
     network_visible: bool,
@@ -284,7 +307,7 @@ struct ChainReadiness {
     caught_up: bool,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 struct Readiness {
     ready: bool,
     postgres: bool,
@@ -369,6 +392,7 @@ async fn load_index_statuses(
     Ok(statuses)
 }
 
+#[utoipa::path(get, path = "/ready", tag = "ops", responses((status = 200, description = "Postgres answers; reads can be served", body = Readiness), (status = 503, description = "Postgres unreachable", body = Readiness)))]
 async fn readiness(State(state): State<AppState>) -> Response {
     let report = match bounded_db_check(
         READINESS_DB_TIMEOUT,
@@ -402,6 +426,7 @@ fn readiness_status(report: &Readiness) -> StatusCode {
 /// returns 200 with `retracer_database_up 0` and whatever chain gauges don't
 /// need Postgres — a monitoring scrape should always get a body to alert on,
 /// not a 503 that looks identical to "server is down".
+#[utoipa::path(get, path = "/metrics", tag = "ops", responses((status = 200, description = "Prometheus text exposition", body = String)))]
 async fn metrics(State(state): State<AppState>) -> Response {
     let now_unix = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -615,7 +640,7 @@ fn escape_label(value: &str) -> String {
         .replace('\n', "\\n")
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, ToSchema)]
 struct ChainInfo {
     chain_id: String,
     display_name: Option<String>,
@@ -634,6 +659,7 @@ struct ChainInfo {
     arxium_node_rev: &'static str,
 }
 
+#[utoipa::path(get, path = "/v1/chains", tag = "chains", responses((status = 200, body = Vec<ChainInfo>)))]
 async fn list_chains(State(state): State<AppState>) -> ApiResult<Vec<ChainInfo>> {
     let mut out = Vec::with_capacity(state.chains.len());
     for c in state.chains.iter() {
@@ -675,6 +701,7 @@ async fn genesis_hash(state: &AppState, chain: &RestChain) -> Option<String> {
     Some(body.genesis_hash)
 }
 
+#[utoipa::path(get, path = "/v1/chains/{chain_id}/status", tag = "chains", params(("chain_id" = String, Path)), responses((status = 200, body = storage::IndexStatus), (status = 404, description = "Unknown chain", body = ErrorBody)))]
 async fn get_status(
     State(state): State<AppState>,
     Path(chain_id): Path<String>,
@@ -687,6 +714,7 @@ async fn get_status(
     ))
 }
 
+#[utoipa::path(get, path = "/v1/chains/{chain_id}/stats", tag = "chains", params(("chain_id" = String, Path)), responses((status = 200, description = "Totals, cached per chain for a few seconds", body = storage::Stats), (status = 404, body = ErrorBody)))]
 async fn get_stats(
     State(state): State<AppState>,
     Path(chain_id): Path<String>,
@@ -706,12 +734,13 @@ async fn get_stats(
     Ok(Json(stats))
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, IntoParams)]
 struct BlockPage {
     limit: Option<i64>,
     before: Option<i64>,
 }
 
+#[utoipa::path(get, path = "/v1/chains/{chain_id}/blocks", tag = "blocks", params(("chain_id" = String, Path), BlockPage), responses((status = 200, description = "Newest first", body = Vec<storage::BlockSummary>), (status = 400, body = ErrorBody), (status = 404, body = ErrorBody)))]
 async fn list_blocks(
     State(state): State<AppState>,
     Path(chain_id): Path<String>,
@@ -728,6 +757,7 @@ async fn list_blocks(
 /// `GetBlockRequest` takes — a numeric segment is a height, anything else is a
 /// hash. Two routes would be more explicit, but a caller holding an identifier
 /// out of a search result shouldn't have to know which kind it is.
+#[utoipa::path(get, path = "/v1/chains/{chain_id}/blocks/{height}", tag = "blocks", params(("chain_id" = String, Path), ("height" = String, Path, description = "A height, or a block hash")), responses((status = 200, body = storage::BlockRow), (status = 404, body = ErrorBody)))]
 async fn get_block(
     State(state): State<AppState>,
     Path((chain_id, height)): Path<(String, String)>,
@@ -741,7 +771,7 @@ async fn get_block(
         .ok_or_else(|| ApiError::NotFound("block not found".into()))
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, IntoParams)]
 struct ActionPage {
     limit: Option<i64>,
     before_height: Option<i64>,
@@ -769,6 +799,7 @@ impl ActionPage {
     }
 }
 
+#[utoipa::path(get, path = "/v1/chains/{chain_id}/actions", tag = "actions", params(("chain_id" = String, Path), ActionPage), responses((status = 200, description = "Newest first", body = Vec<storage::ActionRow>), (status = 400, body = ErrorBody), (status = 404, body = ErrorBody)))]
 async fn list_actions(
     State(state): State<AppState>,
     Path(chain_id): Path<String>,
@@ -839,6 +870,7 @@ fn action_filter<'a>(
     Ok(Some(storage::ActionFilter { kind, projection, value }))
 }
 
+#[utoipa::path(get, path = "/v1/chains/{chain_id}/actions/{action_hash}", tag = "actions", params(("chain_id" = String, Path), ("action_hash" = String, Path)), responses((status = 200, body = storage::ActionRow), (status = 404, body = ErrorBody)))]
 async fn get_action(
     State(state): State<AppState>,
     Path((chain_id, action_hash)): Path<(String, String)>,
@@ -850,6 +882,7 @@ async fn get_action(
         .ok_or_else(|| ApiError::NotFound("action not found".into()))
 }
 
+#[utoipa::path(get, path = "/v1/chains/{chain_id}/accounts/{address}/actions", tag = "actions", params(("chain_id" = String, Path), ("address" = String, Path), ActionPage), responses((status = 200, description = "Newest first", body = Vec<storage::ActionRow>), (status = 400, body = ErrorBody), (status = 404, body = ErrorBody)))]
 async fn get_account_actions(
     State(state): State<AppState>,
     Path((chain_id, address)): Path<(String, String)>,
@@ -877,6 +910,7 @@ async fn get_account_actions(
     ))
 }
 
+#[utoipa::path(get, path = "/v1/chains/{chain_id}/proposers", tag = "validators", params(("chain_id" = String, Path)), responses((status = 200, body = Vec<storage::ProposerRow>), (status = 404, body = ErrorBody)))]
 async fn list_proposers(
     State(state): State<AppState>,
     Path(chain_id): Path<String>,
@@ -885,13 +919,13 @@ async fn list_proposers(
     Ok(Json(storage::list_proposers(&state.pool, &chain_id).await?))
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, IntoParams)]
 struct UptimeQuery {
     from: u64,
     to: u64,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, ToSchema)]
 struct UptimeReport {
     from: u64,
     to: u64,
@@ -901,7 +935,7 @@ struct UptimeReport {
     validators: Vec<ValidatorUptime>,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, ToSchema)]
 struct ValidatorUptime {
     address: String,
     /// Heights where this address was the round-0 (primary) designee.
@@ -924,6 +958,7 @@ struct ValidatorUptime {
 /// proposed it (`storage::list_proposed_heights`, already-local data). Only
 /// heights `list_proposed_heights` returns are fetched from the node, so an
 /// unindexed height never counts as an owed turn and never costs a node call.
+#[utoipa::path(get, path = "/v1/chains/{chain_id}/validators/uptime", tag = "validators", params(("chain_id" = String, Path), UptimeQuery), responses((status = 200, body = UptimeReport), (status = 400, description = "Bad range, or no node RPC configured for this chain", body = ErrorBody), (status = 404, body = ErrorBody)))]
 async fn get_validator_uptime(
     State(state): State<AppState>,
     Path(chain_id): Path<String>,
@@ -1111,12 +1146,12 @@ async fn fetch_validator_set(
 /// longer is a caller mistake or a cost probe, not a query.
 const MAX_SEARCH_LEN: usize = 256;
 
-#[derive(Deserialize)]
+#[derive(Deserialize, IntoParams)]
 struct SearchQuery {
     q: String,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, ToSchema)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 enum SearchHit {
     BlockHeight { height: i64 },
@@ -1128,6 +1163,7 @@ enum SearchHit {
 /// `/search`. The address check sits before the hash lookups, which is why a
 /// chain with no configured validator never classifies anything as an account
 /// rather than classifying everything as one.
+#[utoipa::path(get, path = "/v1/chains/{chain_id}/search", tag = "search", params(("chain_id" = String, Path), SearchQuery), responses((status = 200, description = "What `q` names; fetch it from the matching endpoint", body = SearchHit), (status = 400, body = ErrorBody), (status = 404, description = "Nothing matches", body = ErrorBody)))]
 async fn search(
     State(state): State<AppState>,
     Path(chain_id): Path<String>,
@@ -1187,6 +1223,26 @@ mod tests {
     use std::future::pending;
     use std::time::Instant;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// Every route `router()` registers is in the spec, so a handler added
+    /// without a `#[utoipa::path]` fails here instead of silently going
+    /// undocumented. `/openapi.json` and `/docs` are the spec's own routes.
+    #[test]
+    fn every_route_is_in_the_openapi_spec() {
+        let spec = ApiDoc::openapi();
+        let documented: HashSet<&str> = spec.paths.paths.keys().map(String::as_str).collect();
+        let source = include_str!("lib.rs");
+        let registered: Vec<&str> = source
+            .split(".route(")
+            .skip(1)
+            .filter_map(|rest| rest.trim_start().strip_prefix('"')?.split('"').next())
+            .filter(|p| p.starts_with('/') && *p != "/openapi.json")
+            .collect();
+        assert!(registered.len() >= 14, "route scan found {registered:?}");
+        for route in registered {
+            assert!(documented.contains(route), "{route} is not in the OpenAPI spec");
+        }
+    }
 
     fn rest_chain(network_view: ingestion::NetworkView) -> RestChain {
         let (_, network_view) = tokio::sync::watch::channel(network_view);
