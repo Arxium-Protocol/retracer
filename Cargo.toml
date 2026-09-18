@@ -32,7 +32,7 @@ dotenvy = "0.15"
 # core/rpc already uses for its `Authorization: Bearer` guard.
 subtle = "2"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
-libp2p = { version = "0.56.0", features = ["tcp", "quic", "noise", "yamux", "tokio", "macros", "gossipsub", "request-response", "cbor", "dns"] }
+libp2p = { version = "0.57.0", features = ["tcp", "quic", "noise", "yamux", "tokio", "macros", "gossipsub", "request-response", "cbor", "dns"] }
 # OpenAPI: the spec is derived from the handlers and response types, so it
 # can't drift from the code the way a hand-written YAML would.
 utoipa = { version = "5", features = ["axum_extras"] }
