@@ -1065,17 +1065,40 @@ pub async fn get_block_by_height(
     }))
 }
 
+/// `blocks.hash` is always written as `block.hash()` produces it — `0x` +
+/// lowercase hex — but a lookup's `hash` argument comes from a caller
+/// (ultimately a user-typed URL) that makes no such promise. Comparing the
+/// raw strings would make `/blocks/by-hash/AABB...` silently 404 against a
+/// block actually stored as `0xaabb...`.
+///
+/// `actions.action_hash` is usually a hex signature the same way, but not
+/// always: an unsigned/system-injected action has no signature to key on,
+/// so `insert_block` falls back to `"{height}:{index}"` (see its
+/// `identity()` comment) — not a hash at all, and never subject to this
+/// case/prefix ambiguity. Only a value that actually decodes as hex is
+/// normalized; anything else (including that fallback) passes through
+/// untouched, so a positional identity still matches itself exactly.
+fn canonicalize_hash(hash: &str) -> String {
+    let hex = hash.strip_prefix("0x").or_else(|| hash.strip_prefix("0X")).unwrap_or(hash);
+    if !hex.is_empty() && hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+        format!("0x{}", hex.to_ascii_lowercase())
+    } else {
+        hash.to_string()
+    }
+}
+
 pub async fn get_block_by_hash(
     pool: &PgPool,
     chain_id: &str,
     hash: &str,
 ) -> Result<Option<BlockRow>> {
+    let hash = canonicalize_hash(hash);
     let Some((height, parent_hash, timestamp, proposer)) =
         sqlx::query_as::<_, (i64, String, i64, Option<String>)>(
             "SELECT height, parent_hash, timestamp, proposer FROM blocks WHERE chain_id = $1 AND hash = $2",
         )
         .bind(chain_id)
-        .bind(hash)
+        .bind(&hash)
         .fetch_optional(pool)
         .await?
     else {
@@ -1084,7 +1107,7 @@ pub async fn get_block_by_hash(
     let actions = actions_for_block(pool, chain_id, height).await?;
     Ok(Some(BlockRow {
         height,
-        hash: hash.to_string(),
+        hash,
         parent_hash,
         timestamp,
         proposer,
@@ -1098,12 +1121,13 @@ pub async fn get_action_by_hash(
     chain_id: &str,
     action_hash: &str,
 ) -> Result<Option<ActionRow>> {
+    let action_hash = canonicalize_hash(action_hash);
     Ok(sqlx::query_as::<_, ActionRow>(
         "SELECT action_hash, block_height, index_in_block, kind, from_address, payload
          FROM actions WHERE chain_id = $1 AND action_hash = $2",
     )
     .bind(chain_id)
-    .bind(action_hash)
+    .bind(&action_hash)
     .fetch_optional(pool)
     .await?)
 }

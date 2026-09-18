@@ -47,6 +47,19 @@ pub struct Tip {
     pub hash: String,
 }
 
+/// `tip.hash` (from Postgres) and `incoming_parent_hash` (freshly decoded off
+/// the wire) are hex hashes from two independent sources, so a raw `==` would
+/// misclassify a real chain extension as a fork if either side's case or
+/// `0x` prefix ever drifted (see `xc_primitives::Hash32` on the Arxium side,
+/// which this crate can't depend on directly since it pins that crate to a
+/// fixed git rev).
+fn hashes_match(a: &str, b: &str) -> bool {
+    fn normalize(s: &str) -> String {
+        s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")).unwrap_or(s).to_ascii_lowercase()
+    }
+    normalize(a) == normalize(b)
+}
+
 /// `rewound_from` is the height the current rollback episode started at, if one
 /// is in progress — cumulative depth is measured against that rather than
 /// against each individual step, so peeling one block at a time can't sneak
@@ -75,7 +88,7 @@ pub fn classify(
     if incoming_height > tip.height + 1 {
         return TipAction::Gap;
     }
-    if incoming_parent_hash == tip.hash {
+    if hashes_match(incoming_parent_hash, &tip.hash) {
         return TipAction::Extend;
     }
 
@@ -134,6 +147,19 @@ mod tests {
         let t = tip(5, "0xaaa");
         assert_eq!(
             classify(Some(&t), 6, "0xaaa", None, 100, None),
+            TipAction::Extend
+        );
+    }
+
+    /// The tip's hash and an incoming block's `parent_hash` come from
+    /// independent sources (Postgres vs. freshly decoded wire bytes) — a
+    /// case or `0x`-prefix difference between them must not be read as a
+    /// fork.
+    #[test]
+    fn matching_parent_extends_regardless_of_case_or_prefix() {
+        let t = tip(5, "0xAAA");
+        assert_eq!(
+            classify(Some(&t), 6, "aaa", None, 100, None),
             TipAction::Extend
         );
     }

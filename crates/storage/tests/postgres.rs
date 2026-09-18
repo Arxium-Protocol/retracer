@@ -694,3 +694,88 @@ async fn kind_field_filter_and_reindex() {
         .ok();
     std::fs::remove_file(&path).ok();
 }
+
+/// `get_block_by_hash`/`get_action_by_hash` normalize the lookup argument
+/// before querying (see `canonicalize_hash`), so a differently cased or
+/// `0x`-less query still finds a value stored canonically — true for a
+/// block hash (always `block.hash()`'s output) and for a signed action's
+/// hash (its signature, always `hex::encode`'s lowercase output). An
+/// unsigned action's positional `"{height}:{index}"` identity is not a hash
+/// and must still match itself byte-for-byte — normalization must not touch it.
+#[tokio::test]
+async fn by_hash_lookups_ignore_case_and_prefix_but_leave_non_hex_identities_alone() {
+    let pool = skip_without_db!();
+    let chain = chain_id("by-hash");
+    let extractor = AddressExtractor::tier_a_only(KindSchema::empty());
+
+    let b0 = block(0, "0x0", vec![]);
+    storage::insert_block(&pool, &chain, &b0, &extractor)
+        .await
+        .expect("genesis");
+    let parent = b0.hash();
+    let b1 = block(
+        1,
+        &parent,
+        vec![
+            action(1, Some("0xabcdef"), TestPayload::Noop),
+            action(2, None, TestPayload::Noop),
+        ],
+    );
+    storage::insert_block(&pool, &chain, &b1, &extractor)
+        .await
+        .expect("block 1");
+
+    let by_exact_case = storage::get_block_by_hash(&pool, &chain, &parent)
+        .await
+        .expect("query")
+        .expect("genesis present by its own hash");
+    assert_eq!(by_exact_case.height, 0);
+
+    let mixed = if parent.chars().any(|c| c.is_ascii_lowercase()) {
+        parent.to_ascii_uppercase()
+    } else {
+        parent.to_ascii_lowercase()
+    };
+    let by_different_case = storage::get_block_by_hash(&pool, &chain, &mixed)
+        .await
+        .expect("query")
+        .expect("genesis present regardless of query case");
+    assert_eq!(by_different_case.height, 0);
+
+    let without_prefix = parent.trim_start_matches("0x");
+    let by_no_prefix = storage::get_block_by_hash(&pool, &chain, without_prefix)
+        .await
+        .expect("query")
+        .expect("genesis present without an explicit 0x prefix");
+    assert_eq!(by_no_prefix.height, 0);
+
+    // The signed action's hash (its signature) is real hex, stored canonically
+    // (as `hex::encode` always produces it) — a differently-cased query must
+    // still find it, and so must one without the `0x` prefix.
+    let signed = storage::get_action_by_hash(&pool, &chain, "0xABCDEF")
+        .await
+        .expect("query")
+        .expect("signed action present regardless of query case");
+    assert_eq!(signed.action_hash, "0xabcdef");
+    let signed_no_prefix = storage::get_action_by_hash(&pool, &chain, "ABCDEF")
+        .await
+        .expect("query")
+        .expect("signed action present without an explicit 0x prefix");
+    assert_eq!(signed_no_prefix.action_hash, "0xabcdef");
+
+    // The unsigned action's positional identity is "1:1" — not hex, so it
+    // must be looked up byte-for-byte, and a case/prefix change to it is a
+    // different (missing) identity, not the same one.
+    let unsigned = storage::get_action_by_hash(&pool, &chain, "1:1")
+        .await
+        .expect("query")
+        .expect("unsigned action present under its exact positional identity");
+    assert_eq!(unsigned.action_hash, "1:1");
+    assert!(
+        storage::get_action_by_hash(&pool, &chain, "0x1:1")
+            .await
+            .expect("query")
+            .is_none(),
+        "a positional identity is not a hash and must not gain a 0x prefix"
+    );
+}
