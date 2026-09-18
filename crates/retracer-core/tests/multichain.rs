@@ -4,40 +4,23 @@
 //! tests — CI runs `cargo test --workspace` with no database.
 //!
 //! `run()` blocks until a chain task ends, so these stop at `add_chain`: what
-//! they establish is that two chains with *different payload types* can be
-//! registered against one Runner, which is the claim the type signature makes
-//! and the reason multi-chain isn't expressible as a config file.
+//! they establish is that two chains can be registered against one Runner,
+//! each with its own node and pipeline.
 
+use retracer_core::rpc_block::RpcBlock;
 use retracer_core::{ChainConfig, ChainHooks, NodeRpcToken, Runner};
-use serde::{Deserialize, Serialize};
 use sqlx::Row;
-use xc_primitives::Block;
-
-#[derive(Serialize, Deserialize)]
-enum HubPayload {
-    Transfer { amount: u64 },
-}
-
-/// Shares no variants with `HubPayload` — the point being that one Runner
-/// holds pipelines for both.
-#[derive(Serialize, Deserialize)]
-enum SpokePayload {
-    MintNft { token_id: u64 },
-}
 
 fn config(chain_id: &str, name: &str) -> ChainConfig {
     ChainConfig {
         chain_id: chain_id.to_string(),
         display_name: Some(name.to_string()),
-        bootnodes: Vec::new(),
-        // 0 = pick a free port; these listeners just idle, nothing dials them.
-        port: 0,
         blocks_topic: format!("{chain_id}/blocks/v1"),
         sync_protocol: format!("/{chain_id}/sync/1"),
-        max_pending_blocks: 128,
         finality_depth: 12,
         kind_schema: "does-not-exist.toml".to_string(),
-        node_rpc_url: None,
+        // Nothing listens here; the poller just logs and retries.
+        node_rpc_url: "http://127.0.0.1:9".to_string(),
         node_rpc_token: None,
     }
 }
@@ -81,12 +64,12 @@ async fn one_runner_follows_two_chains_with_different_payload_types() {
     let spoke = format!("mc-spoke-{pid}");
 
     runner
-        .add_chain::<Block<HubPayload>>(config(&hub, "Hub"), ChainHooks::default())
+        .add_chain::<RpcBlock>(config(&hub, "Hub"), ChainHooks::default())
         .await
         .expect("hub registers");
     // Different `B` on the same Runner — this is the whole feature.
     runner
-        .add_chain::<Block<SpokePayload>>(config(&spoke, "Spoke A"), ChainHooks::default())
+        .add_chain::<RpcBlock>(config(&spoke, "Spoke A"), ChainHooks::default())
         .await
         .expect("spoke registers");
 
@@ -119,12 +102,12 @@ async fn adding_the_same_chain_twice_is_refused() {
     let chain = format!("mc-dupe-{}", std::process::id());
 
     runner
-        .add_chain::<Block<HubPayload>>(config(&chain, "First"), ChainHooks::default())
+        .add_chain::<RpcBlock>(config(&chain, "First"), ChainHooks::default())
         .await
         .expect("first registration");
 
     let err = runner
-        .add_chain::<Block<HubPayload>>(config(&chain, "Second"), ChainHooks::default())
+        .add_chain::<RpcBlock>(config(&chain, "Second"), ChainHooks::default())
         .await
         .expect_err("duplicate must be refused");
     assert!(format!("{err:#}").contains("added twice"), "got: {err:#}");

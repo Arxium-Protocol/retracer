@@ -1,12 +1,8 @@
 //! Following a Hub and a Spoke from one process, one database, one API.
 //!
-//! The single-chain example (`src/main.rs`) is the common case. This is the one
-//! that needs showing, because it's the part you cannot express in a config
-//! file: each chain carries its own Rust payload type, so chains are added one
-//! at a time and `add_chain::<B>` builds a separate pipeline for each.
-//!
-//! Here the Hub runs CoreChain's payload and the Spoke runs MintChain's. They
-//! share nothing but the block envelope, and they're served from one endpoint.
+//! The single-chain example (`src/main.rs`) is the common case. Chains are
+//! added one at a time — each gets its own node, kind schema, address format
+//! and Tier B extractors — and served from one endpoint.
 //!
 //! ```text
 //! cargo run -p spoke-indexer --bin multi_chain
@@ -17,11 +13,9 @@
 //! Over gRPC the same choice is the `x-chain-id` header.
 
 use anyhow::Result;
-use ingestion::ActionPayload as CorePayload;
+use retracer_core::rpc_block::RpcBlock;
 use retracer_core::{ChainConfig, ChainHooks, Runner};
-use spoke_indexer::MintPayload;
 use std::sync::Arc;
-use xc_primitives::Block;
 
 const DATABASE_URL: &str = "postgres://retracer:retracer@localhost:5433/retracer";
 
@@ -46,21 +40,18 @@ async fn main() -> Result<()> {
     // with no `x-chain-id` header, which is what keeps existing single-chain
     // clients working when you add a second chain.
     runner
-        .add_chain::<Block<CorePayload>>(
+        .add_chain::<RpcBlock>(
             ChainConfig {
                 chain_id: "corechain-devnet".into(),
                 display_name: Some("Arxium CoreChain".into()),
-                bootnodes: vec![],
-                port: 0,
-                blocks_topic: ingestion::default_blocks_topic("corechain-devnet"),
-                sync_protocol: ingestion::default_sync_protocol("corechain-devnet"),
-                max_pending_blocks: ingestion::DEFAULT_MAX_PENDING_BLOCKS,
+                blocks_topic: retracer_core::default_blocks_topic("corechain-devnet"),
+                sync_protocol: retracer_core::default_sync_protocol("corechain-devnet"),
                 // CoreChain is single-proposer with no forks, so nothing to
                 // un-index. Zero declares that rather than leaving a rollback
                 // budget nothing will ever spend.
                 finality_depth: 0,
                 kind_schema: "kind_schema.toml".into(),
-                node_rpc_url: None,
+                node_rpc_url: "http://127.0.0.1:8081".into(),
                 node_rpc_token: None,
             },
             ChainHooks {
@@ -70,24 +61,18 @@ async fn main() -> Result<()> {
         )
         .await?;
 
-    // Different payload type, different address format, different topic, its
-    // own finality depth — and, because it can fork, a real rollback budget.
+    // Different node, different address format, its own finality depth — and,
+    // because it can fork, a real rollback budget.
     runner
-        .add_chain::<Block<MintPayload>>(
+        .add_chain::<RpcBlock>(
             ChainConfig {
                 chain_id: "mintchain-devnet".into(),
                 display_name: Some("MintChain".into()),
-                bootnodes: vec![],
-                port: 0,
-                // Must match what MintChain's node publishes. Not derived from
-                // chain_id: it's a wire agreement with that node, and two
-                // chains sharing a gossip mesh need distinct topics.
                 blocks_topic: "mintchain/blocks/v1".into(),
                 sync_protocol: "/mintchain/sync/1".into(),
-                max_pending_blocks: ingestion::DEFAULT_MAX_PENDING_BLOCKS,
                 finality_depth: 32,
                 kind_schema: "examples/spoke-indexer/kind_schema.toml".into(),
-                node_rpc_url: None,
+                node_rpc_url: "http://127.0.0.1:8082".into(),
                 node_rpc_token: None,
             },
             ChainHooks {

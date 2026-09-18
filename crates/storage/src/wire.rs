@@ -7,10 +7,10 @@
 //! for every address. A chain that hashes differently would have had correct
 //! rows written under silently wrong hashes, which is worse than a hard error.
 //!
-//! These two traits are everything `storage` reads off a block. A chain built
-//! on `xc-primitives` gets the impls for free (below, behind the default
-//! `xc-primitives` feature); one that isn't implements them for its own types
-//! and never links Arxium code at all.
+//! These two traits are everything `storage` reads off a block. `retracer-core`
+//! implements them for the block JSON an Arxium node serves over RPC
+//! (`rpc_block::RpcBlock`); a chain with a different envelope implements them
+//! for its own types and never links Arxium code at all.
 
 use anyhow::Result;
 
@@ -66,25 +66,58 @@ pub trait IndexableAction {
     fn payload_json(&self) -> Result<serde_json::Value>;
 }
 
-/// Blanket impls for chains built on `xc-primitives`, which is every Arxium
-/// chain today. Behind a default-on feature so a builder who is *not* on
-/// `xc-primitives` can switch it off and compile `storage` without the Arxium
-/// path dependency at all.
-#[cfg(feature = "xc-primitives")]
-mod xc_impls {
+/// A minimal block/action pair for tests: deterministic hash from its fields,
+/// addresses and payloads as plain values. Public so every crate's tests can
+/// build chains without a real node's types.
+#[doc(hidden)]
+pub mod testing {
     use super::{IndexableAction, IndexableBlock};
     use anyhow::Result;
-    use serde::Serialize;
-    use xc_primitives::{Action, Block};
+    use std::hash::{DefaultHasher, Hash, Hasher};
 
-    impl<P: Serialize> IndexableBlock for Block<P> {
-        type Action = Action<P>;
+    #[derive(Clone, Debug)]
+    pub struct TestBlock {
+        pub height: u64,
+        pub parent_hash: String,
+        pub timestamp: u64,
+        pub proposer: Option<String>,
+        pub round: u32,
+        pub actions: Vec<TestAction>,
+    }
 
+    #[derive(Clone, Debug)]
+    pub struct TestAction {
+        pub sender: String,
+        pub signature: Option<String>,
+        pub payload: serde_json::Value,
+    }
+
+    impl TestBlock {
+        /// `sha256(bincode(block))` stand-in: differs whenever any indexed
+        /// field differs, so two forks at one height get two hashes.
+        pub fn hash(&self) -> String {
+            let mut h = DefaultHasher::new();
+            self.height.hash(&mut h);
+            self.parent_hash.hash(&mut h);
+            self.timestamp.hash(&mut h);
+            self.proposer.hash(&mut h);
+            self.round.hash(&mut h);
+            for a in &self.actions {
+                a.sender.hash(&mut h);
+                a.signature.hash(&mut h);
+                a.payload.to_string().hash(&mut h);
+            }
+            format!("0x{:016x}", h.finish())
+        }
+    }
+
+    impl IndexableBlock for TestBlock {
+        type Action = TestAction;
         fn height(&self) -> u64 {
             self.height
         }
         fn hash(&self) -> String {
-            Block::hash(self)
+            TestBlock::hash(self)
         }
         fn parent_hash(&self) -> String {
             self.parent_hash.clone()
@@ -93,9 +126,9 @@ mod xc_impls {
             self.timestamp
         }
         fn proposer(&self) -> Option<String> {
-            self.proposer.as_ref().map(|p| p.to_string())
+            self.proposer.clone()
         }
-        fn actions(&self) -> &[Self::Action] {
+        fn actions(&self) -> &[TestAction] {
             &self.actions
         }
         fn round(&self) -> u32 {
@@ -103,22 +136,16 @@ mod xc_impls {
         }
     }
 
-    impl<P: Serialize> IndexableAction for Action<P> {
+    impl IndexableAction for TestAction {
         fn sender(&self) -> String {
-            self.sender.to_string()
+            self.sender.clone()
         }
-
-        /// An Arxium action's signature is its identity: it is unique per
-        /// action (it covers sender + nonce + payload) and stable across
-        /// re-delivery. Empty is treated as absent rather than as an id — an
-        /// empty string is not a signature, and letting it through would
-        /// recreate the collision `identity`'s docs describe.
+        /// Empty is absent, same rule as a real signature.
         fn identity(&self) -> Option<String> {
             self.signature.clone().filter(|s| !s.is_empty())
         }
-
         fn payload_json(&self) -> Result<serde_json::Value> {
-            Ok(serde_json::to_value(&self.payload)?)
+            Ok(self.payload.clone())
         }
     }
 }

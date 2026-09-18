@@ -142,16 +142,8 @@ say "Installing retracerd ${version}"
 base_path="$(ask 'Install directory' "$base_path")"
 case "$base_path" in "~"*) base_path="${HOME}${base_path#\~}" ;; esac
 
-bootnodes="$(ask 'Bootnode multiaddrs (comma-separated, blank = none)' '')"
-# Strip an accidentally pasted "--bootnodes " / "--bootnodes=" prefix — the
-# CLI help text prints the flag right next to the value, so pasting the
-# whole thing here is an easy mistake and silently breaks multiaddr parsing
-# at startup otherwise.
-bootnodes="${bootnodes#--bootnodes=}"
-bootnodes="${bootnodes#--bootnodes}"
-bootnodes="${bootnodes# }"
 database_url="$(ask 'Postgres URL' 'postgres://retracer:retracer@localhost:5433/retracer')"
-node_rpc_url="$(ask "Chain node RPC URL (blank disables validator-uptime endpoint)" '')"
+node_rpc_url="$(ask 'Chain node RPC URL' 'http://127.0.0.1:8081')"
 auth_token="$(ask 'Auth token (blank = HTTP/gRPC surfaces stay open, generate one with: openssl rand -hex 32)' '')"
 
 if [ -z "$auth_token" ] && [ "$assume_yes" -ne 1 ]; then
@@ -221,14 +213,10 @@ else
 #
 # Apply changes with: systemctl restart retracerd
 
-# Comma-separated peer multiaddrs to dial on startup.
-RETRACER_BOOTNODES=$bootnodes
-
 # Bring your own — retracerd does not run Postgres for you.
 RETRACER_DATABASE_URL=$database_url
 
-# This chain's node HTTP RPC. Only used for the validator-uptime endpoint;
-# leave blank to disable it.
+# This chain's node HTTP RPC; blocks are read from it.
 RETRACER_NODE_RPC_URL=$node_rpc_url
 
 # Shared secret required as "Authorization: Bearer <token>" on the HTTP and

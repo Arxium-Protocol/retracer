@@ -35,7 +35,7 @@ cat <<DONE
 Setup complete.
 
   Database   $DB_URL (override with --database-url or RETRACER_TEST_DATABASE_URL)
-  Run        cargo run -p retracerd -- --bootnodes <multiaddr> --database-url <your-postgres-url>
+  Run        cargo run -p retracerd -- --node-rpc-url <url> --database-url <your-postgres-url>
   Test       ./scripts/test.sh
   Reset DB   ./scripts/reset-db.sh
 

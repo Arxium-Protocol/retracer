@@ -5,7 +5,7 @@ use sqlx::postgres::PgPoolOptions;
 mod schema;
 mod wire;
 pub use schema::{ActionIndexable, AddressExtractor, KindSchema, Projection, ProjectionType, Role};
-pub use wire::{IndexableAction, IndexableBlock};
+pub use wire::{IndexableAction, IndexableBlock, testing};
 
 /// Decides whether a string is a well-formed address on this chain. Injected
 /// rather than hardcoded because address format is chain-specific — Arxium's
@@ -1013,7 +1013,7 @@ pub struct BlockRow {
     pub timestamp: i64,
     pub proposer: Option<String>,
     /// How many of `actions` are `kind == "unknown"` — a tolerant decode
-    /// (see `corechain_wire::tolerant_decoder`) couldn't interpret their
+    /// (the old P2P wire decoder) couldn't interpret their
     /// payload, but kept them as rows rather than dropping them, so the
     /// block stays complete. Derived from `actions` at construction time,
     /// not stored: "unknown" is exactly what `split_kind` produces for a
@@ -1321,41 +1321,27 @@ fn split_kind(payload_json: serde_json::Value) -> (String, serde_json::Value) {
     }
 }
 
-#[cfg(all(test, feature = "xc-primitives"))]
+#[cfg(test)]
 mod tests {
     use super::*;
-    use xc_primitives::{Action, Address, Block};
+    use crate::testing::{TestAction, TestBlock};
 
-    #[derive(serde::Serialize)]
-    enum TestPayload {
-        Noop,
-    }
-
-    fn addr() -> Address {
-        Address::from_pubkey_bytes(&[7u8; 32]).expect("32 bytes is a valid pubkey")
-    }
-
-    fn action(signature: Option<&str>) -> Action<TestPayload> {
-        Action {
-            sender: addr(),
-            nonce: 0,
+    fn action(signature: Option<&str>) -> TestAction {
+        TestAction {
+            sender: "arx1test07".into(),
             signature: signature.map(str::to_string),
-            payload: TestPayload::Noop,
+            payload: serde_json::json!("Noop"),
         }
     }
 
-    fn block_with(actions: Vec<Action<TestPayload>>) -> Block<TestPayload> {
-        Block {
+    fn block_with(actions: Vec<TestAction>) -> TestBlock {
+        TestBlock {
             height: 9,
             parent_hash: String::new(),
             timestamp: 0,
-            actions,
-            tx_root: [0; 32],
             proposer: None,
-            signature: None,
-            state_root: String::new(),
             round: 0,
-            round_certificate: None,
+            actions,
         }
     }
 

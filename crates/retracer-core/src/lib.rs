@@ -16,13 +16,12 @@
 //!   Spokes can be followed together even though their payloads differ.
 
 pub mod auth;
-pub mod corechain_wire;
+pub mod rpc_block;
 pub mod tip;
 
 pub use rest_service::NodeRpcToken;
 
 use anyhow::{Context, Result};
-use libp2p::Multiaddr;
 use sqlx::PgPool;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
@@ -98,6 +97,7 @@ const DEFAULT_READ_POOL_SIZE: u32 = 16;
 /// Matches The Graph's `ETHEREUM_REORG_THRESHOLD` default. Irrelevant on a
 /// fork-free chain like CoreChain, where no rollback ever triggers.
 const DEFAULT_FINALITY_DEPTH: u64 = 250;
+const DEFAULT_NODE_RPC_URL: &str = "http://127.0.0.1:8081";
 /// Per-subscriber backlog on the live block stream.
 ///
 // ponytail: fixed backlog per subscriber; a subscriber more than this many
@@ -111,24 +111,22 @@ pub struct ChainConfig {
     pub chain_id: String,
     /// Free-text label for `ListChains`; `chain_id` remains the stable key.
     pub display_name: Option<String>,
-    pub bootnodes: Vec<Multiaddr>,
-    pub port: u16,
     /// The gossip topic and sync protocol this chain's *node* publishes on.
-    /// Deliberately not derived from `chain_id` — see `ingestion::Config`.
+    /// Not read by ingestion any more (blocks come over RPC), but still
+    /// registered and reported: `ExplorerApi` derives the genesis hash from
+    /// `blocks_topic`, and both name the chain a node is on.
     pub blocks_topic: String,
     pub sync_protocol: String,
-    pub max_pending_blocks: usize,
     /// Deepest reorg to un-index before refusing and stalling. Zero declares
     /// the chain fork-free.
     pub finality_depth: u64,
     pub kind_schema: String,
     /// Base URL of this chain's own node HTTP RPC (e.g.
-    /// `http://127.0.0.1:8081`), used only for `GET /validators?height=N` —
-    /// the same public endpoint any external participant could call, not a
-    /// privileged one (see `Retracer_Design.md`'s boundary rules). `None`
-    /// disables the validator-uptime endpoint; there's no safe default to
-    /// guess since it's a different address than the p2p bootnodes.
-    pub node_rpc_url: Option<String>,
+    /// `http://127.0.0.1:8081`): where blocks are read from, and what the
+    /// validator-uptime endpoint queries. The same public endpoint any
+    /// external participant could call, not a privileged one (see
+    /// `Retracer_Design.md`'s boundary rules).
+    pub node_rpc_url: String,
     /// Optional bearer credential for this chain's node HTTP RPC. Its Debug
     /// representation is redacted by [`NodeRpcToken`].
     pub node_rpc_token: Option<NodeRpcToken>,
@@ -205,11 +203,24 @@ fn validate_rate_limit_rps(rps: u32, source: &str) -> Result<()> {
 
 /// `retracerd --help` text. Kept in sync with `parse_args`'s match arms by
 /// the `usage_lists_every_flag` test below — add a flag to both or neither.
-/// The Arxium git rev this build's wire types are pinned to — set by
-/// `build.rs` from the workspace `Cargo.toml`. A node on a different rev may
-/// produce blocks this Retracer silently misdecodes (bincode carries no
-/// version tag), so every surface that identifies the build reports it.
-pub const ARXIUM_NODE_REV: &str = env!("ARXIUM_NODE_REV");
+/// Oldest node this build reads blocks from, as `/status.version` reports it
+/// (`ingestion::rpc::MIN_NODE_VERSION`). Reported wherever the build
+/// identifies itself so an operator can tell at a glance whether their node
+/// is new enough.
+pub const MIN_NODE_VERSION: &str = "0.2.0";
+
+/// Must match `arxd/network::gossip::blocks_topic`: the node scopes gossip by
+/// its genesis-hash-derived chain ID. Still reported per chain (see
+/// `ChainConfig::blocks_topic`) even though blocks no longer arrive over it.
+pub fn default_blocks_topic(chain_id: &str) -> String {
+    format!("arxium/blocks/v1/{chain_id}")
+}
+
+/// Must match `xc_wire::sync_protocol`. Same status as
+/// [`default_blocks_topic`].
+pub fn default_sync_protocol(chain_id: &str) -> String {
+    format!("/arxium/sync/1/{chain_id}")
+}
 
 pub const USAGE: &str = "\
 retracerd - a Retracer indexer for one chain
@@ -218,10 +229,9 @@ USAGE:
     retracerd [OPTIONS]
 
 OPTIONS:
-    --bootnodes <multiaddrs>       Comma-separated peer multiaddrs to dial on startup.
-                                   [default: none] [env: RETRACER_BOOTNODES]
-    --port <u16>                   P2P listen port; 0 picks a free one.
-                                   [default: 0]
+    --node-rpc-url <url>           This chain's node HTTP RPC base URL; blocks are read
+                                   from it. Refuses a node reporting xc-rpc < 0.2.0.
+                                   [default: http://127.0.0.1:8081] [env: RETRACER_NODE_RPC_URL]
     --database-url <url>           Postgres connection string.
                                    [default: postgres://retracer:retracer@localhost:5433/retracer]
                                    [env: RETRACER_DATABASE_URL]
@@ -240,12 +250,11 @@ OPTIONS:
     --reindex-addresses            Re-run the kind schema's role extraction over
                                    every stored action at startup (after editing
                                    kind_schema.toml), then follow the chain as usual.
-    --blocks-topic <topic>         Must match the node's gossip topic.
+    --blocks-topic <topic>         The node's gossip topic, reported per chain (the
+                                   explorer derives the genesis hash from it).
                                    [default: derived from --chain-id]
-    --sync-protocol <protocol>     Must match the node's sync protocol.
+    --sync-protocol <protocol>     The node's sync protocol, reported per chain.
                                    [default: derived from --chain-id]
-    --max-pending-blocks <usize>   Gap-fill buffer cap; must be at least 1.
-                                   [default: 4096]
     --write-pool-size <u32>        Postgres connections for the writer; must be at least 1.
                                    [default: 4]
     --read-pool-size <u32>        Postgres connections for reads; must be at least 1.
@@ -253,9 +262,6 @@ OPTIONS:
     --finality-depth <u64>         Fallback rollback limit, used only when the node reports no
                                    finality.
                                    [default: 250]
-    --node-rpc-url <url>           This chain's node HTTP RPC base URL. Only used for the
-                                   validator-uptime endpoint; unset disables it.
-                                   [default: none] [env: RETRACER_NODE_RPC_URL]
     --node-rpc-token <token>       Bearer token sent on every HTTP request to this chain's node
                                    RPC. Prefer RETRACER_NODE_RPC_TOKEN so the value is not
                                    visible in process arguments.
@@ -279,20 +285,10 @@ OPTIONS:
 /// [`ChainConfig`]s themselves and drive a [`Runner`], because each chain needs
 /// its own Rust block type and that can't come from a flag.
 pub fn parse_args() -> Result<Args> {
-    // RETRACER_BOOTNODES/RETRACER_DATABASE_URL seed the same defaults a flag
-    // would override, so a builder can put them in .env once instead of
-    // retyping --bootnodes/--database-url on every run. Precedence is flag >
+    // RETRACER_NODE_RPC_URL/RETRACER_DATABASE_URL seed the same defaults a
+    // flag would override, so a builder can put them in .env once instead of
+    // retyping --node-rpc-url/--database-url on every run. Precedence is flag >
     // env > hardcoded default.
-    let mut bootnodes = Vec::new();
-    if let Ok(value) = std::env::var("RETRACER_BOOTNODES") {
-        for addr in value.split(',').filter(|s| !s.is_empty()) {
-            bootnodes.push(
-                addr.parse()
-                    .with_context(|| format!("invalid multiaddr: {addr}"))?,
-            );
-        }
-    }
-    let mut port = 0u16;
     let mut database_url =
         std::env::var("RETRACER_DATABASE_URL").unwrap_or_else(|_| DEFAULT_DATABASE_URL.to_string());
     let mut chain_id = DEFAULT_CHAIN_ID.to_string();
@@ -310,7 +306,6 @@ pub fn parse_args() -> Result<Args> {
     let mut reindex_addresses = false;
     let mut blocks_topic = None;
     let mut sync_protocol = None;
-    let mut max_pending_blocks = ingestion::DEFAULT_MAX_PENDING_BLOCKS;
     let mut write_pool_size = DEFAULT_WRITE_POOL_SIZE;
     let mut read_pool_size = DEFAULT_READ_POOL_SIZE;
     let mut finality_depth = DEFAULT_FINALITY_DEPTH;
@@ -320,7 +315,8 @@ pub fn parse_args() -> Result<Args> {
     // `Authorization` header value equals "Bearer " with nothing after it.
     let mut node_rpc_url = std::env::var("RETRACER_NODE_RPC_URL")
         .ok()
-        .filter(|v| !v.is_empty());
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| DEFAULT_NODE_RPC_URL.to_string());
     let mut node_rpc_token = std::env::var("RETRACER_NODE_RPC_TOKEN")
         .ok()
         .filter(|v| !v.is_empty())
@@ -346,20 +342,6 @@ pub fn parse_args() -> Result<Args> {
     let mut args = std::env::args().skip(1);
     while let Some(flag) = args.next() {
         match flag.as_str() {
-            "--bootnodes" => {
-                let value = args.next().context("--bootnodes requires a value")?;
-                bootnodes.clear();
-                for addr in value.split(',').filter(|s| !s.is_empty()) {
-                    bootnodes.push(
-                        addr.parse()
-                            .with_context(|| format!("invalid multiaddr: {addr}"))?,
-                    );
-                }
-            }
-            "--port" => {
-                let value = args.next().context("--port requires a value")?;
-                port = value.parse().context("--port must be a u16")?;
-            }
             "--database-url" => {
                 database_url = args.next().context("--database-url requires a value")?;
             }
@@ -399,18 +381,6 @@ pub fn parse_args() -> Result<Args> {
             "--sync-protocol" => {
                 sync_protocol = Some(args.next().context("--sync-protocol requires a value")?);
             }
-            "--max-pending-blocks" => {
-                let value = args
-                    .next()
-                    .context("--max-pending-blocks requires a value")?;
-                max_pending_blocks = value
-                    .parse()
-                    .context("--max-pending-blocks must be a usize")?;
-                anyhow::ensure!(
-                    max_pending_blocks > 0,
-                    "--max-pending-blocks must be at least 1"
-                );
-            }
             "--write-pool-size" => {
                 let value = args.next().context("--write-pool-size requires a value")?;
                 write_pool_size = value.parse().context("--write-pool-size must be a u32")?;
@@ -426,7 +396,7 @@ pub fn parse_args() -> Result<Args> {
                 finality_depth = value.parse().context("--finality-depth must be a u64")?;
             }
             "--node-rpc-url" => {
-                node_rpc_url = Some(args.next().context("--node-rpc-url requires a value")?);
+                node_rpc_url = args.next().context("--node-rpc-url requires a value")?;
             }
             "--node-rpc-token" => {
                 let value = args.next().context("--node-rpc-token requires a value")?;
@@ -449,9 +419,8 @@ pub fn parse_args() -> Result<Args> {
             other => anyhow::bail!("unknown flag: {other} (run with --help to list flags)"),
         }
     }
-    let blocks_topic = blocks_topic.unwrap_or_else(|| ingestion::default_blocks_topic(&chain_id));
-    let sync_protocol =
-        sync_protocol.unwrap_or_else(|| ingestion::default_sync_protocol(&chain_id));
+    let blocks_topic = blocks_topic.unwrap_or_else(|| default_blocks_topic(&chain_id));
+    let sync_protocol = sync_protocol.unwrap_or_else(|| default_sync_protocol(&chain_id));
     Ok(Args {
         database_url,
         grpc_port,
@@ -463,11 +432,8 @@ pub fn parse_args() -> Result<Args> {
         chain: ChainConfig {
             chain_id,
             display_name: None,
-            bootnodes,
-            port,
             blocks_topic,
             sync_protocol,
-            max_pending_blocks,
             finality_depth,
             kind_schema,
             node_rpc_url,
@@ -480,17 +446,13 @@ pub fn parse_args() -> Result<Args> {
     })
 }
 
-/// Connects, migrates, and follows one chain until its p2p task exits.
+/// Connects, migrates, and follows one chain until its ingestion task exits.
 ///
-/// `B` is the chain's block type. It is a generic parameter rather than a config
-/// value because the wire format is bincode, which is not self-describing:
-/// decoding needs the sender's exact Rust layout at compile time. A chain built
-/// on `xc-primitives` passes `Block<TheirPayload>` and gets the
-/// `storage::IndexableBlock` impl for free; one with a different block envelope
-/// implements that trait plus `ingestion::HasHeight` for its own type and needs
-/// no fork of these crates. `retracerd` uses [`corechain_wire::CoreChainBlock`]
-/// so released and current CoreChain blocks retain their generation-specific
-/// hashes after decoding.
+/// `B` is the chain's block type as its node's `GET /blocks` serves it — for
+/// any Arxium-stack chain that's [`rpc_block::RpcBlock`]. A chain whose node
+/// serves a different JSON envelope implements `storage::IndexableBlock` +
+/// `ingestion::HasHeight` for its own serde type and needs no fork of these
+/// crates.
 ///
 /// A convenience wrapper over [`Runner`] for the one-chain case.
 pub async fn run<B>(args: Args, hooks: ChainHooks) -> Result<()>
@@ -502,69 +464,30 @@ where
         + Sync
         + 'static,
 {
-    let mut runner = Runner::new(
-        &args.database_url,
-        args.write_pool_size,
-        args.read_pool_size,
-        args.grpc_port,
-    )
-    .await?
-    .with_rest_port(args.rest_port)
-    .with_grpc_bind(args.grpc_bind)
-    .with_rest_bind(args.rest_bind)
-    .with_auth_token(args.auth_token)
-    .with_rate_limit_rps(args.rate_limit_rps)
-    .with_trusted_proxies(args.trusted_proxies);
-    runner.add_chain::<B>(args.chain, hooks).await?;
-    runner.run().await
-}
-
-/// One-chain convenience wrapper with an explicit historical wire decoder.
-pub async fn run_with_decoder<B>(
-    args: Args,
-    hooks: ChainHooks,
-    decoder: ingestion::WireDecoder<B>,
-) -> Result<()>
-where
-    B: ingestion::HasHeight + storage::IndexableBlock + Send + Sync + 'static,
-{
-    run_with_decoder_and_certificate_verifier(args, hooks, decoder, None).await
-}
-
-/// One-chain wrapper that lets a chain supply independently-verifiable
-/// certificate finality without changing the generic multi-chain API.
-pub async fn run_with_decoder_and_certificate_verifier<B>(
-    args: Args,
-    hooks: ChainHooks,
-    decoder: ingestion::WireDecoder<B>,
-    certificate_verifier: Option<ingestion::CertificateVerifier>,
-) -> Result<()>
-where
-    B: ingestion::HasHeight + storage::IndexableBlock + Send + Sync + 'static,
-{
-    let mut runner = Runner::new(
-        &args.database_url,
-        args.write_pool_size,
-        args.read_pool_size,
-        args.grpc_port,
-    )
-    .await?
-    .with_rest_port(args.rest_port)
-    .with_grpc_bind(args.grpc_bind)
-    .with_rest_bind(args.rest_bind)
-    .with_auth_token(args.auth_token)
-    .with_rate_limit_rps(args.rate_limit_rps)
-    .with_trusted_proxies(args.trusted_proxies);
+    let mut runner = runner_from_args(&args).await?;
     let chain_id = args.chain.chain_id.clone();
-    runner
-        .add_chain_with_decoder_and_certificate_verifier(
-            args.chain,
-            hooks,
-            decoder,
-            certificate_verifier,
-        )
-        .await?;
-    if args.reindex_addresses {
+    runner.add_chain::<B>(args.chain, hooks).await?;
+    finish(runner, &chain_id, args.reindex_addresses).await
+}
+
+async fn runner_from_args(args: &Args) -> Result<Runner> {
+    Ok(Runner::new(
+        &args.database_url,
+        args.write_pool_size,
+        args.read_pool_size,
+        args.grpc_port,
+    )
+    .await?
+    .with_rest_port(args.rest_port)
+    .with_grpc_bind(args.grpc_bind)
+    .with_rest_bind(args.rest_bind)
+    .with_auth_token(args.auth_token.clone())
+    .with_rate_limit_rps(args.rate_limit_rps)
+    .with_trusted_proxies(args.trusted_proxies.clone()))
+}
+
+async fn finish(runner: Runner, chain_id: &str, reindex_addresses: bool) -> Result<()> {
+    if reindex_addresses {
         let extractor = runner
             .runtimes
             .iter()
@@ -572,7 +495,7 @@ where
             .map(|r| r.address_extractor.clone())
             .expect("chain was just added");
         let added =
-            storage::reindex_action_addresses(&runner.write_pool, &chain_id, &extractor).await?;
+            storage::reindex_action_addresses(&runner.write_pool, chain_id, &extractor).await?;
         info!(chain_id, added, "action_addresses reindex complete");
     }
     runner.run().await
@@ -685,7 +608,9 @@ impl Runner {
         self
     }
 
-    /// Registers a chain and spawns its ingestion and indexing tasks.
+    /// Registers a chain and spawns its ingestion and indexing tasks. Blocks
+    /// are read over the node's HTTP RPC (`config.node_rpc_url`) — see
+    /// `ingestion::rpc`; finality comes from the node's `/status`.
     pub async fn add_chain<B>(&mut self, config: ChainConfig, hooks: ChainHooks) -> Result<()>
     where
         B: ingestion::HasHeight
@@ -695,31 +620,43 @@ impl Runner {
             + Sync
             + 'static,
     {
-        self.add_chain_with_decoder::<B>(config, hooks, ingestion::WireDecoder::<B>::exact())
-            .await
+        let node_rpc_url = config.node_rpc_url.clone();
+        let node_rpc_token = config
+            .node_rpc_token
+            .as_ref()
+            .map(|token| token.expose().to_owned());
+        self.add_chain_with_source::<B>(
+            config,
+            hooks,
+            move |resume_from, block_tx, rewind_rx, network_tx| {
+                tokio::spawn(ingestion::rpc::run(
+                    ingestion::rpc::RpcConfig {
+                        node_rpc_url,
+                        node_rpc_token,
+                        resume_from,
+                    },
+                    block_tx,
+                    rewind_rx,
+                    network_tx,
+                ))
+            },
+        )
+        .await
     }
 
-    /// Registers a chain with a documented historical wire compatibility
-    /// policy. Exact decoding remains the default through [`Self::add_chain`].
-    pub async fn add_chain_with_decoder<B>(
+    /// Everything a chain needs regardless of where its blocks come from;
+    /// `spawn_source` gets the resume height and the pipeline's ends and
+    /// starts the task that feeds them.
+    async fn add_chain_with_source<B>(
         &mut self,
         config: ChainConfig,
         hooks: ChainHooks,
-        decoder: ingestion::WireDecoder<B>,
-    ) -> Result<()>
-    where
-        B: ingestion::HasHeight + storage::IndexableBlock + Send + Sync + 'static,
-    {
-        self.add_chain_with_decoder_and_certificate_verifier(config, hooks, decoder, None)
-            .await
-    }
-
-    pub async fn add_chain_with_decoder_and_certificate_verifier<B>(
-        &mut self,
-        config: ChainConfig,
-        hooks: ChainHooks,
-        decoder: ingestion::WireDecoder<B>,
-        certificate_verifier: Option<ingestion::CertificateVerifier>,
+        spawn_source: impl FnOnce(
+            Option<u64>,
+            tokio::sync::mpsc::Sender<B>,
+            tokio::sync::mpsc::Receiver<u64>,
+            tokio::sync::watch::Sender<ingestion::NetworkView>,
+        ) -> JoinHandle<Result<()>>,
     ) -> Result<()>
     where
         B: ingestion::HasHeight + storage::IndexableBlock + Send + Sync + 'static,
@@ -730,9 +667,6 @@ impl Runner {
              interleave rollbacks and corrupt the index",
             config.chain_id
         );
-        if config.bootnodes.is_empty() {
-            info!(chain_id = %config.chain_id, "no bootnodes given; will only see blocks from peers that dial in");
-        }
 
         let cursor = storage::get_cursor(&self.write_pool, &config.chain_id).await?;
         info!(chain_id = %config.chain_id, ?cursor, "resuming ingestion");
@@ -784,7 +718,7 @@ impl Runner {
         let (network_tx, network_view) =
             tokio::sync::watch::channel(ingestion::NetworkView::default());
 
-        // Bounded so a stalled indexing loop applies backpressure to the p2p
+        // Bounded so a stalled indexing loop applies backpressure to the
         // receive loop in `ingestion::run` instead of buffering blocks in
         // memory without limit.
         let (block_tx, block_rx) = tokio::sync::mpsc::channel::<B>(300);
@@ -793,23 +727,11 @@ impl Runner {
         // rollback before reading again.
         let (rewind_tx, rewind_rx) = tokio::sync::mpsc::channel::<u64>(4);
 
-        let ingestion_config = ingestion::Config {
-            bootnodes: config.bootnodes,
-            listen_port: config.port,
-            resume_from: cursor.map(|height| height as u64 + 1),
-            blocks_topic: config.blocks_topic.clone(),
-            sync_protocol: config.sync_protocol.clone(),
-            max_pending_blocks: config.max_pending_blocks,
-        };
-        self.tasks.push(tokio::spawn(
-            ingestion::run_with_decoder_and_certificate_verifier(
-                ingestion_config,
-                block_tx,
-                rewind_rx,
-                network_tx,
-                decoder,
-                certificate_verifier,
-            ),
+        self.tasks.push(spawn_source(
+            cursor.map(|height| height as u64 + 1),
+            block_tx,
+            rewind_rx,
+            network_tx,
         ));
 
         self.tasks.push(tokio::spawn(index_chain(
@@ -833,7 +755,7 @@ impl Runner {
             address_validator: hooks.address_validator.clone(),
             projections,
             network_view: network_view.clone(),
-            node_rpc_url: config.node_rpc_url.clone(),
+            node_rpc_url: Some(config.node_rpc_url.clone()),
             node_rpc_token: config.node_rpc_token.clone(),
         });
         self.runtimes.push(grpc_service::ChainRuntime {
@@ -919,9 +841,12 @@ impl Runner {
         if let Some(rest_port) = self.rest_port {
             let rest_addr = SocketAddr::new(self.rest_bind, rest_port);
             let listener = bind_listener(rest_addr, "REST").await?;
-            let router = rest_service::router(self.read_pool.clone(), self.rest_chains, ARXIUM_NODE_REV).layer(
-                axum::middleware::from_fn_with_state(guard, auth::rest_guard),
-            );
+            let router =
+                rest_service::router(self.read_pool.clone(), self.rest_chains, MIN_NODE_VERSION)
+                    .layer(axum::middleware::from_fn_with_state(
+                        guard,
+                        auth::rest_guard,
+                    ));
             info!(%rest_addr, "REST listening");
             let service = router.into_make_service_with_connect_info::<SocketAddr>();
             let mut rest_stop = shutdown_rx.clone();
@@ -1251,8 +1176,6 @@ mod tests {
     /// test — add a flag to both `parse_args`'s match arms and here, or
     /// neither.
     const FLAGS: &[&str] = &[
-        "--bootnodes",
-        "--port",
         "--database-url",
         "--chain-id",
         "--rest-port",
@@ -1262,7 +1185,6 @@ mod tests {
         "--kind-schema",
         "--blocks-topic",
         "--sync-protocol",
-        "--max-pending-blocks",
         "--write-pool-size",
         "--read-pool-size",
         "--finality-depth",

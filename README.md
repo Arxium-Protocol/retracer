@@ -1,12 +1,13 @@
 # Retracer
 
-A read-only blockchain indexer for Arxium chains. It joins the P2P network as an
-ordinary peer, writes blocks and actions into Postgres, and serves them back
-over HTTP and gRPC — so explorers, wallet backends and dashboards don't have to
-hit node RPC or replay chain logic themselves.
+A read-only blockchain indexer for Arxium chains. It reads blocks off a node's
+public HTTP RPC (`/status`, `/blocks`), writes blocks and actions into Postgres,
+and serves them back over HTTP and gRPC — so explorers, wallet backends and
+dashboards don't have to hit node RPC or replay chain logic themselves.
 
-- **No privileged access.** Same gossipsub subscription and public sync protocol
-  any peer can use.
+- **No privileged access.** The same read-only RPC any client can call. No
+  Arxium crate is linked: blocks are plain JSON, and a node whose block shape
+  this build doesn't understand is refused at startup, not misread.
 - **Any Arxium-stack chain.** The payload type is yours; the indexer is generic
   over it. No forking required.
 - **Many chains, one endpoint.** Follow a Hub and its Spokes from one process
@@ -26,7 +27,7 @@ curl -fsSL https://raw.githubusercontent.com/Arxium-Protocol/retracer/main/scrip
 ```
 
 Downloads the latest `retracerd` release (checksum-verified), prompts for
-your bootnodes/database URL/auth token, and offers to install it as a
+your node RPC URL/database URL/auth token, and offers to install it as a
 systemd service. Read it before piping to `bash` if you'd rather:
 
 ```bash
@@ -45,7 +46,7 @@ Requires Rust (2024 edition).
 
 ```bash
 ./scripts/setup.sh            # checks tools, builds
-cp .env.example .env          # fill in RETRACER_DATABASE_URL/RETRACER_BOOTNODES
+cp .env.example .env          # fill in RETRACER_DATABASE_URL/RETRACER_NODE_RPC_URL
 
 cargo run -p retracerd
 ```
@@ -54,7 +55,7 @@ Or skip `.env` and pass flags directly:
 
 ```bash
 cargo run -p retracerd -- \
-  --bootnodes /ip4/127.0.0.1/tcp/30334/p2p/<peer-id> \
+  --node-rpc-url http://127.0.0.1:8081 \
   --database-url postgres://retracer:retracer@localhost:5433/retracer
 ```
 
@@ -88,30 +89,27 @@ answers — "not connected" and "caught up" are different states.
 
 ## Configuration
 
-All flags are optional; the defaults match a local devnet. `--bootnodes`,
+All flags are optional; the defaults match a local devnet. `--node-rpc-url`,
 `--database-url`, `--node-rpc-url`, `--node-rpc-token`, `--auth-token`, `--rate-limit-rps`,
 `--trusted-proxies`, `--grpc-bind` and `--rest-bind`
 can also come from a `.env` file (copy `.env.example`) via
-`RETRACER_BOOTNODES`/`RETRACER_DATABASE_URL`/`RETRACER_NODE_RPC_URL`/`RETRACER_NODE_RPC_TOKEN`/
+`RETRACER_DATABASE_URL`/`RETRACER_NODE_RPC_URL`/`RETRACER_NODE_RPC_TOKEN`/
 `RETRACER_AUTH_TOKEN`/`RETRACER_RATE_LIMIT_RPS`/`RETRACER_TRUSTED_PROXIES`/`RETRACER_GRPC_BIND`/
 `RETRACER_REST_BIND` — a flag always overrides the env value.
 
 | Flag | Default | Description |
 | --- | --- | --- |
-| `--bootnodes` | none | Comma-separated multiaddrs to dial |
-| `--port` | `0` | P2P listen port (`0` picks a free one) |
 | `--chain-id` | `corechain-devnet` | Label for this chain's rows. Not read off the wire |
 | `--database-url` | `postgres://retracer:retracer@localhost:5433/retracer` | Postgres connection string |
-| `--node-rpc-url` | none | This chain's node HTTP RPC base URL, e.g. `http://127.0.0.1:8081`. Only used for the validator-uptime endpoint; leave unset to disable it |
+| `--node-rpc-url` | `http://127.0.0.1:8081` | This chain's node HTTP RPC base URL. Blocks are read from it (`/status`, `/blocks`); refuses a node whose `/status` reports `xc-rpc` < 0.2.0 |
 | `--node-rpc-token` | none | Optional bearer token sent on every HTTP request to this chain's node RPC. Prefer `RETRACER_NODE_RPC_TOKEN` so the value is not visible in process arguments |
 | `--rest-port` | `8080` | HTTP API port; `0` disables it |
 | `--grpc-port` | `50051` | gRPC API port |
 | `--kind-schema` | `kind_schema.toml` | Payload field configuration |
 | `--reindex-addresses` | off | Re-run the kind schema's role extraction over every stored action at startup, then follow the chain as usual. Run once after adding a role to `kind_schema.toml` |
-| `--blocks-topic` | `arxium/blocks/v1` | Must match the node's gossip topic |
-| `--sync-protocol` | `/arxium/sync/1` | Must match the node's sync protocol |
+| `--blocks-topic` | `arxium/blocks/v1/<chain-id>` | The node's gossip topic, reported per chain (the explorer derives the genesis hash from it) |
+| `--sync-protocol` | `/arxium/sync/1/<chain-id>` | The node's sync protocol, reported per chain |
 | `--finality-depth` | `250` | Fallback rollback limit, used only when the node reports no finality |
-| `--max-pending-blocks` | `4096` | Gap-fill buffer cap |
 | `--write-pool-size` | `4` | Postgres connections for the writer |
 | `--read-pool-size` | `16` | Postgres connections for reads |
 | `--auth-token` | none | Shared secret required as `Authorization: Bearer <token>` on both surfaces (`/health` and `/ready` stay open). Unset = both surfaces stay open, same as today |
@@ -130,25 +128,6 @@ Both surfaces listen on loopback by default. Set `--grpc-bind`/`--rest-bind`
 (or the matching env vars) to a private or WireGuard address — never a public
 one — and turn on `--auth-token` before doing so: both surfaces are plaintext,
 and auth defaults off.
-
-### CoreChain wire compatibility
-
-The bundled CoreChain binary accepts both block generations used by supported
-Arxium nodes:
-
-- Arxium `v0.1.1` through `v0.1.5`, whose blocks do not contain `state_root`.
-- The current `state_root` block shape pinned in this workspace.
-
-Both gossip blocks and sync block pages are decoded with complete-input checks.
-Legacy hashes are computed from the legacy bytes, not from a current block with
-an invented empty root. Other chains remain exact-decoding-only unless their
-embedder supplies an explicit `WireDecoder`.
-
-Newer Arxium revisions chain-scope their network names. For those nodes, pass
-their exact `arxium/blocks/v1/<chain-id>` topic and
-`/arxium/sync/1/<chain-id>` protocol with the two flags above. This naming
-change is independent of the block encoding and cannot be inferred from
-`xc_wire::WIRE_VERSION`.
 
 ---
 
@@ -201,11 +180,9 @@ always has a body to alert on. See [Monitoring](#monitoring) below.
 `/v1/chains` includes each chain's `genesis_hash` from the node's own
 `/genesis-hash` (when `--node-rpc-url` is set) — `chain_id` is only this
 deployment's label; the genesis hash is the network's identity. It also
-carries `arxium_node_rev`, the Arxium git rev this build's wire types are
-pinned to (also printed by `retracerd --version`). The P2P wire is bincode
-with no version tag, so a node on a different rev can produce blocks this
-Retracer misdecodes without an error — check the rev before trusting a
-deployment against a node you didn't pin it to.
+carries `min_node_version`, the oldest node (`/status.version`, its `xc-rpc`
+crate version) this build reads blocks from — also printed by
+`retracerd --version`. An older node is refused at startup.
 
 `/actions` filters by `kind`, and by one indexed payload field with
 `field=$.path&value=` — the field must be declared as a `[[kind.index]]` for
@@ -449,7 +426,7 @@ Layout:
 
 | Crate | Role |
 | --- | --- |
-| `ingestion` | libp2p client: gossip + sync backfill |
+| `ingestion` | Node RPC poller: `/status` + `/blocks` pages |
 | `storage` | Postgres schema, writes, reads |
 | `grpc-service` | tonic server |
 | `rest-service` | axum HTTP server |

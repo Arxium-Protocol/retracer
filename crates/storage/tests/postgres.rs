@@ -15,8 +15,8 @@
 
 use serde::Serialize;
 use sqlx::{PgPool, Row};
+use storage::testing::{TestAction, TestBlock};
 use storage::{ActionIndexable, AddressExtractor, KindSchema, Role};
-use xc_primitives::{Action, Address, Block};
 
 #[derive(Serialize)]
 enum TestPayload {
@@ -39,31 +39,26 @@ fn chain_id(name: &str) -> String {
     format!("test-{name}-{}", std::process::id())
 }
 
-fn addr(byte: u8) -> Address {
-    Address::from_pubkey_bytes(&[byte; 32]).expect("32 bytes is a valid pubkey")
+fn addr(byte: u8) -> String {
+    format!("arx1test{byte:02x}")
 }
 
-fn action(sender: u8, signature: Option<&str>, payload: TestPayload) -> Action<TestPayload> {
-    Action {
+fn action(sender: u8, signature: Option<&str>, payload: TestPayload) -> TestAction {
+    TestAction {
         sender: addr(sender),
-        nonce: 0,
         signature: signature.map(str::to_string),
-        payload,
+        payload: serde_json::to_value(payload).expect("payload serializes"),
     }
 }
 
-fn block(height: u64, parent: &str, actions: Vec<Action<TestPayload>>) -> Block<TestPayload> {
-    Block {
+fn block(height: u64, parent: &str, actions: Vec<TestAction>) -> TestBlock {
+    TestBlock {
         height,
         parent_hash: parent.to_string(),
-        timestamp: 1_700_000_000 + height as i64 as u64,
-        actions,
-        tx_root: [0; 32],
+        timestamp: 1_700_000_000 + height,
         proposer: Some(addr(9)),
-        signature: None,
-        state_root: String::new(),
         round: 0,
-        round_certificate: None,
+        actions,
     }
 }
 
@@ -491,22 +486,14 @@ async fn list_proposed_heights_respects_bounds_and_skips_null_proposers() {
     let chain = chain_id("proposed-heights");
     let extractor = AddressExtractor::tier_a_only(KindSchema::empty());
 
-    let block_at = |height: u64,
-                     parent: &str,
-                     proposer: Option<u8>,
-                     round: u32|
-     -> Block<TestPayload> {
-        Block {
+    let block_at = |height: u64, parent: &str, proposer: Option<u8>, round: u32| -> TestBlock {
+        TestBlock {
             height,
             parent_hash: parent.to_string(),
             timestamp: 1_700_000_000 + height,
-            actions: vec![],
-            tx_root: [0; 32],
             proposer: proposer.map(addr),
-            signature: None,
-            state_root: String::new(),
             round,
-            round_certificate: None,
+            actions: vec![],
         }
     };
 
@@ -564,17 +551,13 @@ async fn insert_block_persists_round() {
     let chain = chain_id("block-round");
     let extractor = AddressExtractor::tier_a_only(KindSchema::empty());
 
-    let block = Block::<TestPayload> {
+    let block = TestBlock {
         height: 0,
         parent_hash: "0x0".to_string(),
         timestamp: 1_700_000_000,
-        actions: vec![],
-        tx_root: [0; 32],
         proposer: Some(addr(1)),
-        signature: None,
-        state_root: String::new(),
         round: 2,
-        round_certificate: None,
+        actions: vec![],
     };
     storage::insert_block(&pool, &chain, &block, &extractor)
         .await
@@ -629,7 +612,9 @@ async fn kind_field_filter_and_reindex() {
     .expect("write schema");
     let schema = KindSchema::load(&path).expect("load schema");
     let projection = schema.projections()[0].clone();
-    storage::create_projection_indexes(&pool, &schema).await.expect("indexes");
+    storage::create_projection_indexes(&pool, &schema)
+        .await
+        .expect("indexes");
     let extractor = AddressExtractor::new(schema, Vec::new());
 
     let to = addr(7).to_string();
@@ -637,18 +622,42 @@ async fn kind_field_filter_and_reindex() {
         1,
         "0x00",
         vec![
-            action(1, Some("s1"), TestPayload::Transfer { to: to.clone(), amount: 5 }),
-            action(1, Some("s2"), TestPayload::Transfer { to: to.clone(), amount: 9 }),
+            action(
+                1,
+                Some("s1"),
+                TestPayload::Transfer {
+                    to: to.clone(),
+                    amount: 5,
+                },
+            ),
+            action(
+                1,
+                Some("s2"),
+                TestPayload::Transfer {
+                    to: to.clone(),
+                    amount: 9,
+                },
+            ),
             action(2, Some("s3"), TestPayload::Noop),
         ],
     );
-    storage::insert_block(&pool, &chain, &b1, &extractor).await.expect("insert");
+    storage::insert_block(&pool, &chain, &b1, &extractor)
+        .await
+        .expect("insert");
 
-    let all = storage::list_actions(&pool, &chain, 10, None, None).await.expect("all");
+    let all = storage::list_actions(&pool, &chain, 10, None, None)
+        .await
+        .expect("all");
     assert_eq!(all.len(), 3);
 
-    let by_kind = storage::ActionFilter { kind: "Transfer", projection: None, value: None };
-    let transfers = storage::list_actions(&pool, &chain, 10, None, Some(&by_kind)).await.expect("kind");
+    let by_kind = storage::ActionFilter {
+        kind: "Transfer",
+        projection: None,
+        value: None,
+    };
+    let transfers = storage::list_actions(&pool, &chain, 10, None, Some(&by_kind))
+        .await
+        .expect("kind");
     assert_eq!(transfers.len(), 2);
 
     let by_field = storage::ActionFilter {
@@ -656,7 +665,9 @@ async fn kind_field_filter_and_reindex() {
         projection: Some(&projection),
         value: Some("9"),
     };
-    let nine = storage::list_actions(&pool, &chain, 10, None, Some(&by_field)).await.expect("field");
+    let nine = storage::list_actions(&pool, &chain, 10, None, Some(&by_field))
+        .await
+        .expect("field");
     assert_eq!(nine.len(), 1);
     assert_eq!(nine[0].action_hash, "s2");
 
@@ -677,10 +688,14 @@ async fn kind_field_filter_and_reindex() {
     )
     .expect("write schema");
     let extractor = AddressExtractor::new(KindSchema::load(&path).expect("reload"), Vec::new());
-    let added = storage::reindex_action_addresses(&pool, &chain, &extractor).await.expect("reindex");
+    let added = storage::reindex_action_addresses(&pool, &chain, &extractor)
+        .await
+        .expect("reindex");
     assert_eq!(added, 2);
     assert_eq!(count(&pool, "action_addresses", &chain).await, 2);
-    let again = storage::reindex_action_addresses(&pool, &chain, &extractor).await.expect("reindex again");
+    let again = storage::reindex_action_addresses(&pool, &chain, &extractor)
+        .await
+        .expect("reindex again");
     assert_eq!(again, 0);
 
     let received = storage::get_account_actions(&pool, &chain, &to, 10, None, Some("to"))

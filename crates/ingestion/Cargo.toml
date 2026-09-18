@@ -8,9 +8,6 @@ anyhow = { workspace = true }
 tracing = { workspace = true }
 tokio = { workspace = true, features = ["sync", "macros", "rt", "time"] }
 serde = { workspace = true }
-bincode = { workspace = true }
-xc-primitives = { workspace = true }
-arxd-payload = { workspace = true }
-xc-wire = { workspace = true }
-libp2p = { workspace = true }
-futures = "0.3"
+reqwest = { workspace = true }
+# CoreChain addresses are bech32 (`arx1…`); same crate the node uses.
+bech32 = "0.12"

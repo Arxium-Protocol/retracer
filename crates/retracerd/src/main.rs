@@ -12,11 +12,11 @@ async fn main() -> Result<()> {
             // Release builds set RETRACER_VERSION to the tag. A local build has
             // no tag to report — CARGO_PKG_VERSION is not bumped per release —
             // so say so explicitly rather than print a stale-looking "0.1.0".
-            let node = retracer_core::ARXIUM_NODE_REV;
+            let node = retracer_core::MIN_NODE_VERSION;
             match option_env!("RETRACER_VERSION") {
-                Some(tag) => println!("retracerd {tag} (arxium node rev {node})"),
+                Some(tag) => println!("retracerd {tag} (needs node xc-rpc >= {node})"),
                 None => println!(
-                    "retracerd {} (dev build, not a release; arxium node rev {node})",
+                    "retracerd {} (dev build, not a release; needs node xc-rpc >= {node})",
                     env!("CARGO_PKG_VERSION")
                 ),
             }
@@ -25,7 +25,7 @@ async fn main() -> Result<()> {
     }
 
     // Missing .env is fine — flags and the hardcoded defaults still work; this
-    // only saves builders from retyping --database-url/--bootnodes every run.
+    // only saves builders from retyping --database-url/--node-rpc-url every run.
     dotenvy::dotenv().ok();
 
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
@@ -35,22 +35,11 @@ async fn main() -> Result<()> {
         .init();
 
     let args = retracer_core::parse_args()?;
-    let certificate_verifier = args.chain.node_rpc_url.clone().map(|url| {
-        retracer_core::corechain_wire::http_certificate_verifier(
-            url,
-            args.chain
-                .node_rpc_token
-                .as_ref()
-                .map(|token| token.expose().to_owned()),
-        )
-    });
 
     // Every CoreChain-specific choice the indexer makes is made here, and only
     // here — the library crates are generic over all of it:
     //
-    // - `CoreChainBlock` normalizes the supported released/current wire shapes
-    //   while preserving each sender generation's block hash. A Spoke Chain
-    //   binary uses its own exact block/payload type instead.
+    // - `RpcBlock` is the block as any Arxium-stack node serves it over RPC.
     // - `address_validator` is the chain's address format. Without one, the
     //   indexer still works but stops validating addresses and stops resolving
     //   `Search` queries to accounts.
@@ -63,14 +52,5 @@ async fn main() -> Result<()> {
         tier_b: Vec::new(),
         address_validator: Some(std::sync::Arc::new(ingestion::is_corechain_address)),
     };
-
-    retracer_core::run_with_decoder_and_certificate_verifier::<
-        retracer_core::corechain_wire::CoreChainBlock,
-    >(
-        args,
-        hooks,
-        retracer_core::corechain_wire::validated_decoder(),
-        certificate_verifier,
-    )
-    .await
+    retracer_core::run::<retracer_core::rpc_block::RpcBlock>(args, hooks).await
 }

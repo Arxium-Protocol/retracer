@@ -159,9 +159,8 @@ struct AppState {
     /// hash never changes, so this is fetched once and kept for the life of
     /// the process; a chain with no `node_rpc_url` never gets an entry.
     genesis_cache: Arc<Mutex<HashMap<String, String>>>,
-    /// See `ChainInfo::arxium_node_rev`; supplied by the binary, which is
-    /// where the pin is known.
-    arxium_node_rev: &'static str,
+    /// See `ChainInfo::min_node_version`; supplied by the binary.
+    min_node_version: &'static str,
 }
 
 const STATS_CACHE_TTL: Duration = Duration::from_secs(15);
@@ -203,7 +202,7 @@ impl AppState {
 )]
 struct ApiDoc;
 
-pub fn router(pool: PgPool, chains: Vec<RestChain>, arxium_node_rev: &'static str) -> Router {
+pub fn router(pool: PgPool, chains: Vec<RestChain>, min_node_version: &'static str) -> Router {
     let known = chains.iter().map(|c| c.chain_id.clone()).collect();
     let http = reqwest::Client::builder()
         .timeout(NODE_RPC_TIMEOUT)
@@ -217,7 +216,7 @@ pub fn router(pool: PgPool, chains: Vec<RestChain>, arxium_node_rev: &'static st
         uptime_cache: Arc::new(UptimeCache::new()),
         stats_cache: Arc::new(Mutex::new(HashMap::new())),
         genesis_cache: Arc::new(Mutex::new(HashMap::new())),
-        arxium_node_rev,
+        min_node_version,
     };
 
     Router::new()
@@ -653,10 +652,10 @@ struct ChainInfo {
     /// tells. `null` until the node has answered, or when no `--node-rpc-url`
     /// is configured for the chain.
     genesis_hash: Option<String>,
-    /// The Arxium git rev this Retracer's wire types are pinned to. A node
-    /// on a different rev is not guaranteed to decode; compare against the
-    /// node's own build before trusting a deployment.
-    arxium_node_rev: &'static str,
+    /// Oldest node this Retracer reads blocks from, as the node's
+    /// `/status.version` (its `xc-rpc` crate version) reports it. An older
+    /// node is refused at startup, not misread.
+    min_node_version: &'static str,
 }
 
 #[utoipa::path(get, path = "/v1/chains", tag = "chains", responses((status = 200, body = Vec<ChainInfo>)))]
@@ -670,7 +669,7 @@ async fn list_chains(State(state): State<AppState>) -> ApiResult<Vec<ChainInfo>>
             sync_protocol: c.sync_protocol.clone(),
             finality_depth: c.finality_depth,
             genesis_hash: genesis_hash(&state, c).await,
-            arxium_node_rev: state.arxium_node_rev,
+            min_node_version: state.min_node_version,
         });
     }
     Ok(Json(out))

@@ -3,19 +3,19 @@
 A working indexer for an imaginary Spoke Chain called **MintChain**. Copy this
 directory as the starting point for your own.
 
-The thing to notice is how little there is. Retracer is generic over your
-block type, so you write a binary — not a fork.
+The thing to notice is how little there is. Blocks are read as the JSON your
+node serves on `GET /blocks`, so you write a binary — not a fork, and no
+payload enum to mirror.
 
 ## What you supply
 
 | | Where | Required? |
 | --- | --- | --- |
-| Your payload enum | [`src/lib.rs`](src/lib.rs) → `MintPayload` | Yes |
-| Your address format | `is_mintchain_address` | Optional |
+| Your address format | [`src/lib.rs`](src/lib.rs) → `is_mintchain_address` | Optional |
 | Address roles and queryable fields | [`kind_schema.toml`](kind_schema.toml) | Optional |
 | Logic a config file can't express | `AirdropRecipients` | Only if needed |
 
-Everything else — P2P client, Postgres schema, HTTP and gRPC APIs, reorg
+Everything else — node RPC poller, Postgres schema, HTTP and gRPC APIs, reorg
 handling — is inherited unchanged.
 
 ## Run it
@@ -26,7 +26,7 @@ handling — is inherited unchanged.
 cargo run -p spoke-indexer -- \
   --chain-id mintchain-devnet \
   --kind-schema examples/spoke-indexer/kind_schema.toml \
-  --bootnodes /ip4/127.0.0.1/tcp/30334/p2p/<peer-id>
+  --node-rpc-url http://127.0.0.1:8081
 ```
 
 Then:
@@ -36,23 +36,14 @@ curl localhost:8080/v1/chains/mintchain-devnet/status
 curl "localhost:8080/v1/chains/mintchain-devnet/accounts/spoke1.../actions?role=to"
 ```
 
-## The three integration points
+## The integration points
 
-**1. Your payload enum.** The one hard requirement: it must decode from the
-exact bytes your node gossips. Blocks arrive as bincode, which is not
-self-describing — there's no decoding "whatever shape is there" — so copy the
-enum from your node's source rather than retyping it.
-
-```rust
-run::<Block<MintPayload>>(args, hooks).await
-```
-
-**2. Your address format.** Optional. Without it the indexer works but stops
+**1. Your address format.** Optional. Without it the indexer works but stops
 validating addresses and stops recognising accounts in `Search`. That's
 deliberate: a validator accepting anything would make `Search` classify every
 block hash as an address.
 
-**3. Roles and projections**, declared in `kind_schema.toml` — no rebuild, just
+**2. Roles and projections**, declared in `kind_schema.toml` — no rebuild, just
 a restart:
 
 ```toml
@@ -78,8 +69,8 @@ kind always has exactly one place defining its roles.
 ## Following several chains at once
 
 [`src/bin/multi_chain.rs`](src/bin/multi_chain.rs) runs CoreChain and MintChain
-from one process, one database, one API endpoint — each with its own payload
-type, address format, gossip topic and finality depth.
+from one process, one database, one API endpoint — each with its own node,
+address format and finality depth.
 
 ```bash
 cargo run -p spoke-indexer --bin multi_chain
@@ -87,11 +78,11 @@ curl localhost:8080/v1/chains
 ```
 
 Chains are added one at a time rather than listed in a config file, because each
-carries its own Rust type:
+carries its own hooks (Tier B extractors are Rust):
 
 ```rust
-runner.add_chain::<Block<CorePayload>>(hub_config, hub_hooks).await?;
-runner.add_chain::<Block<MintPayload>>(spoke_config, spoke_hooks).await?;
+runner.add_chain::<RpcBlock>(hub_config, hub_hooks).await?;
+runner.add_chain::<RpcBlock>(spoke_config, spoke_hooks).await?;
 ```
 
 The first chain added is the default — it serves gRPC requests arriving with no

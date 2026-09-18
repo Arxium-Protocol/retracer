@@ -1,51 +1,18 @@
-//! The three things a builder supplies to integrate Retracer with their own
-//! chain. Everything else — the P2P client, Postgres schema, HTTP and gRPC
-//! surfaces — is inherited unchanged; there is no fork of Retracer anywhere
-//! in this example.
+//! The two things a builder supplies to integrate Retracer with their own
+//! chain. Everything else — the node RPC poller, Postgres schema, HTTP and
+//! gRPC surfaces — is inherited unchanged; there is no fork of Retracer
+//! anywhere in this example. Blocks are read as the JSON your node serves on
+//! `GET /blocks`, so there is no payload enum to mirror: the payload is
+//! whatever JSON the node put in `payload_json`.
 //!
-//!   1. your payload enum                         → [`MintPayload`]
-//!   2. your address format                       → [`is_mintchain_address`]
-//!   3. anything `kind_schema.toml` can't express → [`AirdropRecipients`]
+//!   1. your address format                       → [`is_mintchain_address`]
+//!   2. anything `kind_schema.toml` can't express → [`AirdropRecipients`]
 //!
 //! They live in a library so both binaries can use them: `src/main.rs` follows
 //! one chain, `src/bin/multi_chain.rs` follows a Hub and a Spoke together.
 
-use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use storage::{ActionIndexable, Role};
-
-/// MintChain's action payload — nothing like CoreChain's, which is the point.
-///
-/// The one hard requirement is that this decodes from the exact bytes your node
-/// gossips. Blocks arrive as bincode, which is not self-describing, so there is
-/// no decoding "whatever shape is there": this enum must match the node's own
-/// definition field for field. Copy it from your node's source rather than
-/// retyping it from memory.
-#[derive(Debug, Serialize, Deserialize)]
-pub enum MintPayload {
-    MintNft {
-        collection: String,
-        token_id: u64,
-        recipient: String,
-    },
-    TransferNft {
-        token_id: u64,
-        to: String,
-    },
-    ListForSale {
-        token_id: u64,
-        price: u64,
-    },
-    Delist {
-        token_id: u64,
-    },
-    /// One action, many recipients. This is the case `kind_schema.toml` cannot
-    /// handle — see [`AirdropRecipients`].
-    Airdrop {
-        collection: String,
-        recipients: Vec<String>,
-    },
-}
 
 /// MintChain addresses are `spoke1` followed by 32 hex characters.
 ///
