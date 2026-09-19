@@ -541,7 +541,12 @@ pub async fn reindex_action_addresses(
             .await?;
             added += result.rows_affected();
         }
-        tracing::info!(chain_id, through_height = after.0, added, "reindexing action_addresses");
+        tracing::info!(
+            chain_id,
+            through_height = after.0,
+            added,
+            "reindexing action_addresses"
+        );
     }
     Ok(added)
 }
@@ -1079,7 +1084,10 @@ pub async fn get_block_by_height(
 /// normalized; anything else (including that fallback) passes through
 /// untouched, so a positional identity still matches itself exactly.
 fn canonicalize_hash(hash: &str) -> String {
-    let hex = hash.strip_prefix("0x").or_else(|| hash.strip_prefix("0X")).unwrap_or(hash);
+    let hex = hash
+        .strip_prefix("0x")
+        .or_else(|| hash.strip_prefix("0X"))
+        .unwrap_or(hash);
     if !hex.is_empty() && hex.bytes().all(|b| b.is_ascii_hexdigit()) {
         format!("0x{}", hex.to_ascii_lowercase())
     } else {

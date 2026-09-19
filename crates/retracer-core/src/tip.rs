@@ -55,7 +55,10 @@ pub struct Tip {
 /// fixed git rev).
 fn hashes_match(a: &str, b: &str) -> bool {
     fn normalize(s: &str) -> String {
-        s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")).unwrap_or(s).to_ascii_lowercase()
+        s.strip_prefix("0x")
+            .or_else(|| s.strip_prefix("0X"))
+            .unwrap_or(s)
+            .to_ascii_lowercase()
     }
     normalize(a) == normalize(b)
 }

@@ -145,7 +145,10 @@ fn postgres_action_cursor(height: u64, index: u32) -> Result<(i64, i32), Status>
 }
 
 fn public_network_tip(network: ingestion::NetworkView) -> Option<u64> {
-    network.has_fresh_status().then_some(network.tip_height).flatten()
+    network
+        .has_fresh_status()
+        .then_some(network.tip_height)
+        .flatten()
 }
 
 type ResponseStream<T> = Pin<Box<dyn Stream<Item = Result<T, Status>> + Send>>;
@@ -777,9 +780,22 @@ mod tests {
 
     #[test]
     fn action_cursors_must_fit_postgres_columns() {
-        assert_eq!(postgres_action_cursor(i64::MAX as u64, i32::MAX as u32).unwrap(), (i64::MAX, i32::MAX));
-        assert_eq!(postgres_action_cursor(i64::MAX as u64 + 1, 0).unwrap_err().code(), tonic::Code::InvalidArgument);
-        assert_eq!(postgres_action_cursor(0, i32::MAX as u32 + 1).unwrap_err().code(), tonic::Code::InvalidArgument);
+        assert_eq!(
+            postgres_action_cursor(i64::MAX as u64, i32::MAX as u32).unwrap(),
+            (i64::MAX, i32::MAX)
+        );
+        assert_eq!(
+            postgres_action_cursor(i64::MAX as u64 + 1, 0)
+                .unwrap_err()
+                .code(),
+            tonic::Code::InvalidArgument
+        );
+        assert_eq!(
+            postgres_action_cursor(0, i32::MAX as u32 + 1)
+                .unwrap_err()
+                .code(),
+            tonic::Code::InvalidArgument
+        );
     }
 
     fn schema_with_transfer_to_role() -> KindSchema {
@@ -837,7 +853,8 @@ mod tests {
         let mut req = Request::new(SubscribeAccountActionsRequest {
             address: "arx1x".to_string(),
         });
-        req.metadata_mut().insert(CHAIN_HEADER, "hub".parse().unwrap());
+        req.metadata_mut()
+            .insert(CHAIN_HEADER, "hub".parse().unwrap());
 
         let mut stream = svc
             .subscribe_account_actions(req)
