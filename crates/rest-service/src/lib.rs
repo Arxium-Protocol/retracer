@@ -3,9 +3,8 @@
 //!
 //! gRPC plus a hand-maintained `.proto` works fine between services we own on
 //! both ends, but it's an adoption barrier for anyone else: every indexer a
-//! builder has used before answers `curl`. This crate is additive — it does not
-//! replace or wrap `grpc-service`, it just reads the same rows — so the two
-//! surfaces can't drift in behaviour, only in shape.
+//! builder has used before answers `curl`. The live tails are server-sent
+//! events in [`sse`], so this is the one API a client needs.
 //!
 //! The chain is a path segment here (`/v1/chains/{chain_id}/...`) rather than
 //! the `x-chain-id` header gRPC uses. Same routing decision, different idiom:
@@ -18,6 +17,8 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Json, Router};
+
+mod sse;
 use futures::stream::{self, StreamExt};
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
@@ -120,9 +121,7 @@ impl UptimeCache {
     }
 }
 
-/// What the REST layer needs to know about a chain. A subset of
-/// `grpc_service::ChainRuntime` — no broadcast channel, because this surface
-/// has no streaming endpoints.
+/// What the REST layer needs to know about a chain.
 #[derive(Clone)]
 pub struct RestChain {
     pub chain_id: String,
@@ -134,6 +133,10 @@ pub struct RestChain {
     /// The chain's declared `kind_schema.toml` projections — the only payload
     /// fields `GET .../actions?field=` may filter on.
     pub projections: Vec<storage::Projection>,
+    /// Per-chain, not shared: one broadcast channel across all chains would
+    /// deliver chain B's blocks to a chain A subscriber. Feeds the `/stream`
+    /// routes in [`sse`].
+    pub blocks_tx: tokio::sync::broadcast::Sender<storage::BlockRow>,
     pub network_view: tokio::sync::watch::Receiver<ingestion::NetworkView>,
     /// Base URL of this chain's node HTTP RPC, for `GET /validators?height=N`
     /// — used only by [`get_validator_uptime`]. `None` disables that route
@@ -194,6 +197,7 @@ impl AppState {
     paths(
         list_chains, get_status, get_stats, list_blocks, get_block, list_actions, get_action,
         get_account_actions, list_proposers, get_validator_uptime, search, health, readiness, metrics,
+        sse::stream_blocks, sse::stream_actions,
     ),
     tags(
         (name = "chains"), (name = "blocks"), (name = "actions"), (name = "validators"),
@@ -225,7 +229,15 @@ pub fn router(pool: PgPool, chains: Vec<RestChain>, min_node_version: &'static s
         .route("/v1/chains/{chain_id}/stats", get(get_stats))
         .route("/v1/chains/{chain_id}/blocks", get(list_blocks))
         .route("/v1/chains/{chain_id}/blocks/{height}", get(get_block))
+        .route(
+            "/v1/chains/{chain_id}/blocks/stream",
+            get(sse::stream_blocks),
+        )
         .route("/v1/chains/{chain_id}/actions", get(list_actions))
+        .route(
+            "/v1/chains/{chain_id}/actions/stream",
+            get(sse::stream_actions),
+        )
         .route(
             "/v1/chains/{chain_id}/actions/{action_hash}",
             get(get_action),
@@ -486,7 +498,9 @@ fn render_metrics(
 ) -> String {
     let mut out = String::new();
 
-    out.push_str("# HELP retracer_database_up Whether the last database check for this scrape succeeded.\n");
+    out.push_str(
+        "# HELP retracer_database_up Whether the last database check for this scrape succeeded.\n",
+    );
     out.push_str("# TYPE retracer_database_up gauge\n");
     out.push_str(&format!(
         "retracer_database_up {}\n",
@@ -543,9 +557,7 @@ fn render_metrics(
                 node_tip_height: fresh_tip,
                 blocks_behind: status.and_then(|s| s.blocks_behind),
                 finalized_height: network.finalized_height,
-                tip_age_seconds: status
-                    .and_then(|s| s.tip_timestamp)
-                    .map(|ts| now_unix - ts),
+                tip_age_seconds: status.and_then(|s| s.tip_timestamp).map(|ts| now_unix - ts),
                 network_fresh,
             }
         })
@@ -691,7 +703,15 @@ async fn genesis_hash(state: &AppState, chain: &RestChain) -> Option<String> {
     }
     // A node that isn't answering is a `null` here, not an error: this is a
     // listing, and the node's state is already reported by `/status`.
-    let body: Body = request.send().await.ok()?.error_for_status().ok()?.json().await.ok()?;
+    let body: Body = request
+        .send()
+        .await
+        .ok()?
+        .error_for_status()
+        .ok()?
+        .json()
+        .await
+        .ok()?;
     state
         .genesis_cache
         .lock()
@@ -808,8 +828,14 @@ async fn list_actions(
     let limit = clamp_limit(page.limit)?;
     let filter = action_filter(chain, &page)?;
     Ok(Json(
-        storage::list_actions(&state.pool, &chain_id, limit, page.cursor()?, filter.as_ref())
-            .await?,
+        storage::list_actions(
+            &state.pool,
+            &chain_id,
+            limit,
+            page.cursor()?,
+            filter.as_ref(),
+        )
+        .await?,
     ))
 }
 
@@ -866,7 +892,11 @@ fn action_filter<'a>(
             ));
         }
     };
-    Ok(Some(storage::ActionFilter { kind, projection, value }))
+    Ok(Some(storage::ActionFilter {
+        kind,
+        projection,
+        value,
+    }))
 }
 
 #[utoipa::path(get, path = "/v1/chains/{chain_id}/actions/{action_hash}", tag = "actions", params(("chain_id" = String, Path), ("action_hash" = String, Path)), responses((status = 200, body = storage::ActionRow), (status = 404, body = ErrorBody)))]
@@ -979,13 +1009,9 @@ async fn get_validator_uptime(
         )));
     }
 
-    let rows = storage::list_proposed_heights(
-        &state.pool,
-        &chain_id,
-        query.from as i64,
-        query.to as i64,
-    )
-    .await?;
+    let rows =
+        storage::list_proposed_heights(&state.pool, &chain_id, query.from as i64, query.to as i64)
+            .await?;
 
     if rows.is_empty() {
         return Ok(Json(UptimeReport {
@@ -999,29 +1025,29 @@ async fn get_validator_uptime(
     let http = state.http.clone();
     let cache = state.uptime_cache.clone();
     let cache_chain = chain_id.to_string();
-    let sets: Vec<anyhow::Result<(u64, Vec<String>)>> = stream::iter(
-        rows.iter().map(|row| row.height as u64).collect::<Vec<_>>(),
-    )
-    .map(|height| {
-        let http = http.clone();
-        let cache = cache.clone();
-        let cache_chain = cache_chain.clone();
-        let node_rpc_url = node_rpc_url.clone();
-        let node_rpc_token = node_rpc_token.clone();
-        async move {
-            if let Some(set) = cache.get(&cache_chain, height) {
-                return Ok((height, set));
-            }
-            let mut set =
-                fetch_validator_set(&http, &node_rpc_url, node_rpc_token.as_ref(), height).await?;
-            set.sort();
-            cache.insert(&cache_chain, height, set.clone());
-            Ok((height, set))
-        }
-    })
-    .buffer_unordered(MAX_UPTIME_CONCURRENCY)
-    .collect()
-    .await;
+    let sets: Vec<anyhow::Result<(u64, Vec<String>)>> =
+        stream::iter(rows.iter().map(|row| row.height as u64).collect::<Vec<_>>())
+            .map(|height| {
+                let http = http.clone();
+                let cache = cache.clone();
+                let cache_chain = cache_chain.clone();
+                let node_rpc_url = node_rpc_url.clone();
+                let node_rpc_token = node_rpc_token.clone();
+                async move {
+                    if let Some(set) = cache.get(&cache_chain, height) {
+                        return Ok((height, set));
+                    }
+                    let mut set =
+                        fetch_validator_set(&http, &node_rpc_url, node_rpc_token.as_ref(), height)
+                            .await?;
+                    set.sort();
+                    cache.insert(&cache_chain, height, set.clone());
+                    Ok((height, set))
+                }
+            })
+            .buffer_unordered(MAX_UPTIME_CONCURRENCY)
+            .collect()
+            .await;
 
     let mut validator_sets: HashMap<u64, Vec<String>> = HashMap::new();
     for result in sets {
@@ -1061,7 +1087,10 @@ fn compute_uptime(
         let height = row.height as u64;
         let round = row.round as u64;
         let Some(set) = sets.get(&height) else {
-            tracing::warn!(height, "no validator set fetched for an owed height; skipping");
+            tracing::warn!(
+                height,
+                "no validator set fetched for an owed height; skipping"
+            );
             continue;
         };
         let Some(primary) = eligible_designee(set, height, 0) else {
@@ -1239,13 +1268,19 @@ mod tests {
             .collect();
         assert!(registered.len() >= 14, "route scan found {registered:?}");
         for route in registered {
-            assert!(documented.contains(route), "{route} is not in the OpenAPI spec");
+            assert!(
+                documented.contains(route),
+                "{route} is not in the OpenAPI spec"
+            );
         }
     }
 
-    fn rest_chain(network_view: ingestion::NetworkView) -> RestChain {
+    pub(super) fn rest_chain(network_view: ingestion::NetworkView) -> RestChain {
         let (_, network_view) = tokio::sync::watch::channel(network_view);
+        // Capacity 4 so a lag is easy to provoke in the stream tests.
+        let (blocks_tx, _) = tokio::sync::broadcast::channel(4);
         RestChain {
+            blocks_tx,
             chain_id: "test-chain".into(),
             display_name: None,
             blocks_topic: "blocks".into(),
@@ -1256,6 +1291,24 @@ mod tests {
             network_view,
             node_rpc_url: None,
             node_rpc_token: None,
+        }
+    }
+
+    /// `connect_lazy` builds a pool without touching the network, so handlers
+    /// that never reach Postgres are testable without it.
+    pub(super) fn lazy_state(chains: Vec<RestChain>) -> AppState {
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy("postgres://unused:unused@127.0.0.1:1/unused")
+            .expect("lazy pool never connects");
+        AppState {
+            known: Arc::new(chains.iter().map(|c| c.chain_id.clone()).collect()),
+            pool,
+            chains: Arc::new(chains),
+            http: reqwest::Client::new(),
+            uptime_cache: Arc::new(UptimeCache::new()),
+            stats_cache: Arc::new(Mutex::new(HashMap::new())),
+            genesis_cache: Arc::new(Mutex::new(HashMap::new())),
+            min_node_version: "0",
         }
     }
 
@@ -1467,7 +1520,8 @@ mod tests {
         let set = vec!["a".to_string(), "b".to_string(), "c".to_string()];
         // Height 1 (b's turn) is missing entirely, e.g. not indexed yet.
         let rows = vec![proposed_height(0, "a", 0), proposed_height(2, "c", 0)];
-        let sets: HashMap<u64, Vec<String>> = [0u64, 2u64].into_iter().map(|h| (h, set.clone())).collect();
+        let sets: HashMap<u64, Vec<String>> =
+            [0u64, 2u64].into_iter().map(|h| (h, set.clone())).collect();
 
         let uptime = compute_uptime(&rows, &sets);
         assert!(
