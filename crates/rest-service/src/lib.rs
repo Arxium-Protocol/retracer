@@ -133,6 +133,9 @@ pub struct RestChain {
     /// The chain's declared `kind_schema.toml` projections — the only payload
     /// fields `GET .../actions?field=` may filter on.
     pub projections: Vec<storage::Projection>,
+    /// Resolves which addresses hold a role on an action (kind_schema.toml's
+    /// Tier A roles plus any Tier B impls), for `actions/stream?address=`.
+    pub address_extractor: Arc<storage::AddressExtractor>,
     /// Per-chain, not shared: one broadcast channel across all chains would
     /// deliver chain B's blocks to a chain A subscriber. Feeds the `/stream`
     /// routes in [`sse`].
@@ -1281,6 +1284,9 @@ mod tests {
         let (blocks_tx, _) = tokio::sync::broadcast::channel(4);
         RestChain {
             blocks_tx,
+            address_extractor: Arc::new(storage::AddressExtractor::tier_a_only(
+                storage::KindSchema::empty(),
+            )),
             chain_id: "test-chain".into(),
             display_name: None,
             blocks_topic: "blocks".into(),

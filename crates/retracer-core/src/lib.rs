@@ -754,6 +754,7 @@ impl Runner {
             finality_depth: config.finality_depth,
             address_validator: hooks.address_validator.clone(),
             projections,
+            address_extractor: address_extractor.clone(),
             blocks_tx: blocks_tx.clone(),
             network_view: network_view.clone(),
             node_rpc_url: Some(config.node_rpc_url.clone()),

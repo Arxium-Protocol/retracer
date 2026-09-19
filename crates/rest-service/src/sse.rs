@@ -34,6 +34,16 @@ pub(super) struct StreamQuery {
     from_height: Option<u64>,
 }
 
+#[derive(Deserialize, IntoParams)]
+pub(super) struct ActionStreamQuery {
+    /// Replay from this height (inclusive) through the indexed tip, then
+    /// follow live. Omit for live only.
+    from_height: Option<u64>,
+    /// Only actions where this address holds a role — the sender, or a
+    /// kind_schema.toml-resolved role such as a Transfer's recipient.
+    address: Option<String>,
+}
+
 /// Blocks in `[from_height, tip]` from storage, followed by every block the
 /// indexer commits from then on, with the handoff arranged so no height is
 /// skipped or sent twice.
@@ -69,19 +79,41 @@ pub(super) struct ActionEvent {
 /// empty block emits nothing, which is what makes this the right feed for a
 /// wallet backend that only reacts to actions: it no longer tails every
 /// block on the chain to find the few that carry one.
-#[utoipa::path(get, path = "/v1/chains/{chain_id}/actions/stream", tag = "actions", params(("chain_id" = String, Path), StreamQuery), responses((status = 200, description = "`text/event-stream`, one `ActionEvent` per event, `id` = `height:index`", body = ActionEvent, content_type = "text/event-stream"), (status = 404, body = super::ErrorBody)))]
+#[utoipa::path(get, path = "/v1/chains/{chain_id}/actions/stream", tag = "actions", params(("chain_id" = String, Path), ActionStreamQuery), responses((status = 200, description = "`text/event-stream`, one `ActionEvent` per event, `id` = `height:index`", body = ActionEvent, content_type = "text/event-stream"), (status = 404, body = super::ErrorBody)))]
 pub(super) async fn stream_actions(
     State(state): State<AppState>,
     Path(chain_id): Path<String>,
-    Query(query): Query<StreamQuery>,
+    Query(query): Query<ActionStreamQuery>,
 ) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, ApiError> {
+    let chain = state.chain(&chain_id)?;
+    if let (Some(address), Some(valid)) = (&query.address, &chain.address_validator)
+        && !valid(address)
+    {
+        return Err(ApiError::BadRequest(
+            "not a valid address for this chain".into(),
+        ));
+    }
+    let extractor = chain.address_extractor.clone();
+    let address = query.address;
     let blocks = block_stream(&state, &chain_id, query.from_height).await?;
-    let actions = blocks.flat_map(|block| {
+    let actions = blocks.flat_map(move |block| {
         let block_timestamp = block.timestamp;
-        stream::iter(block.actions.into_iter().map(move |action| ActionEvent {
-            action,
-            block_timestamp,
-        }))
+        let extractor = extractor.clone();
+        let address = address.clone();
+        stream::iter(
+            block
+                .actions
+                .into_iter()
+                .filter(move |action| {
+                    address
+                        .as_deref()
+                        .is_none_or(|a| action_matches_address(&extractor, action, a))
+                })
+                .map(move |action| ActionEvent {
+                    action,
+                    block_timestamp,
+                }),
+        )
     });
     Ok(sse(actions.map(|event| {
         Event::default()
@@ -113,6 +145,24 @@ where
 }
 
 type BlockStream = Pin<Box<dyn Stream<Item = BlockRow> + Send>>;
+
+/// True if `address` holds any role on `action` — the original sender
+/// (`from_address`) or a role resolved via `AddressExtractor` (Tier A's
+/// kind_schema.toml, or a Tier B `ActionIndexable` impl for kinds that claim
+/// one). Matches what `GET .../accounts/{address}/actions?role=to` already
+/// finds historically via `action_addresses`, computed live here instead so
+/// a filtered stream notifies recipients, not just senders.
+fn action_matches_address(
+    extractor: &storage::AddressExtractor,
+    action: &ActionRow,
+    address: &str,
+) -> bool {
+    action.from_address == address
+        || extractor
+            .resolve(&action.kind, &action.payload)
+            .into_iter()
+            .any(|(addr, _)| addr == address)
+}
 
 /// Replay-then-live, shared by both routes. Lifted from the gRPC
 /// `SubscribeBlocks` with one change: a lagged live receiver ends the stream
@@ -317,5 +367,33 @@ mod tests {
         assert!(text.contains("id: 9:0\n"), "{text}");
         assert!(text.contains("\"action_hash\":\"a-9-0\""), "{text}");
         assert!(text.contains("\"block_timestamp\":1700000009"), "{text}");
+    }
+
+    /// `?address=` keeps only actions the address holds a role on — the
+    /// sender here, since the test chain declares no Tier A roles.
+    #[tokio::test]
+    async fn actions_stream_address_filter_keeps_only_that_senders_actions() {
+        let chain = rest_chain(ingestion::NetworkView::default());
+        let blocks_tx = chain.blocks_tx.clone();
+        let state = lazy_state(vec![chain]);
+        let app = crate::router(state.pool.clone(), state.chains.to_vec(), "0");
+
+        let resp = app
+            .oneshot(
+                Request::get("/v1/chains/test-chain/actions/stream?address=arx1other")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let mut b = block(4, 2);
+        b.actions[1].from_address = "arx1other".into();
+        blocks_tx.send(b).unwrap();
+        let mut frames = resp.into_body().into_data_stream();
+        let frame = frames.next().await.unwrap().unwrap();
+        let text = std::str::from_utf8(&frame).unwrap();
+        assert!(text.contains("id: 4:1\n"), "{text}");
+        assert!(!text.contains("a-4-0"), "{text}");
     }
 }
