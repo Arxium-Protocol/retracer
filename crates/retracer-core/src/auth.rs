@@ -7,8 +7,7 @@
 //! Mirrors the pattern Arxium's own `core/rpc` already uses for its
 //! `Authorization: Bearer` guard (`subtle::ConstantTimeEq`, a fixed-window
 //! per-IP hit counter swept once it grows large) rather than inventing a
-//! second one — same shape, ported to guard two servers (axum + tonic)
-//! instead of one.
+//! second one — same shape, ported to axum middleware.
 
 use std::collections::HashMap;
 use std::net::IpAddr;
@@ -262,39 +261,6 @@ pub async fn rest_guard(
         }
     }
     next.run(req).await
-}
-
-/// tonic interceptor, same checks as [`rest_guard`] for the gRPC surface.
-#[derive(Clone)]
-pub struct GrpcGuard(pub GuardConfig);
-
-impl tonic::service::Interceptor for GrpcGuard {
-    fn call(&mut self, req: tonic::Request<()>) -> Result<tonic::Request<()>, tonic::Status> {
-        if let Some(token) = &self.0.token {
-            let header_value = req
-                .metadata()
-                .get("authorization")
-                .and_then(|v| v.to_str().ok());
-            if !token_matches(token, header_value) {
-                return Err(tonic::Status::unauthenticated(
-                    "invalid or missing bearer token",
-                ));
-            }
-        }
-        if let Some(limiter) = &self.0.rate_limiter
-            && let Some(peer) = req.remote_addr().map(|a| a.ip())
-        {
-            let forwarded = req
-                .metadata()
-                .get("x-forwarded-for")
-                .and_then(|v| v.to_str().ok());
-            let ip = client_ip(peer, forwarded, self.0.trusted_proxies.as_deref());
-            if !limiter.allow(ip) {
-                return Err(tonic::Status::resource_exhausted("rate limit exceeded"));
-            }
-        }
-        Ok(req)
-    }
 }
 
 #[cfg(test)]

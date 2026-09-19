@@ -2,7 +2,6 @@
 members = [
     "crates/ingestion",
     "crates/storage",
-    "crates/grpc-service",
     "crates/rest-service",
     "crates/retracer-core",
     "crates/retracerd",
@@ -14,7 +13,6 @@ default-members = ["crates/retracerd"]
 [workspace.dependencies]
 ingestion = { path = "crates/ingestion" }
 storage = { path = "crates/storage" }
-grpc-service = { path = "crates/grpc-service" }
 rest-service = { path = "crates/rest-service" }
 retracer-core = { path = "crates/retracer-core" }
 

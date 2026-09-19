@@ -224,14 +224,12 @@ RETRACER_NODE_RPC_URL=$node_rpc_url
 # stay open to anyone who can reach them.
 RETRACER_AUTH_TOKEN=$auth_token
 
-# Per-IP requests/second on both surfaces. Blank disables rate limiting.
+# Per-IP requests/second. Blank disables rate limiting.
 RETRACER_RATE_LIMIT_RPS=
 
-# Interface each API surface listens on. 127.0.0.1 keeps both loopback-only;
-# set to 0.0.0.0 only behind this host's firewall or a private/WireGuard
-# network, and only alongside RETRACER_AUTH_TOKEN above — both surfaces are
-# plaintext.
-RETRACER_GRPC_BIND=127.0.0.1
+# Interface the API listens on. 127.0.0.1 keeps it loopback-only; set to
+# 0.0.0.0 only behind this host's firewall or a private/WireGuard network,
+# and only alongside RETRACER_AUTH_TOKEN above — HTTP is plaintext.
 RETRACER_REST_BIND=127.0.0.1
 ENVFILE
   chmod 600 "$env_file"

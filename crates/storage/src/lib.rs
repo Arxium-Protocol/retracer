@@ -960,10 +960,10 @@ async fn insert_block_in_tx<B: IndexableBlock>(
     Ok(())
 }
 
-/// Built from a freshly-ingested wire block and broadcast to gRPC streaming
-/// subscribers (`SubscribeBlocks`/`SubscribeAccountActions`) — same shape
-/// `get_block_by_height`/`get_action_by_hash` return, so one `From<BlockRow>`
-/// conversion in `grpc-service` covers both the read RPCs and the streams.
+/// Built from a freshly-ingested wire block and broadcast to the SSE
+/// subscribers (`blocks/stream`/`actions/stream`) — same shape
+/// `get_block_by_height`/`get_action_by_hash` return, so one serialisation
+/// in `rest-service` covers both the paged reads and the streams.
 ///
 /// Action identity is resolved exactly as `insert_block` does it, position
 /// fallback included — the streamed row and the stored row have to agree on an

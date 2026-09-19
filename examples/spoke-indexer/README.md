@@ -15,7 +15,7 @@ payload enum to mirror.
 | Address roles and queryable fields | [`kind_schema.toml`](kind_schema.toml) | Optional |
 | Logic a config file can't express | `AirdropRecipients` | Only if needed |
 
-Everything else — node RPC poller, Postgres schema, HTTP and gRPC APIs, reorg
+Everything else — node RPC poller, Postgres schema, HTTP API and SSE tails, reorg
 handling — is inherited unchanged.
 
 ## Run it
@@ -85,9 +85,8 @@ runner.add_chain::<RpcBlock>(hub_config, hub_hooks).await?;
 runner.add_chain::<RpcBlock>(spoke_config, spoke_hooks).await?;
 ```
 
-The first chain added is the default — it serves gRPC requests arriving with no
-`x-chain-id` header, which keeps existing single-chain clients working when you
-add a second chain. Over REST the chain is always explicit in the path.
+The chain is always explicit in the path (`/v1/chains/{chain_id}/...`), so
+adding a second chain changes nothing for clients of the first.
 
 ## If your chain isn't on the Arxium stack
 

@@ -87,9 +87,8 @@ pub struct ChainHooks {
 
 const DEFAULT_DATABASE_URL: &str = "postgres://retracer:retracer@localhost:5433/retracer";
 const DEFAULT_CHAIN_ID: &str = "corechain-devnet";
-const DEFAULT_GRPC_PORT: u16 = 50051;
 const DEFAULT_REST_PORT: u16 = 8080;
-/// Loopback-only until an operator opts in — see `--grpc-bind`/`--rest-bind`.
+/// Loopback-only until an operator opts in — see `--rest-bind`.
 const DEFAULT_BIND: IpAddr = IpAddr::V4(Ipv4Addr::LOCALHOST);
 const DEFAULT_KIND_SCHEMA: &str = "kind_schema.toml";
 const DEFAULT_WRITE_POOL_SIZE: u32 = 4;
@@ -135,25 +134,20 @@ pub struct ChainConfig {
 /// Process-level configuration, plus the single chain the CLI describes.
 pub struct Args {
     pub database_url: String,
-    pub grpc_port: u16,
-    /// HTTP/JSON surface. `None` disables it — gRPC alone is enough between
-    /// services we own on both ends; REST exists for external builders.
-    pub rest_port: Option<u16>,
-    /// Interface the gRPC surface listens on. Defaults to loopback; set to
+    /// The HTTP/JSON + SSE surface — the only API.
+    pub rest_port: u16,
+    /// Interface the REST surface listens on. Defaults to loopback; set to
     /// `0.0.0.0` (or a specific interface) only behind a firewall, a private
-    /// network, or `--auth-token` — gRPC is plaintext.
-    pub grpc_bind: IpAddr,
-    /// Interface the REST surface listens on. Same default and caveats as
-    /// `grpc_bind`.
+    /// network, or `--auth-token` — HTTP is plaintext.
     pub rest_bind: IpAddr,
     pub write_pool_size: u32,
     pub read_pool_size: u32,
     pub chain: ChainConfig,
-    /// Shared secret every request on both surfaces must present as
-    /// `Authorization: Bearer <token>`. `None` (the default) leaves both
-    /// surfaces open, matching today's trusted-consumer behavior.
+    /// Shared secret every request must present as
+    /// `Authorization: Bearer <token>`. `None` (the default) leaves the
+    /// API open, matching today's trusted-consumer behavior.
     pub auth_token: Option<String>,
-    /// Per-IP request budget, in requests/second, on both surfaces. `None`
+    /// Per-IP request budget, in requests/second. `None`
     /// (the default) disables rate limiting entirely.
     pub rate_limit_rps: Option<u32>,
     /// Proxies whose `X-Forwarded-For` the limiter may believe when
@@ -166,7 +160,7 @@ pub struct Args {
 }
 
 /// Parses a listen address, naming `source` (a flag or env var) in the error
-/// so a typo like `--grpc-bind localhost` fails with a message pointing at
+/// so a typo like `--rest-bind localhost` fails with a message pointing at
 /// the right flag instead of a bare "invalid IP address" from the stdlib.
 fn parse_bind(raw: &str, source: &str) -> Result<IpAddr> {
     raw.parse().with_context(|| {
@@ -237,12 +231,8 @@ OPTIONS:
                                    [env: RETRACER_DATABASE_URL]
     --chain-id <string>            Label for this chain's rows; not read off the wire.
                                    [default: corechain-devnet]
-    --rest-port <u16>              HTTP API port; 0 disables it.
+    --rest-port <u16>              HTTP API port.
                                    [default: 8080]
-    --grpc-port <u16>              gRPC API port.
-                                   [default: 50051]
-    --grpc-bind <ip>               Interface the gRPC surface listens on.
-                                   [default: 127.0.0.1] [env: RETRACER_GRPC_BIND]
     --rest-bind <ip>               Interface the REST surface listens on.
                                    [default: 127.0.0.1] [env: RETRACER_REST_BIND]
     --kind-schema <path>           Payload field configuration file.
@@ -292,12 +282,7 @@ pub fn parse_args() -> Result<Args> {
     let mut database_url =
         std::env::var("RETRACER_DATABASE_URL").unwrap_or_else(|_| DEFAULT_DATABASE_URL.to_string());
     let mut chain_id = DEFAULT_CHAIN_ID.to_string();
-    let mut grpc_port = DEFAULT_GRPC_PORT;
-    let mut rest_port = Some(DEFAULT_REST_PORT);
-    let mut grpc_bind = match std::env::var("RETRACER_GRPC_BIND") {
-        Ok(value) if !value.is_empty() => parse_bind(&value, "RETRACER_GRPC_BIND")?,
-        _ => DEFAULT_BIND,
-    };
+    let mut rest_port = DEFAULT_REST_PORT;
     let mut rest_bind = match std::env::var("RETRACER_REST_BIND") {
         Ok(value) if !value.is_empty() => parse_bind(&value, "RETRACER_REST_BIND")?,
         _ => DEFAULT_BIND,
@@ -350,22 +335,12 @@ pub fn parse_args() -> Result<Args> {
             }
             "--rest-port" => {
                 let value = args.next().context("--rest-port requires a value")?;
-                // 0 means "don't serve REST" rather than "pick a free port":
-                // an indexer that silently exposed HTTP on an arbitrary port
-                // would be a surprise, and there is already a way to ask for a
-                // specific one.
+                // 0 would mean "pick a free port": an indexer that silently
+                // exposed HTTP on an arbitrary port would be a surprise.
                 rest_port = match value.parse::<u16>().context("--rest-port must be a u16")? {
-                    0 => None,
-                    port => Some(port),
+                    0 => anyhow::bail!("--rest-port must not be 0: REST is the only API"),
+                    port => port,
                 };
-            }
-            "--grpc-port" => {
-                let value = args.next().context("--grpc-port requires a value")?;
-                grpc_port = value.parse().context("--grpc-port must be a u16")?;
-            }
-            "--grpc-bind" => {
-                let value = args.next().context("--grpc-bind requires a value")?;
-                grpc_bind = parse_bind(&value, "--grpc-bind")?;
             }
             "--rest-bind" => {
                 let value = args.next().context("--rest-bind requires a value")?;
@@ -423,9 +398,7 @@ pub fn parse_args() -> Result<Args> {
     let sync_protocol = sync_protocol.unwrap_or_else(|| default_sync_protocol(&chain_id));
     Ok(Args {
         database_url,
-        grpc_port,
         rest_port,
-        grpc_bind,
         rest_bind,
         write_pool_size,
         read_pool_size,
@@ -475,11 +448,9 @@ async fn runner_from_args(args: &Args) -> Result<Runner> {
         &args.database_url,
         args.write_pool_size,
         args.read_pool_size,
-        args.grpc_port,
+        args.rest_port,
     )
     .await?
-    .with_rest_port(args.rest_port)
-    .with_grpc_bind(args.grpc_bind)
     .with_rest_bind(args.rest_bind)
     .with_auth_token(args.auth_token.clone())
     .with_rate_limit_rps(args.rate_limit_rps)
@@ -489,10 +460,10 @@ async fn runner_from_args(args: &Args) -> Result<Runner> {
 async fn finish(runner: Runner, chain_id: &str, reindex_addresses: bool) -> Result<()> {
     if reindex_addresses {
         let extractor = runner
-            .runtimes
+            .rest_chains
             .iter()
-            .find(|r| r.chain_id == chain_id)
-            .map(|r| r.address_extractor.clone())
+            .find(|c| c.chain_id == chain_id)
+            .map(|c| c.address_extractor.clone())
             .expect("chain was just added");
         let added =
             storage::reindex_action_addresses(&runner.write_pool, chain_id, &extractor).await?;
@@ -514,14 +485,11 @@ async fn finish(runner: Runner, chain_id: &str, reindex_addresses: bool) -> Resu
 pub struct Runner {
     write_pool: PgPool,
     read_pool: PgPool,
-    grpc_port: u16,
-    rest_port: Option<u16>,
-    grpc_bind: IpAddr,
+    rest_port: u16,
     rest_bind: IpAddr,
     auth_token: Option<String>,
     rate_limit_rps: Option<u32>,
     trusted_proxies: Option<auth::TrustedProxies>,
-    runtimes: Vec<grpc_service::ChainRuntime>,
     rest_chains: Vec<rest_service::RestChain>,
     tasks: Vec<JoinHandle<Result<()>>>,
 }
@@ -531,9 +499,9 @@ impl Runner {
         database_url: &str,
         write_pool_size: u32,
         read_pool_size: u32,
-        grpc_port: u16,
+        rest_port: u16,
     ) -> Result<Self> {
-        // Separate pools so a flood of gRPC read queries can never starve the
+        // Separate pools so a flood of API read queries can never starve the
         // ingestion writers of a connection (and vice versa). Shared across
         // chains rather than per-chain: connection count is a property of the
         // database, not of how many chains happen to be followed.
@@ -550,48 +518,32 @@ impl Runner {
         Ok(Runner {
             write_pool,
             read_pool,
-            grpc_port,
-            rest_port: None,
-            grpc_bind: DEFAULT_BIND,
+            rest_port,
             rest_bind: DEFAULT_BIND,
             auth_token: None,
             rate_limit_rps: None,
             trusted_proxies: None,
-            runtimes: Vec::new(),
             rest_chains: Vec::new(),
             tasks: Vec::new(),
         })
     }
 
-    /// Serve the HTTP/JSON surface too. `None` leaves it off.
-    pub fn with_rest_port(mut self, port: Option<u16>) -> Self {
-        self.rest_port = port;
-        self
-    }
-
-    /// Interface the gRPC surface listens on. Defaults to loopback; set to
+    /// Interface the REST surface listens on. Defaults to loopback; set to
     /// `0.0.0.0` (or a specific interface) only behind a firewall, a private
-    /// network, or `--auth-token` — gRPC is plaintext.
-    pub fn with_grpc_bind(mut self, addr: IpAddr) -> Self {
-        self.grpc_bind = addr;
-        self
-    }
-
-    /// Interface the REST surface listens on. Same default and caveats as
-    /// [`Self::with_grpc_bind`].
+    /// network, or `--auth-token` — HTTP is plaintext.
     pub fn with_rest_bind(mut self, addr: IpAddr) -> Self {
         self.rest_bind = addr;
         self
     }
 
-    /// Require `Authorization: Bearer <token>` on every request, both
-    /// surfaces. `None` (the default) leaves both open.
+    /// Require `Authorization: Bearer <token>` on every request. `None`
+    /// (the default) leaves the API open.
     pub fn with_auth_token(mut self, token: Option<String>) -> Self {
         self.auth_token = token;
         self
     }
 
-    /// Per-IP request budget in requests/second, both surfaces. `None` (the
+    /// Per-IP request budget in requests/second. `None` (the
     /// default) disables rate limiting. Zero or overflowing values fail
     /// [`Runner::run`] rather than arming a deny-all or saturated limiter.
     pub fn with_rate_limit_rps(mut self, rps: Option<u32>) -> Self {
@@ -662,7 +614,10 @@ impl Runner {
         B: ingestion::HasHeight + storage::IndexableBlock + Send + Sync + 'static,
     {
         anyhow::ensure!(
-            !self.runtimes.iter().any(|r| r.chain_id == config.chain_id),
+            !self
+                .rest_chains
+                .iter()
+                .any(|c| c.chain_id == config.chain_id),
             "chain {:?} added twice; two pipelines writing one chain_id would \
              interleave rollbacks and corrupt the index",
             config.chain_id
@@ -696,8 +651,8 @@ impl Runner {
             info!(chain_id = %config.chain_id, projections, "payload projections indexed");
         }
 
-        // Shared with grpc-service so SubscribeAccountActions can resolve roles
-        // (e.g. a Transfer's recipient) the same way insert_block does.
+        // Shared with the REST `actions/stream?address=` filter so it resolves
+        // roles (e.g. a Transfer's recipient) the same way insert_block does.
         let projections = kind_schema.projections().to_vec();
         let address_extractor = Arc::new(storage::AddressExtractor::new(kind_schema, hooks.tier_b));
 
@@ -760,38 +715,29 @@ impl Runner {
             node_rpc_url: Some(config.node_rpc_url.clone()),
             node_rpc_token: config.node_rpc_token.clone(),
         });
-        self.runtimes.push(grpc_service::ChainRuntime {
-            chain_id: config.chain_id,
-            display_name: config.display_name,
-            blocks_topic: config.blocks_topic,
-            sync_protocol: config.sync_protocol,
-            finality_depth: config.finality_depth,
-            address_extractor,
-            address_validator: hooks.address_validator,
-            blocks_tx,
-            network_view,
-        });
         Ok(())
     }
 
-    /// Serves gRPC (and REST, if configured) and runs until a chain task or an
-    /// API server finishes or fails, or a shutdown signal arrives.
+    /// Serves the API and runs until a chain task or the API server finishes
+    /// or fails, or a shutdown signal arrives.
     ///
     /// One chain task ending takes the process down rather than leaving the
     /// rest running: a half-dead multi-chain indexer still answers queries for
     /// the chain that died, with data that silently stops advancing. Failing
-    /// visibly is the better outcome — a supervisor restarts it. An API server
-    /// dying is fatal for the same reason: if gRPC dies while REST keeps
-    /// answering `/health`, a supervisor never restarts the process and
-    /// clients relying on gRPC lose service silently.
+    /// visibly is the better outcome — a supervisor restarts it. The API
+    /// server dying is fatal for the same reason.
     pub async fn run(self) -> Result<()> {
         anyhow::ensure!(
-            !self.runtimes.is_empty(),
+            !self.rest_chains.is_empty(),
             "no chains registered; nothing to do"
         );
 
-        let chain_ids: Vec<&str> = self.runtimes.iter().map(|r| r.chain_id.as_str()).collect();
-        info!(chains = ?chain_ids, default = %chain_ids[0], "serving");
+        let chain_ids: Vec<&str> = self
+            .rest_chains
+            .iter()
+            .map(|c| c.chain_id.as_str())
+            .collect();
+        info!(chains = ?chain_ids, "serving");
 
         if let Some(rps) = self.rate_limit_rps {
             validate_rate_limit_rps(rps, "with_rate_limit_rps")?;
@@ -802,46 +748,23 @@ impl Runner {
             info!(
                 auth = guard.token.is_some(),
                 rate_limit = guard.rate_limiter.is_some(),
-                "request guard active on both surfaces"
+                "request guard active"
             );
         } else {
-            let grpc_bind = self.grpc_bind;
             let rest_bind = self.rest_bind;
             warn!(
-                %grpc_bind, %rest_bind,
-                "no --auth-token and no --rate-limit-rps: both API surfaces are \
-                 open to anyone who can reach {grpc_bind}/{rest_bind}; only bind \
-                 a non-loopback address on a closed network"
+                %rest_bind,
+                "no --auth-token and no --rate-limit-rps: the API is open to \
+                 anyone who can reach {rest_bind}; only bind a non-loopback \
+                 address on a closed network"
             );
         }
 
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
         let mut servers: tokio::task::JoinSet<Result<()>> = tokio::task::JoinSet::new();
 
-        let grpc_addr = SocketAddr::new(self.grpc_bind, self.grpc_port);
-        let grpc_listener = bind_listener(grpc_addr, "gRPC").await?;
-        let grpc_service = grpc_service::server(self.read_pool.clone(), self.runtimes);
-        let grpc_service = tonic::service::interceptor::InterceptedService::new(
-            grpc_service,
-            auth::GrpcGuard(guard.clone()),
-        );
-        info!(%grpc_addr, "gRPC listening");
-        let mut grpc_stop = shutdown_rx.clone();
-        servers.spawn(async move {
-            tonic::transport::Server::builder()
-                .add_service(grpc_service)
-                .serve_with_incoming_shutdown(
-                    tokio_stream::wrappers::TcpListenerStream::new(grpc_listener),
-                    async move {
-                        let _ = grpc_stop.wait_for(|stop| *stop).await;
-                    },
-                )
-                .await
-                .context("gRPC server failed")
-        });
-
-        if let Some(rest_port) = self.rest_port {
-            let rest_addr = SocketAddr::new(self.rest_bind, rest_port);
+        {
+            let rest_addr = SocketAddr::new(self.rest_bind, self.rest_port);
             let listener = bind_listener(rest_addr, "REST").await?;
             let router =
                 rest_service::router(self.read_pool.clone(), self.rest_chains, MIN_NODE_VERSION)
@@ -1181,8 +1104,6 @@ mod tests {
         "--database-url",
         "--chain-id",
         "--rest-port",
-        "--grpc-port",
-        "--grpc-bind",
         "--rest-bind",
         "--kind-schema",
         "--blocks-topic",
@@ -1238,8 +1159,8 @@ mod tests {
         );
         assert!(parse_bind("::1", "test").is_ok());
 
-        let err = parse_bind("localhost", "--grpc-bind").unwrap_err();
-        assert!(format!("{err:#}").contains("--grpc-bind"));
+        let err = parse_bind("localhost", "--rest-bind").unwrap_err();
+        assert!(format!("{err:#}").contains("--rest-bind"));
         let err = parse_bind("10.0.0.1:80", "RETRACER_REST_BIND").unwrap_err();
         assert!(format!("{err:#}").contains("RETRACER_REST_BIND"));
     }

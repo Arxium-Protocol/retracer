@@ -9,10 +9,7 @@ tracing = { workspace = true }
 tokio = { workspace = true, features = ["net"] }
 ingestion = { workspace = true }
 storage = { workspace = true }
-grpc-service = { workspace = true }
 rest-service = { workspace = true }
-tonic = "0.14"
-tokio-stream = { version = "0.1", features = ["net"] }
 futures = "0.3"
 axum = "0.8"
 sqlx = { workspace = true }
