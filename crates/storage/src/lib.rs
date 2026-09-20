@@ -1144,16 +1144,18 @@ async fn insert_effects_in_tx(
             .iter()
             .map(|d| d.signature.clone())
             .collect();
+        let sender: Vec<_> = effects.dropped.iter().map(|d| d.sender.clone()).collect();
         let reason: Vec<_> = effects.dropped.iter().map(|d| d.reason.clone()).collect();
         sqlx::query(
-            "INSERT INTO dropped_actions (chain_id, block_height, signature, reason)
-             SELECT $1, $2, u.signature, u.reason
-             FROM UNNEST($3::TEXT[], $4::TEXT[]) AS u(signature, reason)
+            "INSERT INTO dropped_actions (chain_id, block_height, signature, sender, reason)
+             SELECT $1, $2, u.signature, u.sender, u.reason
+             FROM UNNEST($3::TEXT[], $4::TEXT[], $5::TEXT[]) AS u(signature, sender, reason)
              ON CONFLICT DO NOTHING",
         )
         .bind(chain_id)
         .bind(height)
         .bind(&signature[..])
+        .bind(&sender[..])
         .bind(&reason[..])
         .execute(&mut **tx)
         .await?;
@@ -1417,6 +1419,279 @@ pub async fn get_account_actions(
 /// resume waits before its first message. 500 blocks is ~17 minutes of chain at
 /// a 2s interval, and two queries' worth of rows.
 pub const BLOCK_PAGE: i64 = 500;
+
+// ---------------------------------------------------------------- state reads
+//
+// Every table in `0003_state.sql` is sparse by height, so "state at H" is the
+// newest row with `height <= H` — `DISTINCT ON (key) … ORDER BY key, height
+// DESC` when there are many keys, `ORDER BY height DESC LIMIT 1` for one.
+// `at` is the caller's height cap; `i64::MAX` means the tip.
+
+/// An account as of `at`: native balance/nonce, every asset it holds, and
+/// every live stake allocation. `None` when the account has no state row at
+/// or below `at` — never funded, or not yet at that height.
+pub async fn get_account_state(
+    pool: &PgPool,
+    chain_id: &str,
+    address: &str,
+    at: i64,
+) -> Result<Option<AccountState>> {
+    let Some((height, balance, nonce)) = sqlx::query_as::<_, (i64, String, i64)>(
+        "SELECT height, balance::TEXT, nonce FROM account_state
+         WHERE chain_id = $1 AND address = $2 AND height <= $3
+         ORDER BY height DESC LIMIT 1",
+    )
+    .bind(chain_id)
+    .bind(address)
+    .bind(at)
+    .fetch_optional(pool)
+    .await?
+    else {
+        return Ok(None);
+    };
+
+    let assets = sqlx::query_as::<_, (String, String, i64)>(
+        "SELECT asset, balance::TEXT, height FROM (
+             SELECT DISTINCT ON (asset) asset, balance, height FROM asset_balances
+             WHERE chain_id = $1 AND holder = $2 AND height <= $3
+             ORDER BY asset, height DESC
+         ) latest WHERE balance > 0 ORDER BY asset",
+    )
+    .bind(chain_id)
+    .bind(address)
+    .bind(at)
+    .fetch_all(pool)
+    .await?
+    .into_iter()
+    .map(|(asset, balance, height)| AssetHolding {
+        asset,
+        balance,
+        height,
+    })
+    .collect();
+
+    let stakes = sqlx::query_as::<_, (String, Option<serde_json::Value>, i64)>(
+        "SELECT validator, allocation, height FROM (
+             SELECT DISTINCT ON (validator) validator, allocation, height FROM stakes
+             WHERE chain_id = $1 AND master = $2 AND height <= $3
+             ORDER BY validator, height DESC
+         ) latest WHERE allocation IS NOT NULL ORDER BY validator",
+    )
+    .bind(chain_id)
+    .bind(address)
+    .bind(at)
+    .fetch_all(pool)
+    .await?
+    .into_iter()
+    .map(|(validator, allocation, height)| StakeRow {
+        validator,
+        allocation: allocation.unwrap_or_default(),
+        height,
+    })
+    .collect();
+
+    Ok(Some(AccountState {
+        address: address.to_string(),
+        height,
+        balance,
+        nonce,
+        assets,
+        stakes,
+    }))
+}
+
+#[derive(Debug, Clone, serde::Serialize, utoipa::ToSchema)]
+pub struct AccountState {
+    pub address: String,
+    /// Height of the newest native-balance change at or below the requested
+    /// `at` — what "as of" resolved to.
+    pub height: i64,
+    /// Decimal string: the chain's u128 doesn't fit JSON numbers.
+    pub balance: String,
+    pub nonce: i64,
+    pub assets: Vec<AssetHolding>,
+    pub stakes: Vec<StakeRow>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, utoipa::ToSchema)]
+pub struct AssetHolding {
+    pub asset: String,
+    pub balance: String,
+    pub height: i64,
+}
+
+#[derive(Debug, Clone, serde::Serialize, utoipa::ToSchema)]
+pub struct StakeRow {
+    pub validator: String,
+    /// The chain's allocation record verbatim (`xc_primitives::StakeAllocation`).
+    #[schema(value_type = Object)]
+    pub allocation: serde_json::Value,
+    pub height: i64,
+}
+
+/// The holders of `asset` as of `at` with a non-zero balance, ascending by
+/// holder address, keyset-paged on `after` (the last holder of the previous
+/// page). Each row carries the holder's newest compliance state, if any.
+pub async fn get_asset_holders(
+    pool: &PgPool,
+    chain_id: &str,
+    asset: &str,
+    at: i64,
+    after: Option<&str>,
+    limit: i64,
+) -> Result<Vec<HolderRow>> {
+    Ok(
+        sqlx::query_as::<_, (String, String, i64, Option<serde_json::Value>)>(
+            "SELECT h.holder, h.balance::TEXT, h.height, s.state
+             FROM (
+                 SELECT DISTINCT ON (holder) holder, balance, height FROM asset_balances
+                 WHERE chain_id = $1 AND asset = $2 AND height <= $3
+                 ORDER BY holder, height DESC
+             ) h
+             LEFT JOIN LATERAL (
+                 SELECT state FROM asset_holder_states
+                 WHERE chain_id = $1 AND asset = $2 AND holder = h.holder AND height <= $3
+                 ORDER BY height DESC LIMIT 1
+             ) s ON TRUE
+             WHERE h.balance > 0 AND h.holder > $4
+             ORDER BY h.holder LIMIT $5",
+        )
+        .bind(chain_id)
+        .bind(asset)
+        .bind(at)
+        .bind(after.unwrap_or(""))
+        .bind(limit)
+        .fetch_all(pool)
+        .await?
+        .into_iter()
+        .map(|(holder, balance, height, state)| HolderRow {
+            holder,
+            balance,
+            height,
+            state,
+        })
+        .collect(),
+    )
+}
+
+#[derive(Debug, Clone, serde::Serialize, utoipa::ToSchema)]
+pub struct HolderRow {
+    pub holder: String,
+    pub balance: String,
+    pub height: i64,
+    /// Compliance state (`xc_primitives::HolderState`) if the chain ever set
+    /// one for this holder; `null` means default (nothing frozen).
+    #[schema(value_type = Option<Object>)]
+    pub state: Option<serde_json::Value>,
+}
+
+/// A validator's current status, voting power in the newest epoch set that
+/// lists it, and every status change on record. `None` when neither table
+/// has heard of the address.
+pub async fn get_validator(
+    pool: &PgPool,
+    chain_id: &str,
+    address: &str,
+) -> Result<Option<ValidatorRow>> {
+    let history: Vec<(i64, Option<serde_json::Value>)> = sqlx::query_as(
+        "SELECT height, status FROM validator_status
+         WHERE chain_id = $1 AND address = $2 ORDER BY height DESC",
+    )
+    .bind(chain_id)
+    .bind(address)
+    .fetch_all(pool)
+    .await?;
+
+    let power: Option<(i64, serde_json::Value)> = sqlx::query_as(
+        "SELECT height, validators -> $2 FROM validator_sets
+         WHERE chain_id = $1 AND validators ? $2
+         ORDER BY height DESC LIMIT 1",
+    )
+    .bind(chain_id)
+    .bind(address)
+    .fetch_optional(pool)
+    .await?;
+
+    if history.is_empty() && power.is_none() {
+        return Ok(None);
+    }
+    Ok(Some(ValidatorRow {
+        address: address.to_string(),
+        status: history.first().and_then(|(_, s)| s.clone()),
+        voting_power: power.as_ref().and_then(|(_, p)| p.as_u64()),
+        set_effective_height: power.map(|(h, _)| h + 1),
+        history: history
+            .into_iter()
+            .map(|(height, status)| ValidatorStatusChange { height, status })
+            .collect(),
+    }))
+}
+
+#[derive(Debug, Clone, serde::Serialize, utoipa::ToSchema)]
+pub struct ValidatorRow {
+    pub address: String,
+    /// Newest status (`xc_primitives::ValidatorStatus`), `null` if cleared.
+    #[schema(value_type = Option<Object>)]
+    pub status: Option<serde_json::Value>,
+    /// From the newest epoch set listing this validator; `null` if it has
+    /// never been in one.
+    pub voting_power: Option<u64>,
+    /// First height that set applies to.
+    pub set_effective_height: Option<i64>,
+    /// Newest first.
+    pub history: Vec<ValidatorStatusChange>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, utoipa::ToSchema)]
+pub struct ValidatorStatusChange {
+    pub height: i64,
+    #[schema(value_type = Option<Object>)]
+    pub status: Option<serde_json::Value>,
+}
+
+/// Actions the producer rejected, newest first, optionally one sender's,
+/// keyset-paged on `(block_height, signature)` descending.
+pub async fn list_dropped_actions(
+    pool: &PgPool,
+    chain_id: &str,
+    sender: Option<&str>,
+    before: Option<(i64, &str)>,
+    limit: i64,
+) -> Result<Vec<DroppedRow>> {
+    let (before_height, before_sig) = before.unwrap_or((i64::MAX, ""));
+    Ok(sqlx::query_as::<_, (i64, String, String, String)>(
+        "SELECT block_height, signature, sender, reason FROM dropped_actions
+         WHERE chain_id = $1
+           AND ($2::TEXT IS NULL OR sender = $2)
+           AND (block_height < $3 OR (block_height = $3 AND signature < $4))
+         ORDER BY block_height DESC, signature DESC LIMIT $5",
+    )
+    .bind(chain_id)
+    .bind(sender)
+    .bind(before_height)
+    .bind(before_sig)
+    .bind(limit)
+    .fetch_all(pool)
+    .await?
+    .into_iter()
+    .map(|(block_height, signature, sender, reason)| DroppedRow {
+        block_height,
+        signature,
+        sender,
+        reason,
+    })
+    .collect())
+}
+
+#[derive(Debug, Clone, serde::Serialize, utoipa::ToSchema)]
+pub struct DroppedRow {
+    /// The block the producer was building when it rejected the action.
+    pub block_height: i64,
+    pub signature: String,
+    /// Empty for rows from a node older than Arxium `f837d44`.
+    pub sender: String,
+    pub reason: String,
+}
 
 /// Blocks in `[from, to]`, ordered by height, at most `limit` of them.
 ///

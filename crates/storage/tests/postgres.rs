@@ -861,7 +861,10 @@ async fn effects_write_state_tables_and_roll_back_with_the_block() {
     .expect("balance");
     assert_eq!(balance, u128::MAX.to_string(), "u128 survives NUMERIC");
     assert_eq!(
-        storage::get_stats(&pool, &chain).await.expect("stats").total_accounts,
+        storage::get_stats(&pool, &chain)
+            .await
+            .expect("stats")
+            .total_accounts,
         2,
         "two distinct accounts in state, no actions at all"
     );
@@ -872,4 +875,139 @@ async fn effects_write_state_tables_and_roll_back_with_the_block() {
     assert_eq!(count(&pool, "account_state", &chain).await, 2);
     assert_eq!(count(&pool, "dropped_actions", &chain).await, 1);
     assert_eq!(count(&pool, "validator_sets", &chain).await, 1);
+}
+
+/// The state reads resolve "as of height": the newest row at or below `at`
+/// per key, zero balances drop out of holder lists, removed stakes drop out
+/// of an account, a validator answers from either table, and the dropped
+/// list filters by sender and pages by `(height, signature)`.
+#[tokio::test]
+async fn state_reads_resolve_as_of_height() {
+    let pool = skip_without_db!();
+    let chain = chain_id("state-reads");
+    let extractor = AddressExtractor::tier_a_only(KindSchema::empty());
+
+    let effects = |v: serde_json::Value| -> storage::BlockEffects {
+        serde_json::from_value(v).expect("effects decode")
+    };
+    let heights = [
+        // h0: alice funded, holds gold, stakes with v9, v9 active + in set.
+        effects(serde_json::json!({
+            "accounts": {addr(1): {"balance": 1000, "nonce": 0}},
+            "asset_balances": [{"asset": "gold", "owner": addr(1), "balance": 5},
+                               {"asset": "gold", "owner": addr(2), "balance": 7}],
+            "stakes": [{"master": addr(1), "validator": addr(9), "allocation": {"amount": 100}}],
+            "validator_statuses": {addr(9): "Active"},
+            "validator_set": {addr(9): 10000},
+            "dropped": [{"signature": "d0", "sender": addr(1), "reason": "nonce"}],
+        })),
+        // h1: alice spends, bob's gold goes to 0, alice unstakes, v9 jailed.
+        effects(serde_json::json!({
+            "accounts": {addr(1): {"balance": 900, "nonce": 1}, addr(2): {"balance": 50, "nonce": 0}},
+            "asset_balances": [{"asset": "gold", "owner": addr(2), "balance": 0}],
+            "holder_states": [{"asset": "gold", "holder": addr(1), "state": {"frozen": true}}],
+            "stakes": [{"master": addr(1), "validator": addr(9), "allocation": null}],
+            "validator_statuses": {addr(9): {"Jailed": {"until_epoch": 3}}},
+            "dropped": [{"signature": "d1", "sender": addr(2), "reason": "balance"},
+                        {"signature": "d2", "sender": addr(1), "reason": "sig"}],
+        })),
+    ];
+    let mut parent = "0x0".to_string();
+    for (height, fx) in heights.into_iter().enumerate() {
+        let mut b = block(height as u64, &parent, vec![]);
+        b.effects = Some(fx);
+        parent = b.hash();
+        storage::insert_block(&pool, &chain, &b, &extractor)
+            .await
+            .expect("insert");
+    }
+
+    // Account at tip vs as of height 0.
+    let alice = storage::get_account_state(&pool, &chain, &addr(1), i64::MAX)
+        .await
+        .expect("query")
+        .expect("alice exists");
+    assert_eq!(
+        (alice.height, alice.balance.as_str(), alice.nonce),
+        (1, "900", 1)
+    );
+    assert_eq!(alice.assets.len(), 1, "gold unchanged since h0 still shows");
+    assert!(alice.stakes.is_empty(), "removed allocation drops out");
+    let alice0 = storage::get_account_state(&pool, &chain, &addr(1), 0)
+        .await
+        .expect("query")
+        .expect("alice at 0");
+    assert_eq!((alice0.balance.as_str(), alice0.stakes.len()), ("1000", 1));
+    assert!(
+        storage::get_account_state(&pool, &chain, &addr(2), 0)
+            .await
+            .expect("query")
+            .is_none(),
+        "bob has no state row at h0"
+    );
+
+    // Holders: bob at 0 disappears at tip, present at h0; alice carries state.
+    let tip = storage::get_asset_holders(&pool, &chain, "gold", i64::MAX, None, 10)
+        .await
+        .expect("holders");
+    assert_eq!(tip.len(), 1);
+    assert_eq!(tip[0].holder, addr(1));
+    assert_eq!(tip[0].state.as_ref().unwrap()["frozen"], true);
+    let at0 = storage::get_asset_holders(&pool, &chain, "gold", 0, None, 10)
+        .await
+        .expect("holders");
+    assert_eq!(at0.len(), 2);
+    assert!(at0[0].state.is_none());
+    let page2 = storage::get_asset_holders(&pool, &chain, "gold", 0, Some(&at0[0].holder), 10)
+        .await
+        .expect("holders page 2");
+    assert_eq!(page2.len(), 1);
+    assert_eq!(page2[0].holder, addr(2));
+
+    // Validator: newest status, power from the set, full history.
+    let v = storage::get_validator(&pool, &chain, &addr(9))
+        .await
+        .expect("query")
+        .expect("v9");
+    assert_eq!(v.status.unwrap()["Jailed"]["until_epoch"], 3);
+    assert_eq!(
+        (v.voting_power, v.set_effective_height),
+        (Some(10000), Some(1))
+    );
+    assert_eq!(v.history.len(), 2);
+    assert!(
+        storage::get_validator(&pool, &chain, &addr(8))
+            .await
+            .expect("query")
+            .is_none()
+    );
+
+    // Dropped: newest first, sender filter, keyset paging.
+    let all = storage::list_dropped_actions(&pool, &chain, None, None, 10)
+        .await
+        .expect("dropped");
+    assert_eq!(
+        all.iter().map(|d| d.signature.as_str()).collect::<Vec<_>>(),
+        ["d2", "d1", "d0"]
+    );
+    let alice_only = storage::list_dropped_actions(&pool, &chain, Some(&addr(1)), None, 10)
+        .await
+        .expect("dropped");
+    assert_eq!(
+        alice_only
+            .iter()
+            .map(|d| d.signature.as_str())
+            .collect::<Vec<_>>(),
+        ["d2", "d0"]
+    );
+    let after_d2 = storage::list_dropped_actions(&pool, &chain, None, Some((1, "d2")), 10)
+        .await
+        .expect("dropped");
+    assert_eq!(
+        after_d2
+            .iter()
+            .map(|d| d.signature.as_str())
+            .collect::<Vec<_>>(),
+        ["d1", "d0"]
+    );
 }

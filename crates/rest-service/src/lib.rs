@@ -201,10 +201,11 @@ impl AppState {
         list_chains, get_status, get_stats, list_blocks, get_block, list_actions, get_action,
         get_account_actions, list_proposers, get_validator_uptime, search, health, readiness, metrics,
         sse::stream_blocks, sse::stream_actions,
+        get_account, get_asset_holders, get_validator, list_dropped_actions,
     ),
     tags(
-        (name = "chains"), (name = "blocks"), (name = "actions"), (name = "validators"),
-        (name = "search"), (name = "ops"),
+        (name = "chains"), (name = "blocks"), (name = "actions"), (name = "accounts"),
+        (name = "validators"), (name = "search"), (name = "ops"),
     )
 )]
 struct ApiDoc;
@@ -248,6 +249,19 @@ pub fn router(pool: PgPool, chains: Vec<RestChain>, min_node_version: &'static s
         .route(
             "/v1/chains/{chain_id}/accounts/{address}/actions",
             get(get_account_actions),
+        )
+        .route("/v1/chains/{chain_id}/accounts/{address}", get(get_account))
+        .route(
+            "/v1/chains/{chain_id}/assets/{asset}/holders",
+            get(get_asset_holders),
+        )
+        .route(
+            "/v1/chains/{chain_id}/validators/{address}",
+            get(get_validator),
+        )
+        .route(
+            "/v1/chains/{chain_id}/actions/dropped",
+            get(list_dropped_actions),
         )
         .route("/v1/chains/{chain_id}/proposers", get(list_proposers))
         .route(
@@ -920,14 +934,7 @@ async fn get_account_actions(
     Path((chain_id, address)): Path<(String, String)>,
     Query(page): Query<ActionPage>,
 ) -> ApiResult<Vec<storage::ActionRow>> {
-    let chain = state.chain(&chain_id)?;
-    if let Some(valid) = &chain.address_validator
-        && !valid(&address)
-    {
-        return Err(ApiError::BadRequest(
-            "not a valid address for this chain".into(),
-        ));
-    }
+    check_address(state.chain(&chain_id)?, &address)?;
     let limit = clamp_limit(page.limit)?;
     Ok(Json(
         storage::get_account_actions(
@@ -937,6 +944,134 @@ async fn get_account_actions(
             limit,
             page.cursor()?,
             page.role.as_deref(),
+        )
+        .await?,
+    ))
+}
+
+// ---------------------------------------------------------------- state
+//
+// Served from the `0003_state.sql` tables the effects feed fills. `at` caps
+// the height ("as of block H"); absent means the tip. Every amount is a
+// decimal string because the chain's u128 doesn't fit a JSON number.
+
+#[derive(Deserialize, IntoParams)]
+struct AsOf {
+    /// State as of this height; the tip when absent.
+    at: Option<i64>,
+}
+
+impl AsOf {
+    fn height(&self) -> Result<i64, ApiError> {
+        match self.at {
+            None => Ok(i64::MAX),
+            Some(h) if h < 0 => Err(ApiError::BadRequest("at must be >= 0".into())),
+            Some(h) => Ok(h),
+        }
+    }
+}
+
+fn check_address(chain: &RestChain, address: &str) -> Result<(), ApiError> {
+    match &chain.address_validator {
+        Some(valid) if !valid(address) => Err(ApiError::BadRequest(
+            "not a valid address for this chain".into(),
+        )),
+        _ => Ok(()),
+    }
+}
+
+#[utoipa::path(get, path = "/v1/chains/{chain_id}/accounts/{address}", tag = "accounts", params(("chain_id" = String, Path), ("address" = String, Path), AsOf), responses((status = 200, description = "Balance, nonce, asset holdings and live stakes as of `at`", body = storage::AccountState), (status = 400, body = ErrorBody), (status = 404, description = "Unknown chain, or no state for this account at or below `at`", body = ErrorBody)))]
+async fn get_account(
+    State(state): State<AppState>,
+    Path((chain_id, address)): Path<(String, String)>,
+    Query(as_of): Query<AsOf>,
+) -> ApiResult<storage::AccountState> {
+    check_address(state.chain(&chain_id)?, &address)?;
+    storage::get_account_state(&state.pool, &chain_id, &address, as_of.height()?)
+        .await?
+        .map(Json)
+        .ok_or_else(|| ApiError::NotFound("account not found".into()))
+}
+
+#[derive(Deserialize, IntoParams)]
+struct HolderPage {
+    /// State as of this height; the tip when absent.
+    at: Option<i64>,
+    limit: Option<i64>,
+    /// The last `holder` of the previous page.
+    after: Option<String>,
+}
+
+#[utoipa::path(get, path = "/v1/chains/{chain_id}/assets/{asset}/holders", tag = "accounts", params(("chain_id" = String, Path), ("asset" = String, Path, description = "The asset's `AssetRef`"), HolderPage), responses((status = 200, description = "Non-zero holders ascending by address, with compliance state where set", body = Vec<storage::HolderRow>), (status = 400, body = ErrorBody), (status = 404, body = ErrorBody)))]
+async fn get_asset_holders(
+    State(state): State<AppState>,
+    Path((chain_id, asset)): Path<(String, String)>,
+    Query(page): Query<HolderPage>,
+) -> ApiResult<Vec<storage::HolderRow>> {
+    state.chain(&chain_id)?;
+    let at = AsOf { at: page.at }.height()?;
+    let limit = clamp_limit(page.limit)?;
+    Ok(Json(
+        storage::get_asset_holders(
+            &state.pool,
+            &chain_id,
+            &asset,
+            at,
+            page.after.as_deref(),
+            limit,
+        )
+        .await?,
+    ))
+}
+
+#[utoipa::path(get, path = "/v1/chains/{chain_id}/validators/{address}", tag = "validators", params(("chain_id" = String, Path), ("address" = String, Path)), responses((status = 200, description = "Current status, voting power in the newest set listing it, and every status change", body = storage::ValidatorRow), (status = 400, body = ErrorBody), (status = 404, description = "Unknown chain, or the address never had validator state", body = ErrorBody)))]
+async fn get_validator(
+    State(state): State<AppState>,
+    Path((chain_id, address)): Path<(String, String)>,
+) -> ApiResult<storage::ValidatorRow> {
+    check_address(state.chain(&chain_id)?, &address)?;
+    storage::get_validator(&state.pool, &chain_id, &address)
+        .await?
+        .map(Json)
+        .ok_or_else(|| ApiError::NotFound("validator not found".into()))
+}
+
+#[derive(Deserialize, IntoParams)]
+struct DroppedPage {
+    /// Only actions this address sent.
+    sender: Option<String>,
+    limit: Option<i64>,
+    before_height: Option<i64>,
+    before_signature: Option<String>,
+}
+
+#[utoipa::path(get, path = "/v1/chains/{chain_id}/actions/dropped", tag = "actions", params(("chain_id" = String, Path), DroppedPage), responses((status = 200, description = "Actions the producer rejected, newest first, with the reason", body = Vec<storage::DroppedRow>), (status = 400, body = ErrorBody), (status = 404, body = ErrorBody)))]
+async fn list_dropped_actions(
+    State(state): State<AppState>,
+    Path(chain_id): Path<String>,
+    Query(page): Query<DroppedPage>,
+) -> ApiResult<Vec<storage::DroppedRow>> {
+    let chain = state.chain(&chain_id)?;
+    if let Some(sender) = &page.sender {
+        check_address(chain, sender)?;
+    }
+    let before = match (page.before_height, &page.before_signature) {
+        (Some(h), Some(s)) => Some((h, s.as_str())),
+        (None, None) => None,
+        _ => {
+            return Err(ApiError::BadRequest(
+                "before_height and before_signature must be sent together".into(),
+            ));
+        }
+    };
+    let limit = clamp_limit(page.limit)?;
+    Ok(Json(
+        storage::list_dropped_actions(
+            &state.pool,
+            &chain_id,
+            page.sender.as_deref(),
+            before,
+            limit,
         )
         .await?,
     ))

@@ -106,6 +106,9 @@ pub struct StakeEffect {
 #[derive(Clone, Debug, serde::Deserialize)]
 pub struct DroppedEffect {
     pub signature: String,
+    /// Empty from a node older than Arxium `f837d44`.
+    #[serde(default)]
+    pub sender: String,
     pub reason: String,
 }
 
