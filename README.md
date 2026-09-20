@@ -158,7 +158,23 @@ GET  /v1/chains/{chain}/accounts/{address}/actions?limit=&role=
 GET  /v1/chains/{chain}/search?q=
 
 GET  /v1/chains/{chain}/validators/uptime?from=&to=
+
+GET  /v1/chains/{chain}/accounts/{address}?at=
+GET  /v1/chains/{chain}/assets/{asset}/holders?at=&after=&limit=
+GET  /v1/chains/{chain}/validators/{address}
+GET  /v1/chains/{chain}/actions/dropped?sender=&before_height=&before_signature=&limit=
 ```
+
+The last four are **state**, kept by height from the node's
+`GET /blocks/{h}/effects` (what each block changed): an account's balance,
+nonce and identity fields plus its non-zero asset holdings and live stakes;
+an asset's non-zero holders with their compliance state; a validator's
+status, voting power and status history; and the actions a producer
+rejected, with the reason. `at=` answers "as of block H" (default: tip).
+Amounts are decimal strings — the chain's u128 doesn't fit a JSON number.
+State is only as complete as the effects the node served: blocks indexed
+from a node older than the effects record have no state rows, and
+`dropped` is only ever populated by the producing node.
 
 `/health` is process liveness only. `/ready` returns 200 when PostgreSQL
 answers within a fixed timeout — that is, when reads work — and 503 otherwise.
@@ -361,11 +377,15 @@ and `ingestion::HasHeight` for your own block type — see
 
 ## What it deliberately doesn't do
 
-- **Account balances and nonces.** Not derivable from indexed actions; ask the
-  node directly.
-- **Validator set membership.** Live membership comes from the node's
-  `/validators`. Retracer reports who has actually *proposed* blocks — and
-  who *should have*: `GET /v1/chains/{chain_id}/validators/uptime?from=&to=`
+- **A nonce for signing.** `/accounts/{address}` reports the nonce as of the
+  newest indexed block, which trails the node by ingestion latency; a wallet
+  building the next action reads the node.
+- **The asset registry** (symbol, decimals, issuer), BLS keys, min-stake,
+  action-fee, finality. Node reads.
+- **Validator set membership by height.** `/validators/{address}` gives the
+  newest status and set; per-height membership comes from the node's
+  `/validators?height=`. Retracer also reports who has actually *proposed*
+  blocks — and who *should have*: `GET /v1/chains/{chain_id}/validators/uptime?from=&to=`
   compares each indexed height's round-0 designee (a pure function of the
   node's own `/validators?height=N`, mirroring the node's own
   `eligible_proposer` formula, not a replay of chain-specific dispatch logic)
