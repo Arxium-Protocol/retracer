@@ -5,7 +5,10 @@ use sqlx::postgres::PgPoolOptions;
 mod schema;
 mod wire;
 pub use schema::{ActionIndexable, AddressExtractor, KindSchema, Projection, ProjectionType, Role};
-pub use wire::{IndexableAction, IndexableBlock, testing};
+pub use wire::{
+    AccountEffect, AssetBalanceEffect, BlockEffects, DroppedEffect, HolderStateEffect,
+    IndexableAction, IndexableBlock, StakeEffect, testing,
+};
 
 /// Decides whether a string is a well-formed address on this chain. Injected
 /// rather than hardcoded because address format is chain-specific — Arxium's
@@ -294,19 +297,14 @@ pub async fn get_stats(pool: &PgPool, chain_id: &str) -> Result<Stats> {
             .fetch_one(pool)
             .await?;
 
-    // Senders live in account_actions, everyone else in action_addresses.
-    // UNION rather than UNION ALL: an address that both sent and received is
-    // one address, and the whole point of the number is how many there are.
-    let (total_accounts,): (i64,) = sqlx::query_as(
-        "SELECT COUNT(*) FROM (
-             SELECT address FROM account_actions WHERE chain_id = $1
-             UNION
-             SELECT address FROM action_addresses WHERE chain_id = $1
-         ) AS seen",
-    )
-    .bind(chain_id)
-    .fetch_one(pool)
-    .await?;
+    // Accounts that exist in state, not addresses seen in actions: a genesis
+    // allocation that never transacted is an account, and a `to` that was
+    // never funded is not.
+    let (total_accounts,): (i64,) =
+        sqlx::query_as("SELECT COUNT(DISTINCT address) FROM account_state WHERE chain_id = $1")
+            .bind(chain_id)
+            .fetch_one(pool)
+            .await?;
 
     // Against the block's timestamp, which is the chain's clock, not this
     // host's. `indexed_at` would measure when the indexer happened to be
@@ -657,6 +655,14 @@ pub async fn rollback_to(pool: &PgPool, chain_id: &str, height: i64) -> Result<u
         "DELETE FROM action_addresses WHERE chain_id = $1 AND block_height > $2",
         "DELETE FROM account_actions WHERE chain_id = $1 AND block_height > $2",
         "DELETE FROM actions WHERE chain_id = $1 AND block_height > $2",
+        "DELETE FROM dropped_actions WHERE chain_id = $1 AND block_height > $2",
+        "DELETE FROM account_state WHERE chain_id = $1 AND height > $2",
+        "DELETE FROM asset_balances WHERE chain_id = $1 AND height > $2",
+        "DELETE FROM asset_holder_states WHERE chain_id = $1 AND height > $2",
+        "DELETE FROM stakes WHERE chain_id = $1 AND height > $2",
+        "DELETE FROM validator_status WHERE chain_id = $1 AND height > $2",
+        "DELETE FROM validator_sets WHERE chain_id = $1 AND height > $2",
+        "DELETE FROM asset_registrations WHERE chain_id = $1 AND height > $2",
     ] {
         sqlx::query(sql)
             .bind(chain_id)
@@ -945,6 +951,10 @@ async fn insert_block_in_tx<B: IndexableBlock>(
         .await?;
     }
 
+    if let Some(effects) = block.effects() {
+        insert_effects_in_tx(tx, chain_id, height, effects).await?;
+    }
+
     sqlx::query(
         "INSERT INTO ingestion_cursor (chain_id, last_height)
          VALUES ($1, $2)
@@ -956,6 +966,198 @@ async fn insert_block_in_tx<B: IndexableBlock>(
     .bind(height)
     .execute(&mut **tx)
     .await?;
+
+    Ok(())
+}
+
+/// The state rows for one block — `migrations/0003_state.sql`. Same batching
+/// as the history rows (one `UNNEST` statement per table, only for tables the
+/// block touched) and the same `ON CONFLICT DO NOTHING` idempotency, so a
+/// redelivered block is a no-op here too.
+///
+/// Balances travel as `TEXT[]` and are cast to `NUMERIC` server-side: sqlx
+/// has no native u128 and the digits are all we need to preserve.
+async fn insert_effects_in_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    chain_id: &str,
+    height: i64,
+    effects: &BlockEffects,
+) -> Result<()> {
+    if !effects.accounts.is_empty() {
+        let (mut address, mut balance, mut nonce) = (Vec::new(), Vec::new(), Vec::new());
+        for (a, e) in &effects.accounts {
+            address.push(a.clone());
+            balance.push(e.balance.to_string());
+            nonce.push(e.nonce as i64);
+        }
+        sqlx::query(
+            "INSERT INTO account_state (chain_id, address, height, balance, nonce)
+             SELECT $1, u.address, $2, u.balance::NUMERIC, u.nonce
+             FROM UNNEST($3::TEXT[], $4::TEXT[], $5::BIGINT[]) AS u(address, balance, nonce)
+             ON CONFLICT DO NOTHING",
+        )
+        .bind(chain_id)
+        .bind(height)
+        .bind(&address[..])
+        .bind(&balance[..])
+        .bind(&nonce[..])
+        .execute(&mut **tx)
+        .await?;
+    }
+
+    if !effects.asset_balances.is_empty() {
+        let asset: Vec<_> = effects
+            .asset_balances
+            .iter()
+            .map(|e| e.asset.clone())
+            .collect();
+        let holder: Vec<_> = effects
+            .asset_balances
+            .iter()
+            .map(|e| e.owner.clone())
+            .collect();
+        let balance: Vec<_> = effects
+            .asset_balances
+            .iter()
+            .map(|e| e.balance.to_string())
+            .collect();
+        sqlx::query(
+            "INSERT INTO asset_balances (chain_id, asset, holder, height, balance)
+             SELECT $1, u.asset, u.holder, $2, u.balance::NUMERIC
+             FROM UNNEST($3::TEXT[], $4::TEXT[], $5::TEXT[]) AS u(asset, holder, balance)
+             ON CONFLICT DO NOTHING",
+        )
+        .bind(chain_id)
+        .bind(height)
+        .bind(&asset[..])
+        .bind(&holder[..])
+        .bind(&balance[..])
+        .execute(&mut **tx)
+        .await?;
+    }
+
+    if !effects.holder_states.is_empty() {
+        let asset: Vec<_> = effects
+            .holder_states
+            .iter()
+            .map(|e| e.asset.clone())
+            .collect();
+        let holder: Vec<_> = effects
+            .holder_states
+            .iter()
+            .map(|e| e.holder.clone())
+            .collect();
+        let state: Vec<_> = effects
+            .holder_states
+            .iter()
+            .map(|e| e.state.clone())
+            .collect();
+        sqlx::query(
+            "INSERT INTO asset_holder_states (chain_id, asset, holder, height, state)
+             SELECT $1, u.asset, u.holder, $2, u.state
+             FROM UNNEST($3::TEXT[], $4::TEXT[], $5::JSONB[]) AS u(asset, holder, state)
+             ON CONFLICT DO NOTHING",
+        )
+        .bind(chain_id)
+        .bind(height)
+        .bind(&asset[..])
+        .bind(&holder[..])
+        .bind(&state[..])
+        .execute(&mut **tx)
+        .await?;
+    }
+
+    if !effects.stakes.is_empty() {
+        let master: Vec<_> = effects.stakes.iter().map(|e| e.master.clone()).collect();
+        let validator: Vec<_> = effects.stakes.iter().map(|e| e.validator.clone()).collect();
+        let allocation: Vec<Option<serde_json::Value>> = effects
+            .stakes
+            .iter()
+            .map(|e| e.allocation.clone())
+            .collect();
+        sqlx::query(
+            "INSERT INTO stakes (chain_id, master, validator, height, allocation)
+             SELECT $1, u.master, u.validator, $2, u.allocation
+             FROM UNNEST($3::TEXT[], $4::TEXT[], $5::JSONB[]) AS u(master, validator, allocation)
+             ON CONFLICT DO NOTHING",
+        )
+        .bind(chain_id)
+        .bind(height)
+        .bind(&master[..])
+        .bind(&validator[..])
+        .bind(&allocation[..])
+        .execute(&mut **tx)
+        .await?;
+    }
+
+    if !effects.validator_statuses.is_empty() {
+        let (mut address, mut status) = (Vec::new(), Vec::new());
+        for (a, s) in &effects.validator_statuses {
+            address.push(a.clone());
+            status.push(s.clone());
+        }
+        sqlx::query(
+            "INSERT INTO validator_status (chain_id, address, height, status)
+             SELECT $1, u.address, $2, u.status
+             FROM UNNEST($3::TEXT[], $4::JSONB[]) AS u(address, status)
+             ON CONFLICT DO NOTHING",
+        )
+        .bind(chain_id)
+        .bind(height)
+        .bind(&address[..])
+        .bind(&status[..])
+        .execute(&mut **tx)
+        .await?;
+    }
+
+    if let Some(set) = &effects.validator_set {
+        sqlx::query(
+            "INSERT INTO validator_sets (chain_id, height, validators)
+             VALUES ($1, $2, $3) ON CONFLICT DO NOTHING",
+        )
+        .bind(chain_id)
+        .bind(height)
+        .bind(set)
+        .execute(&mut **tx)
+        .await?;
+    }
+
+    if !effects.asset_registrations.is_empty() {
+        let index: Vec<i32> = (0..effects.asset_registrations.len() as i32).collect();
+        sqlx::query(
+            "INSERT INTO asset_registrations (chain_id, height, index_in_block, record)
+             SELECT $1, $2, u.index_in_block, u.record
+             FROM UNNEST($3::INT[], $4::JSONB[]) AS u(index_in_block, record)
+             ON CONFLICT DO NOTHING",
+        )
+        .bind(chain_id)
+        .bind(height)
+        .bind(&index[..])
+        .bind(&effects.asset_registrations[..])
+        .execute(&mut **tx)
+        .await?;
+    }
+
+    if !effects.dropped.is_empty() {
+        let signature: Vec<_> = effects
+            .dropped
+            .iter()
+            .map(|d| d.signature.clone())
+            .collect();
+        let reason: Vec<_> = effects.dropped.iter().map(|d| d.reason.clone()).collect();
+        sqlx::query(
+            "INSERT INTO dropped_actions (chain_id, block_height, signature, reason)
+             SELECT $1, $2, u.signature, u.reason
+             FROM UNNEST($3::TEXT[], $4::TEXT[]) AS u(signature, reason)
+             ON CONFLICT DO NOTHING",
+        )
+        .bind(chain_id)
+        .bind(height)
+        .bind(&signature[..])
+        .bind(&reason[..])
+        .execute(&mut **tx)
+        .await?;
+    }
 
     Ok(())
 }
@@ -1350,6 +1552,7 @@ mod tests {
             proposer: None,
             round: 0,
             actions,
+            effects: None,
         }
     }
 

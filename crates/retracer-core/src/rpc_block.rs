@@ -8,7 +8,7 @@
 use anyhow::Result;
 use ingestion::HasHeight;
 use serde::Deserialize;
-use storage::{IndexableAction, IndexableBlock};
+use storage::{BlockEffects, IndexableAction, IndexableBlock};
 
 #[derive(Debug, Deserialize)]
 pub struct RpcBlock {
@@ -20,6 +20,10 @@ pub struct RpcBlock {
     #[serde(default)]
     round: u32,
     actions: Vec<RpcAction>,
+    /// Not part of the block JSON — attached by the reader from
+    /// `GET /blocks/{height}/effects` (`HasHeight::set_effects`).
+    #[serde(skip)]
+    effects: Option<BlockEffects>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -32,6 +36,10 @@ pub struct RpcAction {
 impl HasHeight for RpcBlock {
     fn height(&self) -> u64 {
         self.height
+    }
+    fn set_effects(&mut self, effects: serde_json::Value) -> Result<()> {
+        self.effects = Some(serde_json::from_value(effects)?);
+        Ok(())
     }
 }
 
@@ -58,6 +66,9 @@ impl IndexableBlock for RpcBlock {
     }
     fn round(&self) -> u32 {
         self.round
+    }
+    fn effects(&self) -> Option<&BlockEffects> {
+        self.effects.as_ref()
     }
 }
 
@@ -94,6 +105,29 @@ mod tests {
         let action = &block.actions()[0];
         assert_eq!(action.identity().as_deref(), Some("sig"));
         assert_eq!(action.payload_json().unwrap()["Transfer"]["amount"], 1);
+        // The node's effects answer decodes into the state rows; a u128
+        // balance survives, and unknown top-level fields are ignored.
+        let mut block = block;
+        block
+            .set_effects(serde_json::json!({
+                "height": 7,
+                "accounts": {"arx1s": {"balance": 340282366920938463463374607431768211455u128, "nonce": 2, "identity_hash": null}},
+                "asset_balances": [{"asset": "gold", "owner": "arx1t", "balance": 5}],
+                "holder_states": [], "stakes": [],
+                "validator_statuses": {"arx1v": {"Jailed": {"until_epoch": 3}}},
+                "validator_set": null, "asset_registrations": [],
+                "dropped": [{"signature": "bad", "reason": "nonce"}],
+                "future_field": 1
+            }))
+            .unwrap();
+        let effects = block.effects().unwrap();
+        assert_eq!(effects.accounts["arx1s"].balance, u128::MAX);
+        assert_eq!(effects.asset_balances[0].balance, 5);
+        assert_eq!(
+            effects.validator_statuses["arx1v"].as_ref().unwrap()["Jailed"]["until_epoch"],
+            3
+        );
+        assert_eq!(effects.dropped[0].reason, "nonce");
         // A node too old to send `payload_json` is a hard decode error.
         assert!(serde_json::from_str::<RpcBlock>(r#"{"height":0,"hash":"","parent_hash":"","timestamp":0,"proposer":null,"actions":[{"sender":"a","signature":null}]}"#).is_err());
     }

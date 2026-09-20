@@ -1,5 +1,6 @@
-//! Block ingestion over the node's HTTP RPC — `GET /status` for the tip and
-//! `GET /blocks?from=&to=` for the blocks — instead of the P2P wire.
+//! Block ingestion over the node's HTTP RPC — `GET /status` for the tip,
+//! `GET /blocks?from=&to=` for the blocks and `GET /blocks/{h}/effects` for
+//! what each one changed — instead of the P2P wire.
 //!
 //! The P2P path decodes the node's bincode wire, which carries no version
 //! tag: a Retracer built against a different node revision decodes garbage
@@ -55,18 +56,31 @@ struct Client {
 
 impl Client {
     async fn get<T: serde::de::DeserializeOwned>(&self, path: &str) -> Result<T> {
+        self.get_optional(path)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("GET {path}: 404"))
+    }
+
+    /// `None` on 404 — the one status that is an answer ("no such row")
+    /// rather than a failure to answer.
+    async fn get_optional<T: serde::de::DeserializeOwned>(&self, path: &str) -> Result<Option<T>> {
         let mut request = self.http.get(format!("{}{path}", self.base));
         if let Some(token) = &self.token {
             request = request.bearer_auth(token);
         }
-        request
+        let response = request
             .send()
             .await
-            .with_context(|| format!("GET {path}"))?
+            .with_context(|| format!("GET {path}"))?;
+        if response.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        response
             .error_for_status()
             .with_context(|| format!("GET {path}"))?
             .json()
             .await
+            .map(Some)
             .with_context(|| format!("GET {path}: decoding body"))
     }
 }
@@ -110,6 +124,7 @@ where
     };
     let mut next = config.resume_from.unwrap_or(0);
     let mut version_checked = false;
+    let mut missing_effects_warned = false;
     info!(node = %client.base, from = next, "ingesting over rpc");
 
     loop {
@@ -165,12 +180,40 @@ where
             !page.is_empty(),
             "node returned no blocks for {next}..={to}"
         );
-        for block in page {
+        for mut block in page {
             let height = block.height();
             anyhow::ensure!(
                 height == next,
                 "node returned height {height}, expected {next}"
             );
+            // ponytail: one request per block; a `/effects?from=&to=` page
+            // on the node if backfill is ever bound by this.
+            // 404 = the node has no effects row for this height (written
+            // before it kept them, or an older node) — the block still
+            // indexes, its state tables just stay empty at this height.
+            let effects = loop {
+                match client
+                    .get_optional::<serde_json::Value>(&format!("/blocks/{height}/effects"))
+                    .await
+                {
+                    Ok(effects) => break effects,
+                    Err(err) => {
+                        warn!(height, "block effects unavailable: {err:#}");
+                        tokio::time::sleep(ERROR_BACKOFF).await;
+                    }
+                }
+            };
+            match effects {
+                Some(effects) => block.set_effects(effects)?,
+                None if !missing_effects_warned => {
+                    warn!(
+                        height,
+                        "node has no effects for this block; state tables will be incomplete until a resync"
+                    );
+                    missing_effects_warned = true;
+                }
+                None => {}
+            }
             if block_tx.send(block).await.is_err() {
                 return Ok(()); // indexer gone; shutting down
             }
@@ -187,10 +230,16 @@ mod tests {
     #[derive(serde::Deserialize)]
     struct TestBlock {
         height: u64,
+        #[serde(skip)]
+        effects: Option<serde_json::Value>,
     }
     impl HasHeight for TestBlock {
         fn height(&self) -> u64 {
             self.height
+        }
+        fn set_effects(&mut self, effects: serde_json::Value) -> Result<()> {
+            self.effects = Some(effects);
+            Ok(())
         }
     }
 
@@ -211,6 +260,18 @@ mod tests {
                 log.lock().unwrap().push(path.clone());
                 let body = if path == "/status" {
                     format!(r#"{{"version":"0.2.0","tip_height":{tip},"finalized_height":null}}"#)
+                } else if let Some(h) = path
+                    .strip_prefix("/blocks/")
+                    .and_then(|p| p.strip_suffix("/effects"))
+                {
+                    // Even heights have an effects row, odd ones predate it.
+                    if h.parse::<u64>().unwrap() % 2 == 1 {
+                        sock.write_all(b"HTTP/1.1 404 Not Found\r\ncontent-length: 0\r\nconnection: close\r\n\r\n")
+                            .await
+                            .unwrap();
+                        continue;
+                    }
+                    format!(r#"{{"height":{h},"dropped":[]}}"#)
                 } else {
                     let q: std::collections::HashMap<_, _> = path
                         .split_once('?')
@@ -250,12 +311,25 @@ mod tests {
             network_tx,
         ));
 
-        // 10..=149, in order, across two pages (10..=109, 110..=149).
+        // 10..=149, in order, across two pages (10..=109, 110..=149); each
+        // block carries the effects the node had for it.
         let mut got = Vec::new();
         while got.len() < 140 {
-            got.push(block_rx.recv().await.unwrap().height);
+            let block = block_rx.recv().await.unwrap();
+            assert_eq!(
+                block.effects.map(|e| e["height"].as_u64().unwrap()),
+                (block.height % 2 == 0).then_some(block.height),
+                "effects attached iff the node had them (height {})",
+                block.height
+            );
+            got.push(block.height);
         }
         assert_eq!(got, (10..=149).collect::<Vec<_>>());
+        assert!(
+            seen.lock()
+                .unwrap()
+                .contains(&"/blocks/10/effects".to_string())
+        );
         assert_eq!(network_rx.borrow().tip_height, Some(149));
         assert!(network_rx.borrow().has_fresh_status());
         assert!(

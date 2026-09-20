@@ -59,6 +59,7 @@ fn block(height: u64, parent: &str, actions: Vec<TestAction>) -> TestBlock {
         proposer: Some(addr(9)),
         round: 0,
         actions,
+        effects: None,
     }
 }
 
@@ -494,6 +495,7 @@ async fn list_proposed_heights_respects_bounds_and_skips_null_proposers() {
             proposer: proposer.map(addr),
             round,
             actions: vec![],
+            effects: None,
         }
     };
 
@@ -558,6 +560,7 @@ async fn insert_block_persists_round() {
         proposer: Some(addr(1)),
         round: 2,
         actions: vec![],
+        effects: None,
     };
     storage::insert_block(&pool, &chain, &block, &extractor)
         .await
@@ -793,4 +796,80 @@ async fn by_hash_lookups_ignore_case_and_prefix_but_leave_non_hex_identities_alo
             .is_none(),
         "a positional identity is not a hash and must not gain a 0x prefix"
     );
+}
+
+/// The state tables (`0003_state.sql`): every effects list lands in its table
+/// with a u128 balance intact, `total_accounts` counts state rows rather than
+/// addresses seen in actions, redelivery is a no-op, and a rollback removes
+/// the state rows above the height along with the history rows.
+#[tokio::test]
+async fn effects_write_state_tables_and_roll_back_with_the_block() {
+    let pool = skip_without_db!();
+    let chain = chain_id("effects");
+    let extractor = AddressExtractor::tier_a_only(KindSchema::empty());
+
+    let effects = |height: u64| -> storage::BlockEffects {
+        serde_json::from_value(serde_json::json!({
+            "accounts": {
+                addr(1): {"balance": u128::MAX, "nonce": height},
+                addr(2): {"balance": 400, "nonce": 0},
+            },
+            "asset_balances": [{"asset": "gold", "owner": addr(2), "balance": 5}],
+            "holder_states": [{"asset": "gold", "holder": addr(2), "state": {"frozen": false}}],
+            "stakes": [{"master": addr(1), "validator": addr(9), "allocation": null}],
+            "validator_statuses": {addr(9): "Active"},
+            "validator_set": {addr(9): 10000},
+            "asset_registrations": [{"id": "gold"}],
+            "dropped": [{"signature": format!("bad-{height}"), "reason": "nonce"}],
+        }))
+        .expect("effects decode")
+    };
+
+    let mut parent = "0x0".to_string();
+    for height in 0..3u64 {
+        let mut b = block(height, &parent, vec![]);
+        b.effects = Some(effects(height));
+        parent = b.hash();
+        storage::insert_block(&pool, &chain, &b, &extractor)
+            .await
+            .expect("insert");
+        // Redelivery: same rows, no conflict error, no duplicates.
+        storage::insert_block(&pool, &chain, &b, &extractor)
+            .await
+            .expect("redeliver");
+    }
+
+    for (table, rows) in [
+        ("account_state", 6),
+        ("asset_balances", 3),
+        ("asset_holder_states", 3),
+        ("stakes", 3),
+        ("validator_status", 3),
+        ("validator_sets", 3),
+        ("asset_registrations", 3),
+        ("dropped_actions", 3),
+    ] {
+        assert_eq!(count(&pool, table, &chain).await, rows, "{table}");
+    }
+    let balance: String = sqlx::query_scalar(
+        "SELECT balance::TEXT FROM account_state WHERE chain_id = $1 AND address = $2 AND height = 2",
+    )
+    .bind(&chain)
+    .bind(addr(1))
+    .fetch_one(&pool)
+    .await
+    .expect("balance");
+    assert_eq!(balance, u128::MAX.to_string(), "u128 survives NUMERIC");
+    assert_eq!(
+        storage::get_stats(&pool, &chain).await.expect("stats").total_accounts,
+        2,
+        "two distinct accounts in state, no actions at all"
+    );
+
+    storage::rollback_to(&pool, &chain, 0)
+        .await
+        .expect("rollback");
+    assert_eq!(count(&pool, "account_state", &chain).await, 2);
+    assert_eq!(count(&pool, "dropped_actions", &chain).await, 1);
+    assert_eq!(count(&pool, "validator_sets", &chain).await, 1);
 }

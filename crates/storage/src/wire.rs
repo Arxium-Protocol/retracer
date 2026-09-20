@@ -39,6 +39,74 @@ pub trait IndexableBlock {
     fn round(&self) -> u32 {
         0
     }
+
+    /// What this block changed, if the node told us. `None` for a chain whose
+    /// node has no effects endpoint, or a block written before the node kept
+    /// them — the state tables then just have no rows at this height.
+    fn effects(&self) -> Option<&BlockEffects> {
+        None
+    }
+}
+
+/// The node's `GET /blocks/{height}/effects` answer (`xc_storage::BlockEffects`
+/// on the Arxium side), read as plain JSON. The row shapes here are what the
+/// state tables store; anything else in the answer is ignored, so the node
+/// can grow the record without breaking this reader.
+///
+/// Balances are `u128` on the node; deserialized as text (serde_json's
+/// `arbitrary_precision` keeps the digits) and bound as `NUMERIC` — no
+/// decimal crate in the loop.
+#[derive(Clone, Debug, Default, serde::Deserialize)]
+pub struct BlockEffects {
+    #[serde(default)]
+    pub accounts: std::collections::BTreeMap<String, AccountEffect>,
+    #[serde(default)]
+    pub asset_balances: Vec<AssetBalanceEffect>,
+    #[serde(default)]
+    pub holder_states: Vec<HolderStateEffect>,
+    #[serde(default)]
+    pub stakes: Vec<StakeEffect>,
+    #[serde(default)]
+    pub validator_statuses: std::collections::BTreeMap<String, Option<serde_json::Value>>,
+    #[serde(default)]
+    pub validator_set: Option<serde_json::Value>,
+    #[serde(default)]
+    pub asset_registrations: Vec<serde_json::Value>,
+    #[serde(default)]
+    pub dropped: Vec<DroppedEffect>,
+}
+
+#[derive(Clone, Debug, serde::Deserialize)]
+pub struct AccountEffect {
+    pub balance: u128,
+    pub nonce: u64,
+}
+
+#[derive(Clone, Debug, serde::Deserialize)]
+pub struct AssetBalanceEffect {
+    pub asset: String,
+    pub owner: String,
+    pub balance: u128,
+}
+
+#[derive(Clone, Debug, serde::Deserialize)]
+pub struct HolderStateEffect {
+    pub asset: String,
+    pub holder: String,
+    pub state: serde_json::Value,
+}
+
+#[derive(Clone, Debug, serde::Deserialize)]
+pub struct StakeEffect {
+    pub master: String,
+    pub validator: String,
+    pub allocation: Option<serde_json::Value>,
+}
+
+#[derive(Clone, Debug, serde::Deserialize)]
+pub struct DroppedEffect {
+    pub signature: String,
+    pub reason: String,
 }
 
 pub trait IndexableAction {
@@ -83,6 +151,7 @@ pub mod testing {
         pub proposer: Option<String>,
         pub round: u32,
         pub actions: Vec<TestAction>,
+        pub effects: Option<super::BlockEffects>,
     }
 
     #[derive(Clone, Debug)]
@@ -133,6 +202,9 @@ pub mod testing {
         }
         fn round(&self) -> u32 {
             self.round
+        }
+        fn effects(&self) -> Option<&super::BlockEffects> {
+            self.effects.as_ref()
         }
     }
 

@@ -15,6 +15,14 @@ pub mod rpc;
 /// `ingestion` doesn't take a dependency on `storage`.
 pub trait HasHeight {
     fn height(&self) -> u64;
+
+    /// Hands the block the node's `GET /blocks/{height}/effects` answer,
+    /// once the reader has fetched it. Default ignores it, for a block type
+    /// that doesn't index state. An `Err` is a shape mismatch — the reader
+    /// stops rather than index a block with half its state.
+    fn set_effects(&mut self, _effects: serde_json::Value) -> anyhow::Result<()> {
+        Ok(())
+    }
 }
 
 /// A `/status` answer from the node is considered current for this long.
