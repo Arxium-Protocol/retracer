@@ -80,6 +80,10 @@ pub struct BlockEffects {
 pub struct AccountEffect {
     pub balance: u128,
     pub nonce: u64,
+    /// Everything else on the node's `AccountEntry` (identity, attestation,
+    /// claims…), kept verbatim — see `migrations/0005_account_entry.sql`.
+    #[serde(flatten)]
+    pub entry: serde_json::Map<String, serde_json::Value>,
 }
 
 #[derive(Clone, Debug, serde::Deserialize)]

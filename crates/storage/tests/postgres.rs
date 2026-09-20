@@ -893,7 +893,7 @@ async fn state_reads_resolve_as_of_height() {
     let heights = [
         // h0: alice funded, holds gold, stakes with v9, v9 active + in set.
         effects(serde_json::json!({
-            "accounts": {addr(1): {"balance": 1000, "nonce": 0}},
+            "accounts": {addr(1): {"balance": 1000, "nonce": 0, "identity_hash": "h", "claims": ["kyc"]}},
             "asset_balances": [{"asset": "gold", "owner": addr(1), "balance": 5},
                                {"asset": "gold", "owner": addr(2), "balance": 7}],
             "stakes": [{"master": addr(1), "validator": addr(9), "allocation": {"amount": 100}}],
@@ -938,6 +938,14 @@ async fn state_reads_resolve_as_of_height() {
         .expect("query")
         .expect("alice at 0");
     assert_eq!((alice0.balance.as_str(), alice0.stakes.len()), ("1000", 1));
+    assert_eq!(
+        alice0.entry["claims"][0], "kyc",
+        "identity fields ride along"
+    );
+    assert!(
+        alice0.entry.get("balance").is_none(),
+        "typed fields aren't duplicated"
+    );
     assert!(
         storage::get_account_state(&pool, &chain, &addr(2), 0)
             .await

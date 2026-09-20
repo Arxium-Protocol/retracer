@@ -984,16 +984,18 @@ async fn insert_effects_in_tx(
     effects: &BlockEffects,
 ) -> Result<()> {
     if !effects.accounts.is_empty() {
-        let (mut address, mut balance, mut nonce) = (Vec::new(), Vec::new(), Vec::new());
+        let (mut address, mut balance, mut nonce, mut entry) =
+            (Vec::new(), Vec::new(), Vec::new(), Vec::new());
         for (a, e) in &effects.accounts {
             address.push(a.clone());
             balance.push(e.balance.to_string());
             nonce.push(e.nonce as i64);
+            entry.push(serde_json::Value::Object(e.entry.clone()));
         }
         sqlx::query(
-            "INSERT INTO account_state (chain_id, address, height, balance, nonce)
-             SELECT $1, u.address, $2, u.balance::NUMERIC, u.nonce
-             FROM UNNEST($3::TEXT[], $4::TEXT[], $5::BIGINT[]) AS u(address, balance, nonce)
+            "INSERT INTO account_state (chain_id, address, height, balance, nonce, entry)
+             SELECT $1, u.address, $2, u.balance::NUMERIC, u.nonce, u.entry
+             FROM UNNEST($3::TEXT[], $4::TEXT[], $5::BIGINT[], $6::JSONB[]) AS u(address, balance, nonce, entry)
              ON CONFLICT DO NOTHING",
         )
         .bind(chain_id)
@@ -1001,6 +1003,7 @@ async fn insert_effects_in_tx(
         .bind(&address[..])
         .bind(&balance[..])
         .bind(&nonce[..])
+        .bind(&entry[..])
         .execute(&mut **tx)
         .await?;
     }
@@ -1436,16 +1439,17 @@ pub async fn get_account_state(
     address: &str,
     at: i64,
 ) -> Result<Option<AccountState>> {
-    let Some((height, balance, nonce)) = sqlx::query_as::<_, (i64, String, i64)>(
-        "SELECT height, balance::TEXT, nonce FROM account_state
-         WHERE chain_id = $1 AND address = $2 AND height <= $3
-         ORDER BY height DESC LIMIT 1",
-    )
-    .bind(chain_id)
-    .bind(address)
-    .bind(at)
-    .fetch_optional(pool)
-    .await?
+    let Some((height, balance, nonce, entry)) =
+        sqlx::query_as::<_, (i64, String, i64, serde_json::Value)>(
+            "SELECT height, balance::TEXT, nonce, entry FROM account_state
+             WHERE chain_id = $1 AND address = $2 AND height <= $3
+             ORDER BY height DESC LIMIT 1",
+        )
+        .bind(chain_id)
+        .bind(address)
+        .bind(at)
+        .fetch_optional(pool)
+        .await?
     else {
         return Ok(None);
     };
@@ -1495,6 +1499,7 @@ pub async fn get_account_state(
         height,
         balance,
         nonce,
+        entry,
         assets,
         stakes,
     }))
@@ -1509,6 +1514,11 @@ pub struct AccountState {
     /// Decimal string: the chain's u128 doesn't fit JSON numbers.
     pub balance: String,
     pub nonce: i64,
+    /// The rest of the node's `AccountEntry` (`identity_hash`,
+    /// `zk_identity_verified`, `attested_by`, `claims`, `jurisdiction`…),
+    /// verbatim. `{}` for rows indexed before migration 0005.
+    #[schema(value_type = Object)]
+    pub entry: serde_json::Value,
     pub assets: Vec<AssetHolding>,
     pub stakes: Vec<StakeRow>,
 }
