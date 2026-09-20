@@ -706,6 +706,39 @@ async fn kind_field_filter_and_reindex() {
         .expect("received");
     assert_eq!(received.len(), 2);
 
+    // First seen spans both tables. addr(7) only ever receives (h1, an
+    // action_addresses row). addr(8) is paid at h2 and first sends at h3,
+    // so the recipient minimum has to win over the sender minimum. addr(3)
+    // is nowhere.
+    let b2 = block(
+        2,
+        &b1.hash(),
+        vec![action(2, Some("s4"), TestPayload::Transfer { to: addr(8), amount: 1 })],
+    );
+    let b3 = block(
+        3,
+        &b2.hash(),
+        vec![action(8, Some("s5"), TestPayload::Transfer { to: addr(2), amount: 1 })],
+    );
+    for b in [&b2, &b3] {
+        storage::insert_block(&pool, &chain, b, &extractor)
+            .await
+            .expect("insert");
+    }
+    let first = |a: String| {
+        let pool = pool.clone();
+        let chain = chain.clone();
+        async move {
+            storage::get_account_first_seen(&pool, &chain, &a)
+                .await
+                .expect("first seen")
+                .map(|f| (f.height, f.timestamp))
+        }
+    };
+    assert_eq!(first(to.clone()).await, Some((1, 1_700_000_001)));
+    assert_eq!(first(addr(8)).await, Some((2, 1_700_000_002)));
+    assert_eq!(first(addr(3)).await, None);
+
     sqlx::query(&format!("DROP INDEX IF EXISTS {}", projection.index_name()))
         .execute(&pool)
         .await

@@ -199,7 +199,8 @@ impl AppState {
     ),
     paths(
         list_chains, get_status, get_stats, list_blocks, get_block, list_actions, get_action,
-        get_account_actions, list_proposers, get_validator_uptime, search, health, readiness, metrics,
+        get_account_actions, get_account_first_seen, list_proposers, get_validator_uptime, search,
+        health, readiness, metrics,
         sse::stream_blocks, sse::stream_actions,
         get_account, get_asset_holders, get_validator, list_dropped_actions,
     ),
@@ -251,6 +252,10 @@ pub fn router(pool: PgPool, chains: Vec<RestChain>, min_node_version: &'static s
             get(get_account_actions),
         )
         .route("/v1/chains/{chain_id}/accounts/{address}", get(get_account))
+        .route(
+            "/v1/chains/{chain_id}/accounts/{address}/first-seen",
+            get(get_account_first_seen),
+        )
         .route(
             "/v1/chains/{chain_id}/assets/{asset}/holders",
             get(get_asset_holders),
@@ -947,6 +952,18 @@ async fn get_account_actions(
         )
         .await?,
     ))
+}
+
+#[utoipa::path(get, path = "/v1/chains/{chain_id}/accounts/{address}/first-seen", tag = "accounts", params(("chain_id" = String, Path), ("address" = String, Path)), responses((status = 200, description = "The first block this address appears in, as sender or in any indexed role", body = storage::FirstSeen), (status = 400, body = ErrorBody), (status = 404, description = "Unknown chain, or no indexed action mentions this address", body = ErrorBody)))]
+async fn get_account_first_seen(
+    State(state): State<AppState>,
+    Path((chain_id, address)): Path<(String, String)>,
+) -> ApiResult<storage::FirstSeen> {
+    check_address(state.chain(&chain_id)?, &address)?;
+    storage::get_account_first_seen(&state.pool, &chain_id, &address)
+        .await?
+        .map(Json)
+        .ok_or_else(|| ApiError::NotFound("no actions for this address".into()))
 }
 
 // ---------------------------------------------------------------- state

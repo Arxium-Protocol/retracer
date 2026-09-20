@@ -1410,6 +1410,44 @@ pub async fn get_account_actions(
     }
 }
 
+/// The first block in which `address` appears in any role — as sender
+/// (`account_actions`) or as an extracted non-sender role
+/// (`action_addresses`); the two tables are disjoint by construction, so
+/// the answer is the smaller of their minimums. `None` for an address with
+/// no indexed action.
+///
+/// Computed, not stored, for the same reason `list_proposers` derives
+/// `first_proposed_height` with `MIN(height)`: both tables carry a
+/// `(chain_id, address, …, block_height DESC)` index, so the minimum is an
+/// index probe, and a stored column would need a backfill and a reorg
+/// rollback path that this query gets for free.
+pub async fn get_account_first_seen(
+    pool: &PgPool,
+    chain_id: &str,
+    address: &str,
+) -> Result<Option<FirstSeen>> {
+    let row: Option<(i64, i64)> = sqlx::query_as(
+        "SELECT b.height, b.timestamp FROM blocks b
+         WHERE b.chain_id = $1 AND b.height = LEAST(
+             (SELECT MIN(block_height) FROM account_actions
+              WHERE chain_id = $1 AND address = $2),
+             (SELECT MIN(block_height) FROM action_addresses
+              WHERE chain_id = $1 AND address = $2))",
+    )
+    .bind(chain_id)
+    .bind(address)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.map(|(height, timestamp)| FirstSeen { height, timestamp }))
+}
+
+#[derive(Debug, Clone, serde::Serialize, utoipa::ToSchema)]
+pub struct FirstSeen {
+    pub height: i64,
+    /// The block's timestamp, seconds since the Unix epoch.
+    pub timestamp: i64,
+}
+
 /// Blocks for `chain_id` in `[from, to]`, ascending — used to replay
 /// persisted history to a resuming `SubscribeBlocks` client before handing
 /// it off to the live broadcast. No dedicated range query: this chain's
