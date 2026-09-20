@@ -22,21 +22,29 @@ run one for you.
 
 ### From a release (no Rust toolchain, no Docker)
 
-```bash
-curl -fsSL https://raw.githubusercontent.com/Arxium-Protocol/retracer/main/scripts/install.sh | bash
-```
-
-Downloads the latest `retracerd` release (checksum-verified), prompts for
-your node RPC URL/database URL/auth token, and offers to install it as a
-systemd service. Read it before piping to `bash` if you'd rather:
+Five commands from nothing to a first query, on x86_64 Linux with systemd.
+You need a Postgres you can reach and an Arxium node RPC URL (node v0.7.0 or
+newer, see [Compatibility](#compatibility-and-versioning)).
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/Arxium-Protocol/retracer/main/scripts/install.sh -o install.sh && less install.sh && bash install.sh
+curl -fsSL https://raw.githubusercontent.com/Arxium-Protocol/retracer/main/scripts/install.sh | bash   # 1. prompts for node RPC URL, database URL, auth token; installs the retracerd service
+systemctl status retracerd                                        # 2. running? logs: journalctl -u retracerd -f
+curl -s localhost:8080/ready                                      # 3. 200 once Postgres answers
+curl -s localhost:8080/v1/chains                                  # 4. the chain id you'll use in every path
+curl -s localhost:8080/v1/chains/corechain-devnet/status          # 5. indexed_height vs node_tip_height
 ```
 
-Non-interactive install with defaults: `install.sh --yes`. See
-`install.sh --help` for `--version`/`--base-path`/`--dry-run`.
+Then read on for the [HTTP API](#http-api), or open `http://localhost:8080/docs`.
 
+Prefer to read the installer before running it, or need `--version`/
+`--base-path`/`--dry-run`/`--yes`:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Arxium-Protocol/retracer/main/scripts/install.sh -o install.sh && less install.sh && bash install.sh --help
+```
+
+The installer verifies the release checksum and writes
+`~/.retracer/configs/retracerd.env`; edit it and `systemctl restart retracerd`.
 Releases only ship `x86_64-linux-gnu` binaries today — everywhere else, build
 from source below.
 
@@ -128,6 +136,46 @@ defaults off.
 
 ---
 
+## Compatibility and versioning
+
+**`/v1/` is additive.** Within `/v1/`, routes, query parameters and response
+fields are only ever added. Nothing is removed or renamed, an existing field
+never changes type or meaning, and pagination cursors keep working across
+upgrades. Clients must ignore fields they don't know. A change that can't be
+made that way ships as `/v2/` next to `/v1/`, and `/v1/` keeps answering for
+at least two further minor releases after `/v2/` appears. While `retracerd`
+is 0.x this promise has one exception: a minor release may still break `/v1/`,
+and when it does the release notes say **Breaking** and the OpenAPI document
+changes — diff `GET /openapi.json` between versions to see exactly what.
+`/health`, `/ready` and `/metrics` are operational, not part of the promise.
+
+**Node versions.** Retracer reads a node's public RPC and is pinned to the
+shape of its block and effects JSON, not to a release number. A build refuses
+at startup any node whose `/status.version` (the `xc-rpc` crate) is below its
+floor, printed by `retracerd --version` and reported per chain as
+`min_node_version` in `GET /v1/chains`. Today:
+
+| Retracer | Node RPC floor (`xc-rpc`) | Node release |
+| --- | --- | --- |
+| v0.4.x | 0.2.0 | Arxium v0.7.0 and newer |
+
+Newer nodes keep working until they change the wire shape, at which point a
+Retracer release raises the floor and this table gains a row. State (accounts,
+holders, validators, dropped actions) needs the node's `GET /blocks/{h}/effects`,
+which v0.7.0 serves; blocks indexed from an older node have no state rows.
+
+**Schema reference.** The OpenAPI 3.1 document at `GET /openapi.json`
+(browsable at `GET /docs`) is the contract: every route, parameter and
+response type, generated from the handlers at compile time. Storage tables are
+plain SQL under [`migrations/`](migrations/) — `blocks`, `actions`,
+`account_actions` and `action_addresses` for history; `account_state`,
+`asset_balances`, `asset_holder_states`, `stakes`, `validator_status`,
+`validator_sets`, `asset_registrations` and `dropped_actions` for state by
+height. The schema is Retracer's own and may change between releases; query
+the API, not the database.
+
+---
+
 ## HTTP API
 
 Every path is scoped to a chain. `GET /v1/chains` lists the ones this deployment
@@ -209,10 +257,19 @@ block holds many actions, so half a cursor would silently repeat or skip the
 rest of one.
 
 ```bash
-curl "localhost:8080/v1/chains/corechain-devnet/blocks?limit=5"
-curl "localhost:8080/v1/chains/corechain-devnet/accounts/<address>/actions?role=to"
-curl "localhost:8080/v1/chains/corechain-devnet/search?q=42"
-curl "localhost:8080/v1/chains/corechain-devnet/actions?kind=TransferAsset&field=\$.asset&value=arxasset1..."
+C=localhost:8080/v1/chains/corechain-devnet
+curl "$C/blocks?limit=5"                                          # newest five blocks
+curl "$C/blocks/1042"                                             # by height, or by hash
+curl "$C/actions?limit=20&before_height=1042&before_index=0"      # next page of actions
+curl "$C/actions/<action_hash>"
+curl "$C/accounts/<address>/actions?role=to"                      # history where the address received
+curl "$C/accounts/<address>"                                      # balance, nonce, holdings, stakes at tip
+curl "$C/accounts/<address>?at=1000"                              # the same as of block 1000
+curl "$C/assets/<asset>/holders?limit=100"                        # cap table, keyset-paged with after=
+curl "$C/validators/<address>"                                    # status, voting power, history
+curl "$C/actions/dropped?sender=<address>"                        # producer-rejected, with reason
+curl "$C/search?q=42"                                             # height, hash, address or action hash
+curl "$C/actions?kind=TransferAsset&field=\$.asset&value=arxasset1..."
 ```
 
 ---
