@@ -388,11 +388,6 @@ For roles a dotted path can't express (conditional or computed), implement
 
 ## Using it for your own chain
 
-A complete worked example lives in
-[`examples/spoke-indexer/`](examples/spoke-indexer/) — copy that directory as
-your starting point. It's a workspace member, so it's compiled and tested on
-every build and can't silently rot.
-
 If your chain is built on the Arxium stack, you need a binary, not a fork —
 supply your payload type and your address format:
 
@@ -502,7 +497,6 @@ Layout:
 | `rest-service` | axum HTTP server, paged reads + SSE tails |
 | `retracer-core` | Run loop, wiring, CLI parsing |
 | `retracerd` | The binary |
-| `examples/spoke-indexer` | Worked integration example (workspace member) |
 
 Only `retracer-core` depends on the others; the service crates never depend
 on each other.
@@ -521,4 +515,3 @@ bytes — so a schema change is always a new numbered file under `migrations/`.
 | | |
 | --- | --- |
 | `cargo doc --workspace --open` | Rustdoc for every crate: internals, boundary rules, module docs |
-| [`examples/spoke-indexer/README.md`](examples/spoke-indexer/README.md) | Worked multi-chain example |

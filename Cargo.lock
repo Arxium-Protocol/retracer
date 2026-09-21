@@ -1644,19 +1644,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "spoke-indexer"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "ingestion",
- "retracer-core",
- "serde_json",
- "storage",
- "tokio",
- "tracing-subscriber",
-]
-
-[[package]]
 name = "sqlx"
 version = "0.8.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
