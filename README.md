@@ -210,7 +210,7 @@ GET  /v1/chains/{chain}/search?q=
 GET  /v1/chains/{chain}/validators/uptime?from=&to=
 
 GET  /v1/chains/{chain}/accounts/{address}?at=
-GET  /v1/chains/{chain}/assets/{asset}/holders?at=&after=&limit=
+GET  /v1/chains/{chain}/assets/{asset}/holders?at=&jurisdiction=&after=&limit=
 GET  /v1/chains/{chain}/validators/{address}
 GET  /v1/chains/{chain}/attestors?at=
 GET  /v1/chains/{chain}/actions/dropped?sender=&before_height=&before_signature=&limit=
@@ -219,7 +219,7 @@ GET  /v1/chains/{chain}/actions/dropped?sender=&before_height=&before_signature=
 The last five are **state**, kept by height from the node's
 `GET /blocks/{h}/effects` (what each block changed): an account's balance,
 nonce and identity fields plus its non-zero asset holdings and live stakes;
-an asset's non-zero holders with their compliance state; a validator's
+an asset's non-zero holders with balance, compliance state and jurisdiction; a validator's
 status, voting power, status history, authorized operator, BLS key and
 equivocation slashes; the registered attestors; and the actions a producer
 rejected, with the reason. `at=` answers "as of block H" (default: tip).

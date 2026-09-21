@@ -980,7 +980,7 @@ async fn state_reads_resolve_as_of_height() {
     let heights = [
         // h0: alice funded, holds gold, stakes with v9, v9 active + in set.
         effects(serde_json::json!({
-            "accounts": {addr(1): {"balance": 1000, "nonce": 0, "identity_hash": "h", "claims": ["kyc"]}},
+            "accounts": {addr(1): {"balance": 1000, "nonce": 0, "identity_hash": "h", "claims": ["kyc"], "jurisdiction": "CH"}},
             "asset_balances": [{"asset": "gold", "owner": addr(1), "balance": 5},
                                {"asset": "gold", "owner": addr(2), "balance": 7}],
             "stakes": [{"master": addr(1), "validator": addr(9), "allocation": {"amount": 100}}],
@@ -990,7 +990,8 @@ async fn state_reads_resolve_as_of_height() {
         })),
         // h1: alice spends, bob's gold goes to 0, alice unstakes, v9 jailed.
         effects(serde_json::json!({
-            "accounts": {addr(1): {"balance": 900, "nonce": 1}, addr(2): {"balance": 50, "nonce": 0}},
+            // The node writes the whole entry each time, so h1 carries the jurisdiction too.
+            "accounts": {addr(1): {"balance": 900, "nonce": 1, "jurisdiction": "CH"}, addr(2): {"balance": 50, "nonce": 0}},
             "asset_balances": [{"asset": "gold", "owner": addr(2), "balance": 0}],
             "holder_states": [{"asset": "gold", "holder": addr(1), "state": {"frozen": true}}],
             "stakes": [{"master": addr(1), "validator": addr(9), "allocation": null}],
@@ -1042,22 +1043,43 @@ async fn state_reads_resolve_as_of_height() {
     );
 
     // Holders: bob at 0 disappears at tip, present at h0; alice carries state.
-    let tip = storage::get_asset_holders(&pool, &chain, "gold", i64::MAX, None, 10)
+    let tip = storage::get_asset_holders(&pool, &chain, "gold", i64::MAX, None, None, 10)
         .await
         .expect("holders");
     assert_eq!(tip.len(), 1);
     assert_eq!(tip[0].holder, addr(1));
     assert_eq!(tip[0].state.as_ref().unwrap()["frozen"], true);
-    let at0 = storage::get_asset_holders(&pool, &chain, "gold", 0, None, 10)
+    assert_eq!(
+        tip[0].jurisdiction.as_deref(),
+        Some("CH"),
+        "from the account row"
+    );
+    let at0 = storage::get_asset_holders(&pool, &chain, "gold", 0, None, None, 10)
         .await
         .expect("holders");
     assert_eq!(at0.len(), 2);
     assert!(at0[0].state.is_none());
-    let page2 = storage::get_asset_holders(&pool, &chain, "gold", 0, Some(&at0[0].holder), 10)
-        .await
-        .expect("holders page 2");
+    assert!(at0[1].jurisdiction.is_none(), "bob never declared one");
+    let page2 =
+        storage::get_asset_holders(&pool, &chain, "gold", 0, None, Some(&at0[0].holder), 10)
+            .await
+            .expect("holders page 2");
     assert_eq!(page2.len(), 1);
     assert_eq!(page2[0].holder, addr(2));
+    // Jurisdiction filter: only alice is CH; nobody is DE.
+    let ch = storage::get_asset_holders(&pool, &chain, "gold", 0, Some("CH"), None, 10)
+        .await
+        .expect("holders CH");
+    assert_eq!(
+        ch.iter().map(|h| h.holder.as_str()).collect::<Vec<_>>(),
+        vec![addr(1).as_str()]
+    );
+    assert!(
+        storage::get_asset_holders(&pool, &chain, "gold", 0, Some("DE"), None, 10)
+            .await
+            .expect("holders DE")
+            .is_empty()
+    );
 
     // Validator: newest status, power from the set, full history.
     let v = storage::get_validator(&pool, &chain, &addr(9))

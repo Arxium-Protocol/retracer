@@ -1680,41 +1680,60 @@ pub async fn get_asset_holders(
     chain_id: &str,
     asset: &str,
     at: i64,
+    jurisdiction: Option<&str>,
     after: Option<&str>,
     limit: i64,
 ) -> Result<Vec<HolderRow>> {
-    Ok(
-        sqlx::query_as::<_, (String, String, i64, Option<serde_json::Value>)>(
-            "SELECT h.holder, h.balance::TEXT, h.height, s.state
-             FROM (
-                 SELECT DISTINCT ON (holder) holder, balance, height FROM asset_balances
-                 WHERE chain_id = $1 AND asset = $2 AND height <= $3
-                 ORDER BY holder, height DESC
-             ) h
-             LEFT JOIN LATERAL (
-                 SELECT state FROM asset_holder_states
-                 WHERE chain_id = $1 AND asset = $2 AND holder = h.holder AND height <= $3
-                 ORDER BY height DESC LIMIT 1
-             ) s ON TRUE
-             WHERE h.balance > 0 AND h.holder > $4
-             ORDER BY h.holder LIMIT $5",
-        )
-        .bind(chain_id)
-        .bind(asset)
-        .bind(at)
-        .bind(after.unwrap_or(""))
-        .bind(limit)
-        .fetch_all(pool)
-        .await?
-        .into_iter()
-        .map(|(holder, balance, height, state)| HolderRow {
-            holder,
-            balance,
-            height,
-            state,
-        })
-        .collect(),
+    // Jurisdiction is an account field, not an asset one, so it comes from
+    // the holder's newest account row at or below `at` — the same "as of"
+    // rule as the balance, so a holder who moved jurisdiction after `at`
+    // still reports where they were.
+    Ok(sqlx::query_as::<
+        _,
+        (
+            String,
+            String,
+            i64,
+            Option<serde_json::Value>,
+            Option<String>,
+        ),
+    >(
+        "SELECT h.holder, h.balance::TEXT, h.height, s.state, a.jurisdiction
+         FROM (
+             SELECT DISTINCT ON (holder) holder, balance, height FROM asset_balances
+             WHERE chain_id = $1 AND asset = $2 AND height <= $3
+             ORDER BY holder, height DESC
+         ) h
+         LEFT JOIN LATERAL (
+             SELECT state FROM asset_holder_states
+             WHERE chain_id = $1 AND asset = $2 AND holder = h.holder AND height <= $3
+             ORDER BY height DESC LIMIT 1
+         ) s ON TRUE
+         LEFT JOIN LATERAL (
+             SELECT entry ->> 'jurisdiction' AS jurisdiction FROM account_state
+             WHERE chain_id = $1 AND address = h.holder AND height <= $3
+             ORDER BY height DESC LIMIT 1
+         ) a ON TRUE
+         WHERE h.balance > 0 AND h.holder > $4 AND ($6::TEXT IS NULL OR a.jurisdiction = $6)
+         ORDER BY h.holder LIMIT $5",
     )
+    .bind(chain_id)
+    .bind(asset)
+    .bind(at)
+    .bind(after.unwrap_or(""))
+    .bind(limit)
+    .bind(jurisdiction)
+    .fetch_all(pool)
+    .await?
+    .into_iter()
+    .map(|(holder, balance, height, state, jurisdiction)| HolderRow {
+        holder,
+        balance,
+        height,
+        state,
+        jurisdiction,
+    })
+    .collect())
 }
 
 #[derive(Debug, Clone, serde::Serialize, utoipa::ToSchema)]
@@ -1726,6 +1745,9 @@ pub struct HolderRow {
     /// one for this holder; `null` means default (nothing frozen).
     #[schema(value_type = Option<Object>)]
     pub state: Option<serde_json::Value>,
+    /// The holder's account `jurisdiction` (ISO country code) as of the same
+    /// height; `null` when the account never declared one.
+    pub jurisdiction: Option<String>,
 }
 
 /// A validator's current status, voting power in the newest epoch set that

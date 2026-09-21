@@ -1015,12 +1015,14 @@ async fn get_account(
 struct HolderPage {
     /// State as of this height; the tip when absent.
     at: Option<i64>,
+    /// Only holders whose account declares this jurisdiction (country code).
+    jurisdiction: Option<String>,
     limit: Option<i64>,
     /// The last `holder` of the previous page.
     after: Option<String>,
 }
 
-#[utoipa::path(get, path = "/v1/chains/{chain_id}/assets/{asset}/holders", tag = "accounts", params(("chain_id" = String, Path), ("asset" = String, Path, description = "The asset's `AssetRef`"), HolderPage), responses((status = 200, description = "Non-zero holders ascending by address, with compliance state where set", body = Vec<storage::HolderRow>), (status = 400, body = ErrorBody), (status = 404, body = ErrorBody)))]
+#[utoipa::path(get, path = "/v1/chains/{chain_id}/assets/{asset}/holders", tag = "accounts", params(("chain_id" = String, Path), ("asset" = String, Path, description = "The asset's `AssetRef`"), HolderPage), responses((status = 200, description = "Non-zero holders ascending by address, with balance, compliance state and jurisdiction as of `at`", body = Vec<storage::HolderRow>), (status = 400, body = ErrorBody), (status = 404, body = ErrorBody)))]
 async fn get_asset_holders(
     State(state): State<AppState>,
     Path((chain_id, asset)): Path<(String, String)>,
@@ -1035,6 +1037,7 @@ async fn get_asset_holders(
             &chain_id,
             &asset,
             at,
+            page.jurisdiction.as_deref(),
             page.after.as_deref(),
             limit,
         )
