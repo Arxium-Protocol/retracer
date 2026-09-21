@@ -201,7 +201,7 @@ fn validate_rate_limit_rps(rps: u32, source: &str) -> Result<()> {
 /// (`ingestion::rpc::MIN_NODE_VERSION`). Reported wherever the build
 /// identifies itself so an operator can tell at a glance whether their node
 /// is new enough.
-pub const MIN_NODE_VERSION: &str = "0.2.0";
+pub const MIN_NODE_VERSION: &str = "0.3.0";
 
 /// Must match `arxd/network::gossip::blocks_topic`: the node scopes gossip by
 /// its genesis-hash-derived chain ID. Still reported per chain (see
@@ -224,7 +224,7 @@ USAGE:
 
 OPTIONS:
     --node-rpc-url <url>           This chain's node HTTP RPC base URL; blocks are read
-                                   from it. Refuses a node reporting xc-rpc < 0.2.0.
+                                   from it. Refuses a node reporting xc-rpc < 0.3.0.
                                    [default: http://127.0.0.1:8081] [env: RETRACER_NODE_RPC_URL]
     --database-url <url>           Postgres connection string.
                                    [default: postgres://retracer:retracer@localhost:5433/retracer]

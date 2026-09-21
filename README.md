@@ -108,7 +108,7 @@ can also come from a `.env` file (copy `.env.example`) via
 | --- | --- | --- |
 | `--chain-id` | `corechain-devnet` | Label for this chain's rows. Not read off the wire |
 | `--database-url` | `postgres://retracer:retracer@localhost:5433/retracer` | Postgres connection string |
-| `--node-rpc-url` | `http://127.0.0.1:8081` | This chain's node HTTP RPC base URL. Blocks are read from it (`/status`, `/blocks`); refuses a node whose `/status` reports `xc-rpc` < 0.2.0 |
+| `--node-rpc-url` | `http://127.0.0.1:8081` | This chain's node HTTP RPC base URL. Blocks are read from it (`/status`, `/blocks`); refuses a node whose `/status` reports `xc-rpc` < 0.3.0 |
 | `--node-rpc-token` | none | Optional bearer token sent on every HTTP request to this chain's node RPC. Prefer `RETRACER_NODE_RPC_TOKEN` so the value is not visible in process arguments |
 | `--rest-port` | `8080` | HTTP API port |
 | `--kind-schema` | `kind_schema.toml` | Payload field configuration |
@@ -158,11 +158,13 @@ floor, printed by `retracerd --version` and reported per chain as
 | Retracer | Node RPC floor (`xc-rpc`) | Node release |
 | --- | --- | --- |
 | v0.4.x | 0.2.0 | Arxium v0.7.0 and newer |
+| v0.5.x | 0.3.0 | Arxium with `GET /effects?from=&to=` (next release) |
 
 Newer nodes keep working until they change the wire shape, at which point a
 Retracer release raises the floor and this table gains a row. State (accounts,
-holders, validators, dropped actions) needs the node's `GET /blocks/{h}/effects`,
-which v0.7.0 serves; blocks indexed from an older node have no state rows.
+holders, validators, dropped actions) is read one page at a time from the
+node's `GET /effects?from=&to=`, alongside the matching `/blocks` page; a
+height the node has no effects row for indexes with no state rows.
 
 **Schema reference.** The OpenAPI 3.1 document at `GET /openapi.json`
 (browsable at `GET /docs`) is the contract: every route, parameter and

@@ -19,10 +19,12 @@ use std::time::{Duration, Instant};
 use tokio::sync::mpsc::{Receiver, Sender};
 use tracing::{info, warn};
 
-/// Oldest node whose block JSON this reader understands: `hash` on the block
-/// and `payload_json` on each action arrived in `xc-rpc` 0.2.0. A node that
-/// reports no version at all predates the field and is refused the same way.
-pub const MIN_NODE_VERSION: (u64, u64, u64) = (0, 2, 0);
+/// Oldest node whose RPC this reader understands: `hash` on the block and
+/// `payload_json` on each action arrived in `xc-rpc` 0.2.0; the
+/// `/effects?from=&to=` page this reader backfills state from arrived in
+/// 0.3.0. A node that reports no version at all predates the field and is
+/// refused the same way.
+pub const MIN_NODE_VERSION: (u64, u64, u64) = (0, 3, 0);
 
 /// The node's `/blocks` page cap (`xc_storage::MAX_PAGE_SIZE`). Asking for
 /// more is not an error — the node truncates — but each page would then be
@@ -180,30 +182,34 @@ where
             !page.is_empty(),
             "node returned no blocks for {next}..={to}"
         );
+        // One effects page per block page, same window. A height the node
+        // has no effects row for (written before it kept them) is simply
+        // absent from the list — the block still indexes, its state tables
+        // just stay empty at that height.
+        let mut effects_by_height: std::collections::HashMap<u64, serde_json::Value> = loop {
+            match client
+                .get::<Vec<serde_json::Value>>(&format!("/effects?from={next}&to={to}"))
+                .await
+            {
+                Ok(page) => {
+                    break page
+                        .into_iter()
+                        .filter_map(|e| e["height"].as_u64().map(|h| (h, e)))
+                        .collect();
+                }
+                Err(err) => {
+                    warn!(from = next, to, "effects page unavailable: {err:#}");
+                    tokio::time::sleep(ERROR_BACKOFF).await;
+                }
+            }
+        };
         for mut block in page {
             let height = block.height();
             anyhow::ensure!(
                 height == next,
                 "node returned height {height}, expected {next}"
             );
-            // ponytail: one request per block; a `/effects?from=&to=` page
-            // on the node if backfill is ever bound by this.
-            // 404 = the node has no effects row for this height (written
-            // before it kept them, or an older node) — the block still
-            // indexes, its state tables just stay empty at this height.
-            let effects = loop {
-                match client
-                    .get_optional::<serde_json::Value>(&format!("/blocks/{height}/effects"))
-                    .await
-                {
-                    Ok(effects) => break effects,
-                    Err(err) => {
-                        warn!(height, "block effects unavailable: {err:#}");
-                        tokio::time::sleep(ERROR_BACKOFF).await;
-                    }
-                }
-            };
-            match effects {
+            match effects_by_height.remove(&height) {
                 Some(effects) => block.set_effects(effects)?,
                 None if !missing_effects_warned => {
                     warn!(
@@ -259,19 +265,7 @@ mod tests {
                 let path = req.split_whitespace().nth(1).unwrap_or("").to_string();
                 log.lock().unwrap().push(path.clone());
                 let body = if path == "/status" {
-                    format!(r#"{{"version":"0.2.0","tip_height":{tip},"finalized_height":null}}"#)
-                } else if let Some(h) = path
-                    .strip_prefix("/blocks/")
-                    .and_then(|p| p.strip_suffix("/effects"))
-                {
-                    // Even heights have an effects row, odd ones predate it.
-                    if h.parse::<u64>().unwrap() % 2 == 1 {
-                        sock.write_all(b"HTTP/1.1 404 Not Found\r\ncontent-length: 0\r\nconnection: close\r\n\r\n")
-                            .await
-                            .unwrap();
-                        continue;
-                    }
-                    format!(r#"{{"height":{h},"dropped":[]}}"#)
+                    format!(r#"{{"version":"0.3.0","tip_height":{tip},"finalized_height":null}}"#)
                 } else {
                     let q: std::collections::HashMap<_, _> = path
                         .split_once('?')
@@ -279,10 +273,18 @@ mod tests {
                         .unwrap_or_default();
                     let from: u64 = q["from"].parse().unwrap();
                     let to: u64 = q["to"].parse::<u64>().unwrap().min(tip);
-                    let blocks: Vec<String> = (from..=to)
-                        .map(|h| format!(r#"{{"height":{h}}}"#))
-                        .collect();
-                    format!("[{}]", blocks.join(","))
+                    let rows: Vec<String> = if path.starts_with("/effects") {
+                        // Even heights have an effects row, odd ones predate it.
+                        (from..=to)
+                            .filter(|h| h % 2 == 0)
+                            .map(|h| format!(r#"{{"height":{h},"dropped":[]}}"#))
+                            .collect()
+                    } else {
+                        (from..=to)
+                            .map(|h| format!(r#"{{"height":{h}}}"#))
+                            .collect()
+                    };
+                    format!("[{}]", rows.join(","))
                 };
                 let resp = format!(
                     "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
@@ -328,7 +330,16 @@ mod tests {
         assert!(
             seen.lock()
                 .unwrap()
-                .contains(&"/blocks/10/effects".to_string())
+                .contains(&"/effects?from=10&to=109".to_string()),
+            "effects come one page per block page, not one request per block"
+        );
+        assert!(
+            !seen
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|p| p.starts_with("/blocks/") && p.ends_with("/effects")),
+            "no per-block effects requests"
         );
         assert_eq!(network_rx.borrow().tip_height, Some(149));
         assert!(network_rx.borrow().has_fresh_status());
@@ -354,8 +365,12 @@ mod tests {
         };
         assert!(check_version(&status(None)).is_err());
         assert!(check_version(&status(Some("0.1.0"))).is_err());
+        assert!(
+            check_version(&status(Some("0.2.0"))).is_err(),
+            "pre-/effects node refused"
+        );
         assert!(check_version(&status(Some("garbage"))).is_err());
-        assert!(check_version(&status(Some("0.2.0"))).is_ok());
+        assert!(check_version(&status(Some("0.3.0"))).is_ok());
         assert!(check_version(&status(Some("v1.0.3"))).is_ok());
     }
 }
