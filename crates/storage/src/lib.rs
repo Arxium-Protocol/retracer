@@ -663,6 +663,10 @@ pub async fn rollback_to(pool: &PgPool, chain_id: &str, height: i64) -> Result<u
         "DELETE FROM validator_status WHERE chain_id = $1 AND height > $2",
         "DELETE FROM validator_sets WHERE chain_id = $1 AND height > $2",
         "DELETE FROM asset_registrations WHERE chain_id = $1 AND height > $2",
+        "DELETE FROM evidence WHERE chain_id = $1 AND height > $2",
+        "DELETE FROM bls_keys WHERE chain_id = $1 AND height > $2",
+        "DELETE FROM operators WHERE chain_id = $1 AND height > $2",
+        "DELETE FROM attestors WHERE chain_id = $1 AND height > $2",
     ] {
         sqlx::query(sql)
             .bind(chain_id)
@@ -1137,6 +1141,97 @@ async fn insert_effects_in_tx(
         .bind(height)
         .bind(&index[..])
         .bind(&effects.asset_registrations[..])
+        .execute(&mut **tx)
+        .await?;
+    }
+
+    if !effects.evidence.is_empty() {
+        let proposer: Vec<_> = effects
+            .evidence
+            .iter()
+            .map(|e| e.proposer.clone())
+            .collect();
+        let at: Vec<i64> = effects.evidence.iter().map(|e| e.height as i64).collect();
+        sqlx::query(
+            "INSERT INTO evidence (chain_id, height, proposer, evidence_height)
+             SELECT $1, $2, u.proposer, u.evidence_height
+             FROM UNNEST($3::TEXT[], $4::BIGINT[]) AS u(proposer, evidence_height)
+             ON CONFLICT DO NOTHING",
+        )
+        .bind(chain_id)
+        .bind(height)
+        .bind(&proposer[..])
+        .bind(&at[..])
+        .execute(&mut **tx)
+        .await?;
+    }
+
+    if !effects.bls_keys.is_empty() {
+        let address: Vec<_> = effects.bls_keys.iter().map(|k| k.address.clone()).collect();
+        let effective: Vec<i64> = effects
+            .bls_keys
+            .iter()
+            .map(|k| k.effective_height as i64)
+            .collect();
+        let pubkey: Vec<_> = effects.bls_keys.iter().map(|k| k.pubkey.clone()).collect();
+        sqlx::query(
+            "INSERT INTO bls_keys (chain_id, address, height, effective_height, pubkey)
+             SELECT $1, u.address, $2, u.effective_height, u.pubkey
+             FROM UNNEST($3::TEXT[], $4::BIGINT[], $5::JSONB[]) AS u(address, effective_height, pubkey)
+             ON CONFLICT DO NOTHING",
+        )
+        .bind(chain_id)
+        .bind(height)
+        .bind(&address[..])
+        .bind(&effective[..])
+        .bind(&pubkey[..])
+        .execute(&mut **tx)
+        .await?;
+    }
+
+    if !effects.operators.authorization.is_empty() {
+        let (mut validator, mut operator) = (Vec::new(), Vec::new());
+        for (v, o) in &effects.operators.authorization {
+            validator.push(v.clone());
+            operator.push(o.clone());
+        }
+        sqlx::query(
+            "INSERT INTO operators (chain_id, validator, height, operator)
+             SELECT $1, u.validator, $2, u.operator
+             FROM UNNEST($3::TEXT[], $4::TEXT[]) AS u(validator, operator)
+             ON CONFLICT DO NOTHING",
+        )
+        .bind(chain_id)
+        .bind(height)
+        .bind(&validator[..])
+        .bind(&operator[..])
+        .execute(&mut **tx)
+        .await?;
+    }
+
+    if !effects.attestor_registrations.is_empty() || !effects.attestor_deregistrations.is_empty() {
+        // One table, registration and removal alike: a NULL record is the
+        // deregistration, exactly like `stakes.allocation`.
+        let mut attestor: Vec<String> = Vec::new();
+        let mut record: Vec<Option<serde_json::Value>> = Vec::new();
+        for r in &effects.attestor_registrations {
+            attestor.push(r.attestor.clone());
+            record.push(Some(r.record.clone()));
+        }
+        for a in &effects.attestor_deregistrations {
+            attestor.push(a.clone());
+            record.push(None);
+        }
+        sqlx::query(
+            "INSERT INTO attestors (chain_id, attestor, height, record)
+             SELECT $1, u.attestor, $2, u.record
+             FROM UNNEST($3::TEXT[], $4::JSONB[]) AS u(attestor, record)
+             ON CONFLICT DO NOTHING",
+        )
+        .bind(chain_id)
+        .bind(height)
+        .bind(&attestor[..])
+        .bind(&record[..])
         .execute(&mut **tx)
         .await?;
     }
@@ -1663,16 +1758,104 @@ pub async fn get_validator(
     if history.is_empty() && power.is_none() {
         return Ok(None);
     }
+
+    let operator: Option<(Option<String>,)> = sqlx::query_as(
+        "SELECT operator FROM operators WHERE chain_id = $1 AND validator = $2
+         ORDER BY height DESC LIMIT 1",
+    )
+    .bind(chain_id)
+    .bind(address)
+    .fetch_optional(pool)
+    .await?;
+    let bls_key: Option<(serde_json::Value, i64)> = sqlx::query_as(
+        "SELECT pubkey, effective_height FROM bls_keys WHERE chain_id = $1 AND address = $2
+         ORDER BY height DESC LIMIT 1",
+    )
+    .bind(chain_id)
+    .bind(address)
+    .fetch_optional(pool)
+    .await?;
+    let evidence: Vec<(i64, i64)> = sqlx::query_as(
+        "SELECT height, evidence_height FROM evidence WHERE chain_id = $1 AND proposer = $2
+         ORDER BY height DESC",
+    )
+    .bind(chain_id)
+    .bind(address)
+    .fetch_all(pool)
+    .await?;
+
     Ok(Some(ValidatorRow {
         address: address.to_string(),
         status: history.first().and_then(|(_, s)| s.clone()),
         voting_power: power.as_ref().and_then(|(_, p)| p.as_u64()),
         set_effective_height: power.map(|(h, _)| h + 1),
+        operator: operator.and_then(|(o,)| o),
+        bls_key: bls_key.map(|(pubkey, effective_height)| BlsKeyRow {
+            pubkey,
+            effective_height,
+        }),
+        evidence: evidence
+            .into_iter()
+            .map(|(slashed_at, evidence_height)| EvidenceRow {
+                slashed_at,
+                evidence_height,
+            })
+            .collect(),
         history: history
             .into_iter()
             .map(|(height, status)| ValidatorStatusChange { height, status })
             .collect(),
     }))
+}
+
+/// Attestors registered as of `at`: the newest row per attestor at or below
+/// `at`, minus those whose newest row is a deregistration.
+pub async fn list_attestors(pool: &PgPool, chain_id: &str, at: i64) -> Result<Vec<AttestorRow>> {
+    let rows: Vec<(String, i64, serde_json::Value)> = sqlx::query_as(
+        "SELECT attestor, height, record FROM (
+             SELECT DISTINCT ON (attestor) attestor, height, record
+             FROM attestors WHERE chain_id = $1 AND height <= $2
+             ORDER BY attestor, height DESC
+         ) newest WHERE record IS NOT NULL ORDER BY attestor",
+    )
+    .bind(chain_id)
+    .bind(at)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|(attestor, height, record)| AttestorRow {
+            attestor,
+            height,
+            record,
+        })
+        .collect())
+}
+
+#[derive(Debug, Clone, serde::Serialize, utoipa::ToSchema)]
+pub struct AttestorRow {
+    pub attestor: String,
+    /// Height of the registration in force.
+    pub height: i64,
+    /// The node's `AttestorRecord`, verbatim.
+    #[schema(value_type = Object)]
+    pub record: serde_json::Value,
+}
+
+#[derive(Debug, Clone, serde::Serialize, utoipa::ToSchema)]
+pub struct BlsKeyRow {
+    /// The node's `BlsPublicKey`, verbatim.
+    #[schema(value_type = Object)]
+    pub pubkey: serde_json::Value,
+    pub effective_height: i64,
+}
+
+#[derive(Debug, Clone, serde::Serialize, utoipa::ToSchema)]
+pub struct EvidenceRow {
+    /// Block that processed the evidence and applied the slash.
+    pub slashed_at: i64,
+    /// Height the validator double-signed at.
+    pub evidence_height: i64,
 }
 
 #[derive(Debug, Clone, serde::Serialize, utoipa::ToSchema)]
@@ -1686,6 +1869,12 @@ pub struct ValidatorRow {
     pub voting_power: Option<u64>,
     /// First height that set applies to.
     pub set_effective_height: Option<i64>,
+    /// Operator currently authorized to act for this validator, if any.
+    pub operator: Option<String>,
+    /// Newest registered BLS key, if any.
+    pub bls_key: Option<BlsKeyRow>,
+    /// Every equivocation slash against this validator, newest first.
+    pub evidence: Vec<EvidenceRow>,
     /// Newest first.
     pub history: Vec<ValidatorStatusChange>,
 }

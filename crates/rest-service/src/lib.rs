@@ -202,7 +202,7 @@ impl AppState {
         get_account_actions, get_account_first_seen, list_proposers, get_validator_uptime, search,
         health, readiness, metrics,
         sse::stream_blocks, sse::stream_actions,
-        get_account, get_asset_holders, get_validator, list_dropped_actions,
+        get_account, get_asset_holders, get_validator, list_attestors, list_dropped_actions,
     ),
     tags(
         (name = "chains"), (name = "blocks"), (name = "actions"), (name = "accounts"),
@@ -269,6 +269,7 @@ pub fn router(pool: PgPool, chains: Vec<RestChain>, min_node_version: &'static s
             get(list_dropped_actions),
         )
         .route("/v1/chains/{chain_id}/proposers", get(list_proposers))
+        .route("/v1/chains/{chain_id}/attestors", get(list_attestors))
         .route(
             "/v1/chains/{chain_id}/validators/uptime",
             get(get_validator_uptime),
@@ -1051,6 +1052,18 @@ async fn get_validator(
         .await?
         .map(Json)
         .ok_or_else(|| ApiError::NotFound("validator not found".into()))
+}
+
+#[utoipa::path(get, path = "/v1/chains/{chain_id}/attestors", tag = "validators", params(("chain_id" = String, Path), AsOf), responses((status = 200, description = "Attestors registered as of `at` (default: tip)", body = Vec<storage::AttestorRow>), (status = 400, body = ErrorBody), (status = 404, body = ErrorBody)))]
+async fn list_attestors(
+    State(state): State<AppState>,
+    Path(chain_id): Path<String>,
+    Query(as_of): Query<AsOf>,
+) -> ApiResult<Vec<storage::AttestorRow>> {
+    state.chain(&chain_id)?;
+    Ok(Json(
+        storage::list_attestors(&state.pool, &chain_id, as_of.height()?).await?,
+    ))
 }
 
 #[derive(Deserialize, IntoParams)]

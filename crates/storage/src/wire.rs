@@ -72,8 +72,47 @@ pub struct BlockEffects {
     pub validator_set: Option<serde_json::Value>,
     #[serde(default)]
     pub asset_registrations: Vec<serde_json::Value>,
+    /// The four below are empty from a node older than Arxium `b360a9c`.
+    #[serde(default)]
+    pub evidence: Vec<EvidenceEffect>,
+    #[serde(default)]
+    pub bls_keys: Vec<BlsKeyEffect>,
+    #[serde(default)]
+    pub operators: OperatorsEffect,
+    #[serde(default)]
+    pub attestor_registrations: Vec<AttestorEffect>,
+    #[serde(default)]
+    pub attestor_deregistrations: Vec<String>,
     #[serde(default)]
     pub dropped: Vec<DroppedEffect>,
+}
+
+#[derive(Clone, Debug, serde::Deserialize)]
+pub struct EvidenceEffect {
+    /// The height the proposer double-signed at, not the block that slashed.
+    pub height: u64,
+    pub proposer: String,
+}
+
+#[derive(Clone, Debug, serde::Deserialize)]
+pub struct BlsKeyEffect {
+    pub address: String,
+    pub pubkey: serde_json::Value,
+    pub effective_height: u64,
+}
+
+/// `validator -> Some(operator)` authorized, `-> None` revoked. The node's
+/// reverse index (`operator_index`) is derivable, so it's ignored.
+#[derive(Clone, Debug, Default, serde::Deserialize)]
+pub struct OperatorsEffect {
+    #[serde(default)]
+    pub authorization: std::collections::BTreeMap<String, Option<String>>,
+}
+
+#[derive(Clone, Debug, serde::Deserialize)]
+pub struct AttestorEffect {
+    pub attestor: String,
+    pub record: serde_json::Value,
 }
 
 #[derive(Clone, Debug, serde::Deserialize)]

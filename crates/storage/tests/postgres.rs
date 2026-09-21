@@ -875,6 +875,12 @@ async fn effects_write_state_tables_and_roll_back_with_the_block() {
             "validator_statuses": {addr(9): "Active"},
             "validator_set": {addr(9): 10000},
             "asset_registrations": [{"id": "gold"}],
+            "evidence": [{"height": height, "proposer": addr(9)}],
+            "bls_keys": [{"address": addr(9), "pubkey": vec![height; 48], "effective_height": height + 1}],
+            "operators": {"authorization": {addr(9): addr(3)}, "operator_index": {addr(3): [addr(9)]}},
+            // Registered at every height, and deregistered again at h1 only.
+            "attestor_registrations": [{"attestor": addr(5), "record": {"name": "att", "registered_at": height}}],
+            "attestor_deregistrations": if height == 1 { vec![addr(6)] } else { vec![] },
             "dropped": [{"signature": format!("bad-{height}"), "reason": "nonce"}],
         }))
         .expect("effects decode")
@@ -902,10 +908,34 @@ async fn effects_write_state_tables_and_roll_back_with_the_block() {
         ("validator_status", 3),
         ("validator_sets", 3),
         ("asset_registrations", 3),
+        ("evidence", 3),
+        ("bls_keys", 3),
+        ("operators", 3),
+        ("attestors", 4),
         ("dropped_actions", 3),
     ] {
         assert_eq!(count(&pool, table, &chain).await, rows, "{table}");
     }
+    // Validator bookkeeping reads: newest operator/key, every slash.
+    let v9 = storage::get_validator(&pool, &chain, &addr(9))
+        .await
+        .expect("query")
+        .expect("v9");
+    assert_eq!(v9.operator.as_deref(), Some(addr(3).as_str()));
+    assert_eq!(v9.bls_key.as_ref().map(|k| k.effective_height), Some(3));
+    assert_eq!(
+        v9.evidence.iter().map(|e| e.slashed_at).collect::<Vec<_>>(),
+        vec![2, 1, 0]
+    );
+    // addr(6) was only ever deregistered, so it never lists; addr(5) does.
+    let attestors = storage::list_attestors(&pool, &chain, i64::MAX)
+        .await
+        .expect("attestors");
+    assert_eq!(attestors.len(), 1);
+    assert_eq!(
+        (attestors[0].attestor.as_str(), attestors[0].height),
+        (addr(5).as_str(), 2)
+    );
     let balance: String = sqlx::query_scalar(
         "SELECT balance::TEXT FROM account_state WHERE chain_id = $1 AND address = $2 AND height = 2",
     )
@@ -930,6 +960,8 @@ async fn effects_write_state_tables_and_roll_back_with_the_block() {
     assert_eq!(count(&pool, "account_state", &chain).await, 2);
     assert_eq!(count(&pool, "dropped_actions", &chain).await, 1);
     assert_eq!(count(&pool, "validator_sets", &chain).await, 1);
+    assert_eq!(count(&pool, "attestors", &chain).await, 1);
+    assert_eq!(count(&pool, "evidence", &chain).await, 1);
 }
 
 /// The state reads resolve "as of height": the newest row at or below `at`
