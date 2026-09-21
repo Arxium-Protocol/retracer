@@ -117,6 +117,14 @@ mod tests {
                 "validator_statuses": {"arx1v": {"Jailed": {"until_epoch": 3}}},
                 "validator_set": null, "asset_registrations": [],
                 "dropped": [{"signature": "bad", "reason": "nonce"}],
+                // Arxium b360a9c: a BLS pubkey is `serialize_bytes` → a JSON
+                // array of 48 ints; a deregistration is the bare address;
+                // `operator_index` is the node's reverse index, ignored.
+                "evidence": [{"height": 3, "proposer": "arx1v"}],
+                "bls_keys": [{"address": "arx1v", "pubkey": vec![9u8; 48], "effective_height": 8, "previous_pubkey": null}],
+                "operators": {"authorization": {"arx1v": "arx1o"}, "operator_index": {"arx1o": ["arx1v"]}},
+                "attestor_registrations": [{"attestor": "arx1a", "record": {"name": "att", "registered_at": 7}}],
+                "attestor_deregistrations": ["arx1b"],
                 "future_field": 1
             }))
             .unwrap();
@@ -128,6 +136,17 @@ mod tests {
             3
         );
         assert_eq!(effects.dropped[0].reason, "nonce");
+        assert_eq!(effects.evidence[0].height, 3);
+        assert_eq!(effects.bls_keys[0].pubkey.as_array().unwrap().len(), 48);
+        assert_eq!(
+            effects.operators.authorization["arx1v"].as_deref(),
+            Some("arx1o")
+        );
+        assert_eq!(effects.attestor_registrations[0].record["name"], "att");
+        assert_eq!(effects.attestor_deregistrations, vec!["arx1b"]);
+        // A node older than b360a9c sends none of the five: all default.
+        block.set_effects(serde_json::json!({"height": 7})).unwrap();
+        assert!(block.effects().unwrap().attestor_registrations.is_empty());
         // A node too old to send `payload_json` is a hard decode error.
         assert!(serde_json::from_str::<RpcBlock>(r#"{"height":0,"hash":"","parent_hash":"","timestamp":0,"proposer":null,"actions":[{"sender":"a","signature":null}]}"#).is_err());
     }

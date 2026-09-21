@@ -602,13 +602,12 @@ async fn kind_field_filter_and_reindex() {
 
     // Ingest with a schema that indexes `$.amount` but declares no roles.
     //
-    // This test is the sole owner of the `Transfer`/`$.amount`/numeric index
-    // name in this binary. `index_name()` hashes kind+path+type, not
-    // chain_id, so a second test declaring the same projection would race
-    // this one's create/drop under the parallel runner (see 4162224). The
-    // kind can't be made synthetic here — it has to match
-    // `TestPayload::Transfer` for the filter to hit — so new tests must pick
-    // a different kind or field instead.
+    // `index_name()` hashes kind+path+type, not chain_id, so this index is
+    // shared with any other test declaring `Transfer`/`$.amount`. It is
+    // never dropped: `CREATE INDEX IF NOT EXISTS` is idempotent, and the
+    // create/drop race under the parallel runner (4162224) only existed
+    // because the loser's cleanup pulled the index out from under the
+    // winner's existence check. The test DB is disposable.
     let path = std::env::temp_dir().join(format!("retracer_filter_{}.toml", std::process::id()));
     std::fs::write(
         &path,
@@ -761,10 +760,6 @@ async fn kind_field_filter_and_reindex() {
     assert_eq!(first(addr(8)).await, Some((2, 1_700_000_002)));
     assert_eq!(first(addr(3)).await, None);
 
-    sqlx::query(&format!("DROP INDEX IF EXISTS {}", projection.index_name()))
-        .execute(&pool)
-        .await
-        .ok();
     std::fs::remove_file(&path).ok();
 }
 
