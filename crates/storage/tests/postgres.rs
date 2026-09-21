@@ -601,6 +601,14 @@ async fn kind_field_filter_and_reindex() {
     let chain = chain_id("filter");
 
     // Ingest with a schema that indexes `$.amount` but declares no roles.
+    //
+    // This test is the sole owner of the `Transfer`/`$.amount`/numeric index
+    // name in this binary. `index_name()` hashes kind+path+type, not
+    // chain_id, so a second test declaring the same projection would race
+    // this one's create/drop under the parallel runner (see 4162224). The
+    // kind can't be made synthetic here — it has to match
+    // `TestPayload::Transfer` for the filter to hit — so new tests must pick
+    // a different kind or field instead.
     let path = std::env::temp_dir().join(format!("retracer_filter_{}.toml", std::process::id()));
     std::fs::write(
         &path,
@@ -713,12 +721,26 @@ async fn kind_field_filter_and_reindex() {
     let b2 = block(
         2,
         &b1.hash(),
-        vec![action(2, Some("s4"), TestPayload::Transfer { to: addr(8), amount: 1 })],
+        vec![action(
+            2,
+            Some("s4"),
+            TestPayload::Transfer {
+                to: addr(8),
+                amount: 1,
+            },
+        )],
     );
     let b3 = block(
         3,
         &b2.hash(),
-        vec![action(8, Some("s5"), TestPayload::Transfer { to: addr(2), amount: 1 })],
+        vec![action(
+            8,
+            Some("s5"),
+            TestPayload::Transfer {
+                to: addr(2),
+                amount: 1,
+            },
+        )],
     );
     for b in [&b2, &b3] {
         storage::insert_block(&pool, &chain, b, &extractor)
