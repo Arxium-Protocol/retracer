@@ -19,6 +19,7 @@ use axum::routing::get;
 use axum::{Json, Router};
 
 mod sse;
+pub mod webhooks;
 use futures::stream::{self, StreamExt};
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
@@ -153,6 +154,8 @@ pub struct RestChain {
 #[derive(Clone)]
 struct AppState {
     pool: PgPool,
+    /// Webhook registration is allowed only behind `--auth-token`.
+    webhooks_writable: bool,
     chains: Arc<Vec<RestChain>>,
     known: Arc<HashSet<String>>,
     http: reqwest::Client,
@@ -203,15 +206,21 @@ impl AppState {
         health, readiness, metrics,
         sse::stream_blocks, sse::stream_actions, sse::stream_dropped,
         get_account, get_asset_holders, get_validator, list_attestors, list_dropped_actions,
+        webhooks::register, webhooks::list, webhooks::remove,
     ),
     tags(
         (name = "chains"), (name = "blocks"), (name = "actions"), (name = "accounts"),
-        (name = "validators"), (name = "search"), (name = "ops"),
+        (name = "validators"), (name = "search"), (name = "webhooks"), (name = "ops"),
     )
 )]
 struct ApiDoc;
 
-pub fn router(pool: PgPool, chains: Vec<RestChain>, min_node_version: &'static str) -> Router {
+pub fn router(
+    pool: PgPool,
+    chains: Vec<RestChain>,
+    min_node_version: &'static str,
+    webhooks_writable: bool,
+) -> Router {
     let known = chains.iter().map(|c| c.chain_id.clone()).collect();
     let http = reqwest::Client::builder()
         .timeout(NODE_RPC_TIMEOUT)
@@ -219,6 +228,7 @@ pub fn router(pool: PgPool, chains: Vec<RestChain>, min_node_version: &'static s
         .expect("reqwest client with only a timeout set never fails to build");
     let state = AppState {
         pool,
+        webhooks_writable,
         chains: Arc::new(chains),
         known: Arc::new(known),
         http,
@@ -283,6 +293,7 @@ pub fn router(pool: PgPool, chains: Vec<RestChain>, min_node_version: &'static s
         .route("/ready", get(readiness))
         .route("/metrics", get(metrics))
         .route("/openapi.json", get(|| async { Json(ApiDoc::openapi()) }))
+        .merge(webhooks::routes())
         .merge(Redoc::with_url("/docs", ApiDoc::openapi()))
         .with_state(state)
 }
@@ -292,6 +303,7 @@ pub fn router(pool: PgPool, chains: Vec<RestChain>, min_node_version: &'static s
 enum ApiError {
     NotFound(String),
     BadRequest(String),
+    Forbidden(String),
     Internal(anyhow::Error),
 }
 
@@ -311,6 +323,7 @@ impl IntoResponse for ApiError {
         let (status, message) = match self {
             ApiError::NotFound(m) => (StatusCode::NOT_FOUND, m),
             ApiError::BadRequest(m) => (StatusCode::BAD_REQUEST, m),
+            ApiError::Forbidden(m) => (StatusCode::FORBIDDEN, m),
             // The underlying error is logged rather than returned: it can carry
             // connection strings and SQL, and a caller can act on "something
             // broke here" but not on our query text.
@@ -1481,6 +1494,7 @@ mod tests {
         AppState {
             known: Arc::new(chains.iter().map(|c| c.chain_id.clone()).collect()),
             pool,
+            webhooks_writable: false,
             chains: Arc::new(chains),
             http: reqwest::Client::new(),
             uptime_cache: Arc::new(UptimeCache::new()),

@@ -949,6 +949,29 @@ async fn effects_write_state_tables_and_roll_back_with_the_block() {
         "two distinct accounts in state, no actions at all"
     );
 
+    // Rejections ride on the block reads, single and ranged, so the SSE
+    // replay and the paged read agree with the live broadcast.
+    let b1 = storage::get_block_by_height(&pool, &chain, 1)
+        .await
+        .expect("query")
+        .expect("block 1");
+    assert_eq!(b1.dropped.len(), 1);
+    assert_eq!(
+        (
+            b1.dropped[0].signature.as_str(),
+            b1.dropped[0].reason.as_str()
+        ),
+        ("bad-1", "nonce")
+    );
+    let range = storage::get_blocks_in_range(&pool, &chain, 0, 2, 10)
+        .await
+        .expect("range");
+    assert_eq!(
+        range.iter().map(|b| b.dropped.len()).collect::<Vec<_>>(),
+        [1, 1, 1]
+    );
+    assert_eq!(range[2].dropped[0].block_height, 2);
+
     storage::rollback_to(&pool, &chain, 0)
         .await
         .expect("rollback");
@@ -1121,5 +1144,104 @@ async fn state_reads_resolve_as_of_height() {
             .map(|d| d.signature.as_str())
             .collect::<Vec<_>>(),
         ["d1", "d0"]
+    );
+}
+
+/// Registration is an upsert keyed on URL that re-arms a disabled hook;
+/// the cursor moves only through `webhook_delivered`; `webhook_failed`
+/// starts the failing clock once and disables past the window.
+#[tokio::test]
+async fn webhooks_round_trip_cursor_and_failure_bookkeeping() {
+    let Some(pool) = pool().await else { return };
+    let chain = chain_id("webhooks");
+    storage::register_chain(&pool, &chain, None, "t", "s", 0)
+        .await
+        .expect("register chain");
+    let events = vec!["action".to_string(), "dropped".to_string()];
+
+    let hook = storage::upsert_webhook(
+        &pool,
+        &chain,
+        "http://a/",
+        "secret-0123456789",
+        Some("arx1x"),
+        &events,
+        41,
+    )
+    .await
+    .expect("insert");
+    assert_eq!(
+        (hook.cursor_height, hook.enabled, hook.failing_since),
+        (41, true, None)
+    );
+    assert_eq!(
+        storage::list_webhooks(&pool, &chain)
+            .await
+            .expect("list")
+            .len(),
+        1
+    );
+
+    storage::webhook_delivered(&pool, hook.id, 45)
+        .await
+        .expect("delivered");
+    // First failure at t=100 starts the clock; a later one keeps it; one
+    // whose window (`disable_before`) has passed the clock disables.
+    storage::webhook_failed(&pool, hook.id, "503", 100, 0)
+        .await
+        .expect("fail");
+    storage::webhook_failed(&pool, hook.id, "504", 200, 50)
+        .await
+        .expect("fail");
+    let h = &storage::list_webhooks(&pool, &chain).await.expect("list")[0];
+    assert_eq!(
+        (
+            h.cursor_height,
+            h.failing_since,
+            h.last_error.as_deref(),
+            h.enabled
+        ),
+        (45, Some(100), Some("504"), true)
+    );
+    storage::webhook_failed(&pool, hook.id, "504", 300, 150)
+        .await
+        .expect("fail");
+    assert!(!storage::list_webhooks(&pool, &chain).await.expect("list")[0].enabled);
+
+    // Success clears the clock; re-registering the same URL re-arms.
+    storage::webhook_delivered(&pool, hook.id, 46)
+        .await
+        .expect("delivered");
+    let h = &storage::list_webhooks(&pool, &chain).await.expect("list")[0];
+    assert_eq!(
+        (h.failing_since, h.last_error.as_deref(), h.enabled),
+        (None, None, false)
+    );
+    let again = storage::upsert_webhook(
+        &pool,
+        &chain,
+        "http://a/",
+        "secret-abcdefghijk",
+        None,
+        &events[..1],
+        10,
+    )
+    .await
+    .expect("upsert");
+    assert_eq!(
+        (again.id, again.cursor_height, again.enabled, again.address),
+        (hook.id, 10, true, None)
+    );
+    assert_eq!(again.events, ["action"]);
+
+    assert!(
+        storage::delete_webhook(&pool, &chain, hook.id)
+            .await
+            .expect("delete")
+    );
+    assert!(
+        !storage::delete_webhook(&pool, &chain, hook.id)
+            .await
+            .expect("delete")
     );
 }

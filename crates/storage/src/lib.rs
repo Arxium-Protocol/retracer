@@ -2116,6 +2116,123 @@ fn split_kind(payload_json: serde_json::Value) -> (String, serde_json::Value) {
     }
 }
 
+// ------------------------------------------------------------------ webhooks
+
+/// A webhook subscription as `webhooks` stores it. `secret` never leaves the
+/// process: it is the HMAC key the receiver uses to verify deliveries.
+#[derive(Debug, Clone, serde::Serialize, sqlx::FromRow, utoipa::ToSchema)]
+pub struct WebhookRow {
+    pub id: i64,
+    #[serde(skip)]
+    pub chain_id: String,
+    pub url: String,
+    #[serde(skip)]
+    pub secret: String,
+    pub address: Option<String>,
+    pub events: Vec<String>,
+    /// Last block whose events were all delivered.
+    pub cursor_height: i64,
+    pub enabled: bool,
+    /// Unix seconds since deliveries started failing, `None` while healthy.
+    pub failing_since: Option<i64>,
+    pub last_error: Option<String>,
+    pub created_at: i64,
+}
+
+const WEBHOOK_COLUMNS: &str = "id, chain_id, url, secret, address, events, cursor_height, enabled, failing_since, last_error, created_at";
+
+/// Registers a hook, or re-arms an existing one for the same URL: the new
+/// secret, filter and cursor replace the old and it is enabled again. That
+/// is how an operator revives a hook the dispatcher gave up on.
+pub async fn upsert_webhook(
+    pool: &PgPool,
+    chain_id: &str,
+    url: &str,
+    secret: &str,
+    address: Option<&str>,
+    events: &[String],
+    cursor_height: i64,
+) -> Result<WebhookRow> {
+    Ok(sqlx::query_as(&format!(
+        "INSERT INTO webhooks (chain_id, url, secret, address, events, cursor_height)
+         VALUES ($1, $2, $3, $4, $5, $6)
+         ON CONFLICT (chain_id, url) DO UPDATE SET
+            secret = EXCLUDED.secret, address = EXCLUDED.address,
+            events = EXCLUDED.events, cursor_height = EXCLUDED.cursor_height,
+            enabled = TRUE, failing_since = NULL, last_error = NULL
+         RETURNING {WEBHOOK_COLUMNS}"
+    ))
+    .bind(chain_id)
+    .bind(url)
+    .bind(secret)
+    .bind(address)
+    .bind(events)
+    .bind(cursor_height)
+    .fetch_one(pool)
+    .await?)
+}
+
+pub async fn list_webhooks(pool: &PgPool, chain_id: &str) -> Result<Vec<WebhookRow>> {
+    Ok(sqlx::query_as(&format!(
+        "SELECT {WEBHOOK_COLUMNS} FROM webhooks WHERE chain_id = $1 ORDER BY id"
+    ))
+    .bind(chain_id)
+    .fetch_all(pool)
+    .await?)
+}
+
+/// `true` if a row was deleted.
+pub async fn delete_webhook(pool: &PgPool, chain_id: &str, id: i64) -> Result<bool> {
+    Ok(
+        sqlx::query("DELETE FROM webhooks WHERE chain_id = $1 AND id = $2")
+            .bind(chain_id)
+            .bind(id)
+            .execute(pool)
+            .await?
+            .rows_affected()
+            > 0,
+    )
+}
+
+/// A block fully delivered: advance the cursor and mark the hook healthy.
+pub async fn webhook_delivered(pool: &PgPool, id: i64, height: i64) -> Result<()> {
+    sqlx::query(
+        "UPDATE webhooks SET cursor_height = $2, failing_since = NULL, last_error = NULL
+          WHERE id = $1",
+    )
+    .bind(id)
+    .bind(height)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// A delivery failed: keep the cursor, record why, start the failing clock
+/// if it is not already running, and disable the hook if it has been
+/// failing since before `disable_before`.
+pub async fn webhook_failed(
+    pool: &PgPool,
+    id: i64,
+    error: &str,
+    now: i64,
+    disable_before: i64,
+) -> Result<()> {
+    sqlx::query(
+        "UPDATE webhooks
+            SET last_error = $2,
+                failing_since = COALESCE(failing_since, $3),
+                enabled = COALESCE(failing_since, $3) > $4
+          WHERE id = $1",
+    )
+    .bind(id)
+    .bind(error)
+    .bind(now)
+    .bind(disable_before)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -50,9 +50,14 @@ emit. Point the issuer's Retracer at a producer.
   minute, cursor stays, so the receiver gets at-least-once and dedupes on
   `X-Retracer-Id`. Lagging behind the broadcast buffer is not a failure — the
   task just reopens its replay from the cursor.
-- After `--webhook-max-failing` (default 3 days) of continuous failure the
-  hook is disabled with `last_error` set; `GET` shows it, `POST` with the
-  same URL re-enables it.
+- After 3 days of continuous failure (a constant for now — a flag when an
+  operator needs a different window) the hook is disabled with `last_error`
+  set; `GET` shows it, `POST` with the same URL re-enables it.
+
+Status: both phases implemented. Delivery is sequential across a chain's
+hooks on each wake (one slow receiver costs the others at most the 10s
+request timeout per wake before it is backed off); per-hook tasks if that
+ever matters.
 
 What is deliberately not here: a management UI, per-hook payload templates,
 a delivery log beyond `last_error`/`failing_since`, fan-out through a broker.

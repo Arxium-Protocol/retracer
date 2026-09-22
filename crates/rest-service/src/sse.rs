@@ -215,7 +215,7 @@ type BlockStream = Pin<Box<dyn Stream<Item = BlockRow> + Send>>;
 /// one). Matches what `GET .../accounts/{address}/actions?role=to` already
 /// finds historically via `action_addresses`, computed live here instead so
 /// a filtered stream notifies recipients, not just senders.
-fn action_matches_address(
+pub(super) fn action_matches_address(
     extractor: &storage::AddressExtractor,
     action: &ActionRow,
     address: &str,
@@ -399,7 +399,7 @@ mod tests {
         let chain = rest_chain(ingestion::NetworkView::default());
         let blocks_tx = chain.blocks_tx.clone();
         let state = lazy_state(vec![chain]);
-        let app = crate::router(state.pool.clone(), state.chains.to_vec(), "0");
+        let app = crate::router(state.pool.clone(), state.chains.to_vec(), "0", false);
 
         let resp = app
             .clone()
@@ -440,7 +440,7 @@ mod tests {
         let chain = rest_chain(ingestion::NetworkView::default());
         let blocks_tx = chain.blocks_tx.clone();
         let state = lazy_state(vec![chain]);
-        let app = crate::router(state.pool.clone(), state.chains.to_vec(), "0");
+        let app = crate::router(state.pool.clone(), state.chains.to_vec(), "0", false);
 
         let resp = app
             .oneshot(
@@ -468,7 +468,7 @@ mod tests {
         let chain = rest_chain(ingestion::NetworkView::default());
         let blocks_tx = chain.blocks_tx.clone();
         let state = lazy_state(vec![chain]);
-        let app = crate::router(state.pool.clone(), state.chains.to_vec(), "0");
+        let app = crate::router(state.pool.clone(), state.chains.to_vec(), "0", false);
 
         let resp = app
             .oneshot(

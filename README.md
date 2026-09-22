@@ -118,7 +118,7 @@ can also come from a `.env` file (copy `.env.example`) via
 | `--finality-depth` | `250` | Fallback rollback limit, used only when the node reports no finality |
 | `--write-pool-size` | `4` | Postgres connections for the writer |
 | `--read-pool-size` | `16` | Postgres connections for reads |
-| `--auth-token` | none | Shared secret required as `Authorization: Bearer <token>` on every request (`/health` and `/ready` stay open). Unset = the API stays open, same as today |
+| `--auth-token` | none | Shared secret required as `Authorization: Bearer <token>` on every request (`/health` and `/ready` stay open). Unset = the API stays open, same as today, and webhook registration is refused |
 | `--rate-limit-rps` | none | Per-IP request budget. Unset = no rate limiting |
 | `--trusted-proxies` | none | Comma-separated IPs/CIDRs (e.g. `10.0.0.8,10.0.0.0/8`) whose `X-Forwarded-For` the limiter may believe. Unset = the socket peer is always the client; only set addresses you operate |
 | `--rest-bind` | `127.0.0.1` | Interface the API listens on |
@@ -308,6 +308,45 @@ gets `Last-Event-ID` for free; a backend keeps its own checkpoint.
 ```bash
 curl -N "localhost:8080/v1/chains/corechain-devnet/actions/stream?from_height=100"
 ```
+
+### Webhooks
+
+The same events, delivered as HTTP `POST`s to a receiver that has a URL
+rather than an open socket — an issuer's back office learning that a
+transfer was refused for a compliance reason. Registration needs
+`--auth-token` (an open API must not be made to POST chain data anywhere).
+
+```bash
+curl -s -X POST -H "Authorization: Bearer $TOKEN" -H 'content-type: application/json' \
+  localhost:8080/v1/chains/corechain-devnet/webhooks \
+  -d '{"url":"https://backoffice.example/arxium","secret":"<16+ chars>","address":"arx1issuer...","events":["dropped"]}'
+```
+
+- `address` (optional) keeps only actions that address holds a role on and
+  rejections it sent; `events` ⊂ `["action","dropped"]`, default both;
+  `from_height` starts delivery from history instead of the current tip.
+- `GET .../webhooks` lists hooks (secrets are never returned);
+  `DELETE .../webhooks/{id}` removes one. `POST` with an existing URL
+  replaces its secret and filter and re-enables it.
+
+Each delivery is one JSON body — the SSE event with an added
+`"event": "action" | "dropped"` — and these headers:
+
+| Header | Value |
+| --- | --- |
+| `X-Retracer-Chain` | chain id |
+| `X-Retracer-Event` | `action` or `dropped` |
+| `X-Retracer-Id` | the SSE `id:` — `height:index` or `height:signature`; dedupe on it |
+| `X-Retracer-Timestamp` | unix seconds when sent |
+| `X-Retracer-Signature` | `sha256=` + hex HMAC-SHA256 of `"<timestamp>.<body>"` under the secret |
+
+Delivery is at-least-once, in chain order, one hook at a time: a hook's
+cursor (`cursor_height`) advances only once every event of a block answered
+2xx, so a receiver that is down is replayed from Postgres when it returns.
+Failures back off up to a minute; after three days of continuous failure the
+hook is disabled (`enabled: false`, `last_error` says why) — re-`POST` it to
+re-arm. Rejections (`dropped`) are only known to a Retracer following the
+*producing* node.
 
 ---
 

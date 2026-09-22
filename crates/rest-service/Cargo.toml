@@ -21,6 +21,9 @@ tokio-stream = { version = "0.1", features = ["sync"] }
 utoipa = { workspace = true }
 # `/docs` is one HTML page that loads Redoc from a CDN — no bundled UI assets.
 utoipa-redoc = { version = "6", features = ["axum"] }
+hmac = "0.12"
+sha2 = "0.10"
+hex = "0.4"
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["io-util", "net"] }
