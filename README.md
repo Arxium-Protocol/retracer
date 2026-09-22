@@ -280,7 +280,7 @@ curl "$C/actions?kind=TransferAsset&field=\$.asset&value=arxasset1..."
 
 ## Live tails (server-sent events)
 
-Two routes stream instead of paging, Horizon-style — plain `GET`s answering
+Three routes stream instead of paging, Horizon-style — plain `GET`s answering
 `text/event-stream`, one JSON row per `data:` line, the same shapes the paged
 reads return:
 
@@ -291,6 +291,13 @@ reads return:
   per action (an empty block emits nothing), each carrying `block_timestamp`,
   with `id:` = `height:index`. `address` keeps only actions where that address
   holds a role (sender, recipient, or any role your schema defines).
+- `GET /v1/chains/{chain}/actions/dropped/stream?from_height=N&address=A` —
+  one event per action the producer rejected, with the `reason`, `id:` =
+  `height:signature`; `address` keeps only that sender's. The feed for
+  "transfer refused for compliance reason X" — only a Retracer following the
+  *producing* node sees rejections at all (see `actions/dropped`). Blocks
+  also carry a `dropped` array on `blocks/stream` and `/blocks/{height}`,
+  present only when non-empty.
 
 The connection is allowed to drop. A subscriber that reads too slowly for the
 broadcast buffer is simply cut off — the stream ends — and reconnects with

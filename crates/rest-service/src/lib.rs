@@ -201,7 +201,7 @@ impl AppState {
         list_chains, get_status, get_stats, list_blocks, get_block, list_actions, get_action,
         get_account_actions, get_account_first_seen, list_proposers, get_validator_uptime, search,
         health, readiness, metrics,
-        sse::stream_blocks, sse::stream_actions,
+        sse::stream_blocks, sse::stream_actions, sse::stream_dropped,
         get_account, get_asset_holders, get_validator, list_attestors, list_dropped_actions,
     ),
     tags(
@@ -242,6 +242,10 @@ pub fn router(pool: PgPool, chains: Vec<RestChain>, min_node_version: &'static s
         .route(
             "/v1/chains/{chain_id}/actions/stream",
             get(sse::stream_actions),
+        )
+        .route(
+            "/v1/chains/{chain_id}/actions/dropped/stream",
+            get(sse::stream_dropped),
         )
         .route(
             "/v1/chains/{chain_id}/actions/{action_hash}",

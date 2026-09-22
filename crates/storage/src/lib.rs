@@ -1291,6 +1291,21 @@ pub fn block_row_from_wire<B: IndexableBlock>(block: &B) -> Result<BlockRow> {
             })
         })
         .collect::<Result<Vec<_>>>()?;
+    let dropped = block
+        .effects()
+        .map(|effects| {
+            effects
+                .dropped
+                .iter()
+                .map(|d| DroppedRow {
+                    block_height: height,
+                    signature: d.signature.clone(),
+                    sender: d.sender.clone(),
+                    reason: d.reason.clone(),
+                })
+                .collect()
+        })
+        .unwrap_or_default();
     Ok(BlockRow {
         height,
         hash: block.hash(),
@@ -1299,6 +1314,7 @@ pub fn block_row_from_wire<B: IndexableBlock>(block: &B) -> Result<BlockRow> {
         proposer: block.proposer(),
         undecoded_action_count: count_undecoded(&actions),
         actions,
+        dropped,
     })
 }
 
@@ -1327,6 +1343,31 @@ pub struct BlockRow {
     /// multi-key unknown-action payload, so no schema change is needed.
     pub undecoded_action_count: usize,
     pub actions: Vec<ActionRow>,
+    /// Actions the producer rejected while building this block. Only a
+    /// Retracer following the producing node has any; omitted from the JSON
+    /// when empty so a chain without rejections serialises exactly as before.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub dropped: Vec<DroppedRow>,
+}
+
+/// Rejections in `[from, to]`, ordered by height then signature — the order
+/// `actions/dropped/stream` assigns its `id`s in.
+async fn dropped_in_range(
+    pool: &PgPool,
+    chain_id: &str,
+    from: i64,
+    to: i64,
+) -> Result<Vec<DroppedRow>> {
+    Ok(sqlx::query_as(
+        "SELECT block_height, signature, sender, reason FROM dropped_actions
+          WHERE chain_id = $1 AND block_height >= $2 AND block_height <= $3
+          ORDER BY block_height, signature",
+    )
+    .bind(chain_id)
+    .bind(from)
+    .bind(to)
+    .fetch_all(pool)
+    .await?)
 }
 
 fn count_undecoded(actions: &[ActionRow]) -> usize {
@@ -1361,6 +1402,7 @@ pub async fn get_block_by_height(
         return Ok(None);
     };
     let actions = actions_for_block(pool, chain_id, height).await?;
+    let dropped = dropped_in_range(pool, chain_id, height, height).await?;
     Ok(Some(BlockRow {
         height,
         hash,
@@ -1369,6 +1411,7 @@ pub async fn get_block_by_height(
         proposer,
         undecoded_action_count: count_undecoded(&actions),
         actions,
+        dropped,
     }))
 }
 
@@ -1415,6 +1458,7 @@ pub async fn get_block_by_hash(
         return Ok(None);
     };
     let actions = actions_for_block(pool, chain_id, height).await?;
+    let dropped = dropped_in_range(pool, chain_id, height, height).await?;
     Ok(Some(BlockRow {
         height,
         hash,
@@ -1423,6 +1467,7 @@ pub async fn get_block_by_hash(
         proposer,
         undecoded_action_count: count_undecoded(&actions),
         actions,
+        dropped,
     }))
 }
 
@@ -1942,7 +1987,7 @@ pub async fn list_dropped_actions(
     .collect())
 }
 
-#[derive(Debug, Clone, serde::Serialize, utoipa::ToSchema)]
+#[derive(Debug, Clone, serde::Serialize, sqlx::FromRow, utoipa::ToSchema)]
 pub struct DroppedRow {
     /// The block the producer was building when it rejected the action.
     pub block_height: i64,
@@ -2012,6 +2057,11 @@ pub async fn get_blocks_in_range(
             .or_default()
             .push(action);
     }
+    let mut dropped_by_height: std::collections::HashMap<i64, Vec<DroppedRow>> =
+        std::collections::HashMap::new();
+    for d in dropped_in_range(pool, chain_id, lo, hi).await? {
+        dropped_by_height.entry(d.block_height).or_default().push(d);
+    }
 
     Ok(rows
         .into_iter()
@@ -2020,6 +2070,7 @@ pub async fn get_blocks_in_range(
             BlockRow {
                 undecoded_action_count: count_undecoded(&actions),
                 actions,
+                dropped: dropped_by_height.remove(&height).unwrap_or_default(),
                 height,
                 hash,
                 parent_hash,

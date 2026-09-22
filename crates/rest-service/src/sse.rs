@@ -22,7 +22,7 @@ use futures::stream::{self, Stream, StreamExt};
 use serde::{Deserialize, Serialize};
 use std::convert::Infallible;
 use std::pin::Pin;
-use storage::{ActionRow, BlockRow};
+use storage::{ActionRow, BlockRow, DroppedRow};
 use tokio_stream::wrappers::BroadcastStream;
 use tokio_stream::wrappers::errors::BroadcastStreamRecvError;
 use utoipa::{IntoParams, ToSchema};
@@ -32,6 +32,15 @@ pub(super) struct StreamQuery {
     /// Replay from this height (inclusive) through the indexed tip, then
     /// follow live. Omit for live only.
     from_height: Option<u64>,
+}
+
+#[derive(Deserialize, IntoParams)]
+pub(super) struct DroppedStreamQuery {
+    /// Replay from this height (inclusive) through the indexed tip, then
+    /// follow live. Omit for live only.
+    from_height: Option<u64>,
+    /// Only rejections sent by this address.
+    address: Option<String>,
 }
 
 #[derive(Deserialize, IntoParams)]
@@ -120,6 +129,60 @@ pub(super) async fn stream_actions(
             .id(format!(
                 "{}:{}",
                 event.action.block_height, event.action.index_in_block
+            ))
+            .json_data(event)
+    })))
+}
+
+/// One `actions/dropped/stream` event: the rejection plus the timestamp of
+/// the block the producer was building when it refused the action, for the
+/// same reason `ActionEvent` carries one.
+#[derive(Serialize, ToSchema)]
+pub(super) struct DroppedEvent {
+    #[serde(flatten)]
+    pub dropped: DroppedRow,
+    pub block_timestamp: i64,
+}
+
+/// The tail of what the producer rejected — the feed an issuer's back office
+/// wants for "transfer refused, compliance reason X". Only a Retracer
+/// following the producing node sees rejections at all (see
+/// `dropped_actions`); on any other it is silent, not wrong.
+#[utoipa::path(get, path = "/v1/chains/{chain_id}/actions/dropped/stream", tag = "actions", params(("chain_id" = String, Path), DroppedStreamQuery), responses((status = 200, description = "`text/event-stream`, one `DroppedEvent` per event, `id` = `height:signature`", body = DroppedEvent, content_type = "text/event-stream"), (status = 404, body = super::ErrorBody)))]
+pub(super) async fn stream_dropped(
+    State(state): State<AppState>,
+    Path(chain_id): Path<String>,
+    Query(query): Query<DroppedStreamQuery>,
+) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, ApiError> {
+    let chain = state.chain(&chain_id)?;
+    if let (Some(address), Some(valid)) = (&query.address, &chain.address_validator)
+        && !valid(address)
+    {
+        return Err(ApiError::BadRequest(
+            "not a valid address for this chain".into(),
+        ));
+    }
+    let address = query.address;
+    let blocks = block_stream(&state, &chain_id, query.from_height).await?;
+    let dropped = blocks.flat_map(move |block| {
+        let block_timestamp = block.timestamp;
+        let address = address.clone();
+        stream::iter(
+            block
+                .dropped
+                .into_iter()
+                .filter(move |d| address.as_deref().is_none_or(|a| d.sender == a))
+                .map(move |dropped| DroppedEvent {
+                    dropped,
+                    block_timestamp,
+                }),
+        )
+    });
+    Ok(sse(dropped.map(|event| {
+        Event::default()
+            .id(format!(
+                "{}:{}",
+                event.dropped.block_height, event.dropped.signature
             ))
             .json_data(event)
     })))
@@ -282,6 +345,7 @@ mod tests {
                     payload: serde_json::json!({}),
                 })
                 .collect(),
+            dropped: Vec::new(),
         }
     }
 
@@ -395,5 +459,53 @@ mod tests {
         let text = std::str::from_utf8(&frame).unwrap();
         assert!(text.contains("id: 4:1\n"), "{text}");
         assert!(!text.contains("a-4-0"), "{text}");
+    }
+
+    /// One event per rejection, keyed `height:signature`, filtered by
+    /// sender; a block with nothing rejected emits nothing.
+    #[tokio::test]
+    async fn dropped_stream_emits_rejections_filtered_by_sender() {
+        let chain = rest_chain(ingestion::NetworkView::default());
+        let blocks_tx = chain.blocks_tx.clone();
+        let state = lazy_state(vec![chain]);
+        let app = crate::router(state.pool.clone(), state.chains.to_vec(), "0");
+
+        let resp = app
+            .oneshot(
+                Request::get("/v1/chains/test-chain/actions/dropped/stream?address=arx1issuer")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        assert_eq!(resp.headers()["content-type"], "text/event-stream");
+        blocks_tx.send(block(7, 1)).unwrap();
+        let mut b = block(8, 0);
+        b.dropped = vec![
+            DroppedRow {
+                block_height: 8,
+                signature: "0xaa".into(),
+                sender: "arx1other".into(),
+                reason: "nonce".into(),
+            },
+            DroppedRow {
+                block_height: 8,
+                signature: "0xbb".into(),
+                sender: "arx1issuer".into(),
+                reason: "compliance: jurisdiction".into(),
+            },
+        ];
+        blocks_tx.send(b).unwrap();
+        let mut frames = resp.into_body().into_data_stream();
+        let frame = frames.next().await.unwrap().unwrap();
+        let text = std::str::from_utf8(&frame).unwrap();
+        assert!(text.contains("id: 8:0xbb\n"), "{text}");
+        assert!(
+            text.contains("\"reason\":\"compliance: jurisdiction\""),
+            "{text}"
+        );
+        assert!(text.contains("\"block_timestamp\":1700000008"), "{text}");
+        assert!(!text.contains("0xaa"), "{text}");
     }
 }
