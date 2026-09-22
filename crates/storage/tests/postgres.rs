@@ -1175,7 +1175,7 @@ async fn webhooks_round_trip_cursor_and_failure_bookkeeping() {
         (41, true, None)
     );
     assert_eq!(
-        storage::list_webhooks(&pool, &chain)
+        storage::list_webhooks(&pool, &chain, None)
             .await
             .expect("list")
             .len(),
@@ -1193,7 +1193,9 @@ async fn webhooks_round_trip_cursor_and_failure_bookkeeping() {
     storage::webhook_failed(&pool, hook.id, "504", 200, 50)
         .await
         .expect("fail");
-    let h = &storage::list_webhooks(&pool, &chain).await.expect("list")[0];
+    let h = &storage::list_webhooks(&pool, &chain, None)
+        .await
+        .expect("list")[0];
     assert_eq!(
         (
             h.cursor_height,
@@ -1206,13 +1208,20 @@ async fn webhooks_round_trip_cursor_and_failure_bookkeeping() {
     storage::webhook_failed(&pool, hook.id, "504", 300, 150)
         .await
         .expect("fail");
-    assert!(!storage::list_webhooks(&pool, &chain).await.expect("list")[0].enabled);
+    assert!(
+        !storage::list_webhooks(&pool, &chain, None)
+            .await
+            .expect("list")[0]
+            .enabled
+    );
 
     // Success clears the clock; re-registering the same URL re-arms.
     storage::webhook_delivered(&pool, hook.id, 46)
         .await
         .expect("delivered");
-    let h = &storage::list_webhooks(&pool, &chain).await.expect("list")[0];
+    let h = &storage::list_webhooks(&pool, &chain, None)
+        .await
+        .expect("list")[0];
     assert_eq!(
         (h.failing_since, h.last_error.as_deref(), h.enabled),
         (None, None, false)
@@ -1234,13 +1243,109 @@ async fn webhooks_round_trip_cursor_and_failure_bookkeeping() {
     );
     assert_eq!(again.events, ["action"]);
 
+    // Owner scoping: a caller confined to an address sees and deletes
+    // only hooks filtered to it. `again` has no address now.
+    let scoped = storage::upsert_webhook(
+        &pool,
+        &chain,
+        "http://b/",
+        "secret-0123456789",
+        Some("arx1x"),
+        &events,
+        0,
+    )
+    .await
+    .expect("insert");
+    assert_eq!(
+        storage::list_webhooks(&pool, &chain, Some("arx1x"))
+            .await
+            .expect("list")
+            .iter()
+            .map(|h| h.id)
+            .collect::<Vec<_>>(),
+        [scoped.id]
+    );
     assert!(
-        storage::delete_webhook(&pool, &chain, hook.id)
+        !storage::delete_webhook(&pool, &chain, hook.id, Some("arx1x"))
             .await
             .expect("delete")
     );
     assert!(
-        !storage::delete_webhook(&pool, &chain, hook.id)
+        storage::delete_webhook(&pool, &chain, scoped.id, Some("arx1x"))
+            .await
+            .expect("delete")
+    );
+
+    assert!(
+        storage::delete_webhook(&pool, &chain, hook.id, None)
+            .await
+            .expect("delete")
+    );
+    assert!(
+        !storage::delete_webhook(&pool, &chain, hook.id, None)
+            .await
+            .expect("delete")
+    );
+}
+
+/// Keys are found by hash only while enabled, listed per chain, and deleted
+/// by id; the hash is unique.
+#[tokio::test]
+async fn api_keys_round_trip() {
+    let Some(pool) = pool().await else { return };
+    let chain = chain_id("api-keys");
+    storage::register_chain(&pool, &chain, None, "t", "s", 0)
+        .await
+        .expect("register chain");
+    let hash = format!("hash-{chain}");
+    let key = storage::insert_api_key(&pool, &chain, &hash, "issuer", "arx1x", Some(10))
+        .await
+        .expect("insert");
+    assert_eq!(
+        (key.address.as_str(), key.rps, key.enabled),
+        ("arx1x", Some(10), true)
+    );
+    assert!(
+        storage::insert_api_key(&pool, &chain, &hash, "dup", "arx1y", None)
+            .await
+            .is_err()
+    );
+    let found = storage::get_api_key_by_hash(&pool, &hash)
+        .await
+        .expect("lookup")
+        .expect("found");
+    assert_eq!(found.id, key.id);
+    assert!(
+        storage::get_api_key_by_hash(&pool, "nope")
+            .await
+            .expect("lookup")
+            .is_none()
+    );
+    assert_eq!(
+        storage::list_api_keys(&pool, &chain)
+            .await
+            .expect("list")
+            .len(),
+        1
+    );
+    sqlx::query("UPDATE api_keys SET enabled = FALSE WHERE id = $1")
+        .bind(key.id)
+        .execute(&pool)
+        .await
+        .expect("disable");
+    assert!(
+        storage::get_api_key_by_hash(&pool, &hash)
+            .await
+            .expect("lookup")
+            .is_none()
+    );
+    assert!(
+        storage::delete_api_key(&pool, &chain, key.id)
+            .await
+            .expect("delete")
+    );
+    assert!(
+        !storage::delete_api_key(&pool, &chain, key.id)
             .await
             .expect("delete")
     );

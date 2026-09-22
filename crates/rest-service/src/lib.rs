@@ -18,6 +18,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Json, Router};
 
+pub mod api_keys;
 mod sse;
 pub mod webhooks;
 use futures::stream::{self, StreamExt};
@@ -154,8 +155,6 @@ pub struct RestChain {
 #[derive(Clone)]
 struct AppState {
     pool: PgPool,
-    /// Webhook registration is allowed only behind `--auth-token`.
-    webhooks_writable: bool,
     chains: Arc<Vec<RestChain>>,
     known: Arc<HashSet<String>>,
     http: reqwest::Client,
@@ -207,20 +206,16 @@ impl AppState {
         sse::stream_blocks, sse::stream_actions, sse::stream_dropped,
         get_account, get_asset_holders, get_validator, list_attestors, list_dropped_actions,
         webhooks::register, webhooks::list, webhooks::remove,
+        api_keys::create, api_keys::list, api_keys::remove,
     ),
     tags(
         (name = "chains"), (name = "blocks"), (name = "actions"), (name = "accounts"),
-        (name = "validators"), (name = "search"), (name = "webhooks"), (name = "ops"),
+        (name = "validators"), (name = "search"), (name = "webhooks"), (name = "api-keys"), (name = "ops"),
     )
 )]
 struct ApiDoc;
 
-pub fn router(
-    pool: PgPool,
-    chains: Vec<RestChain>,
-    min_node_version: &'static str,
-    webhooks_writable: bool,
-) -> Router {
+pub fn router(pool: PgPool, chains: Vec<RestChain>, min_node_version: &'static str) -> Router {
     let known = chains.iter().map(|c| c.chain_id.clone()).collect();
     let http = reqwest::Client::builder()
         .timeout(NODE_RPC_TIMEOUT)
@@ -228,7 +223,6 @@ pub fn router(
         .expect("reqwest client with only a timeout set never fails to build");
     let state = AppState {
         pool,
-        webhooks_writable,
         chains: Arc::new(chains),
         known: Arc::new(known),
         http,
@@ -294,6 +288,7 @@ pub fn router(
         .route("/metrics", get(metrics))
         .route("/openapi.json", get(|| async { Json(ApiDoc::openapi()) }))
         .merge(webhooks::routes())
+        .merge(api_keys::routes())
         .merge(Redoc::with_url("/docs", ApiDoc::openapi()))
         .with_state(state)
 }
@@ -1494,7 +1489,6 @@ mod tests {
         AppState {
             known: Arc::new(chains.iter().map(|c| c.chain_id.clone()).collect()),
             pool,
-            webhooks_writable: false,
             chains: Arc::new(chains),
             http: reqwest::Client::new(),
             uptime_cache: Arc::new(UptimeCache::new()),

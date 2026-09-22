@@ -259,7 +259,8 @@ OPTIONS:
     --auth-token <token>           Shared secret required as \"Authorization: Bearer <token>\" on
                                    both API surfaces (/health and /ready stay open). Unset means
                                    both surfaces stay open to anyone who can reach them, and
-                                   webhook registration is refused.
+                                   webhook registration is refused. API keys minted with it
+                                   (POST /v1/chains/<id>/api-keys) are accepted as bearers too.
                                    [default: none] [env: RETRACER_AUTH_TOKEN]
     --rate-limit-rps <u32>         Per-IP request budget, both surfaces. Unset disables rate
                                    limiting.
@@ -756,9 +757,11 @@ impl Runner {
         if let Some(rps) = self.rate_limit_rps {
             validate_rate_limit_rps(rps, "with_rate_limit_rps")?;
         }
-        let webhooks_writable = self.auth_token.is_some();
-        let guard = auth::GuardConfig::new(self.auth_token, self.rate_limit_rps)
+        let mut guard = auth::GuardConfig::new(self.auth_token, self.rate_limit_rps)
             .with_trusted_proxies(self.trusted_proxies);
+        if guard.token.is_some() {
+            guard = guard.with_api_keys(self.read_pool.clone());
+        }
         if guard.is_active() {
             info!(
                 auth = guard.token.is_some(),
@@ -781,16 +784,12 @@ impl Runner {
         {
             let rest_addr = SocketAddr::new(self.rest_bind, self.rest_port);
             let listener = bind_listener(rest_addr, "REST").await?;
-            let router = rest_service::router(
-                self.read_pool.clone(),
-                self.rest_chains,
-                MIN_NODE_VERSION,
-                webhooks_writable,
-            )
-            .layer(axum::middleware::from_fn_with_state(
-                guard,
-                auth::rest_guard,
-            ));
+            let router =
+                rest_service::router(self.read_pool.clone(), self.rest_chains, MIN_NODE_VERSION)
+                    .layer(axum::middleware::from_fn_with_state(
+                        guard,
+                        auth::rest_guard,
+                    ));
             info!(%rest_addr, "REST listening");
             let service = router.into_make_service_with_connect_info::<SocketAddr>();
             let mut rest_stop = shutdown_rx.clone();

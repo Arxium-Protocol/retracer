@@ -399,7 +399,7 @@ mod tests {
         let chain = rest_chain(ingestion::NetworkView::default());
         let blocks_tx = chain.blocks_tx.clone();
         let state = lazy_state(vec![chain]);
-        let app = crate::router(state.pool.clone(), state.chains.to_vec(), "0", false);
+        let app = crate::router(state.pool.clone(), state.chains.to_vec(), "0");
 
         let resp = app
             .clone()
@@ -440,7 +440,7 @@ mod tests {
         let chain = rest_chain(ingestion::NetworkView::default());
         let blocks_tx = chain.blocks_tx.clone();
         let state = lazy_state(vec![chain]);
-        let app = crate::router(state.pool.clone(), state.chains.to_vec(), "0", false);
+        let app = crate::router(state.pool.clone(), state.chains.to_vec(), "0");
 
         let resp = app
             .oneshot(
@@ -468,7 +468,7 @@ mod tests {
         let chain = rest_chain(ingestion::NetworkView::default());
         let blocks_tx = chain.blocks_tx.clone();
         let state = lazy_state(vec![chain]);
-        let app = crate::router(state.pool.clone(), state.chains.to_vec(), "0", false);
+        let app = crate::router(state.pool.clone(), state.chains.to_vec(), "0");
 
         let resp = app
             .oneshot(

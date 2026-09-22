@@ -19,10 +19,11 @@
 //! The broadcast is a wake-up signal here, not the data path, so a lagged
 //! receiver is nothing to recover from: the next wake pages from the cursor.
 
+use super::api_keys::caller;
 use super::sse::{ActionEvent, DroppedEvent, action_matches_address};
 use super::{ApiError, ApiResult, AppState};
 use axum::extract::{Path, State};
-use axum::http::StatusCode;
+use axum::http::{Extensions, StatusCode};
 use axum::{Json, Router};
 use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
@@ -62,17 +63,29 @@ pub(super) struct RegisterWebhook {
 }
 
 /// Register a hook, or re-arm the one already at this URL (new secret and
-/// filter, enabled again, cursor reset). Requires `--auth-token`: anyone who
-/// can register a hook can make this process POST chain data anywhere, so
-/// an open API refuses with 403.
+/// filter, enabled again, cursor reset). Needs a caller: anyone who can
+/// register a hook can make this process POST chain data anywhere, so an
+/// open API refuses with 403. An API key may only register hooks for its
+/// own address (`address` defaults to it).
 #[utoipa::path(post, path = "/v1/chains/{chain_id}/webhooks", tag = "webhooks", params(("chain_id" = String, Path)), request_body = RegisterWebhook, responses((status = 201, body = WebhookRow), (status = 400, body = super::ErrorBody), (status = 403, body = super::ErrorBody), (status = 404, body = super::ErrorBody)))]
 pub(super) async fn register(
     State(state): State<AppState>,
     Path(chain_id): Path<String>,
-    Json(body): Json<RegisterWebhook>,
+    extensions: Extensions,
+    Json(mut body): Json<RegisterWebhook>,
 ) -> Result<(StatusCode, Json<WebhookRow>), ApiError> {
     let chain = state.chain(&chain_id)?;
-    require_writable(&state)?;
+    if let Some(scope) = caller(&extensions)?.scope(&chain_id)? {
+        match &body.address {
+            None => body.address = Some(scope.to_string()),
+            Some(a) if a == scope => {}
+            Some(_) => {
+                return Err(ApiError::Forbidden(format!(
+                    "this API key may only register webhooks for {scope}"
+                )));
+            }
+        }
+    }
     let url =
         reqwest::Url::parse(&body.url).map_err(|e| ApiError::BadRequest(format!("url: {e}")))?;
     if !matches!(url.scheme(), "http" | "https") {
@@ -126,33 +139,27 @@ pub(super) async fn register(
 pub(super) async fn list(
     State(state): State<AppState>,
     Path(chain_id): Path<String>,
+    extensions: Extensions,
 ) -> ApiResult<Vec<WebhookRow>> {
     state.chain(&chain_id)?;
-    require_writable(&state)?;
-    Ok(Json(storage::list_webhooks(&state.pool, &chain_id).await?))
+    let scope = caller(&extensions)?;
+    Ok(Json(
+        storage::list_webhooks(&state.pool, &chain_id, scope.scope(&chain_id)?).await?,
+    ))
 }
 
 #[utoipa::path(delete, path = "/v1/chains/{chain_id}/webhooks/{id}", tag = "webhooks", params(("chain_id" = String, Path), ("id" = i64, Path)), responses((status = 204), (status = 403, body = super::ErrorBody), (status = 404, body = super::ErrorBody)))]
 pub(super) async fn remove(
     State(state): State<AppState>,
     Path((chain_id, id)): Path<(String, i64)>,
+    extensions: Extensions,
 ) -> Result<StatusCode, ApiError> {
     state.chain(&chain_id)?;
-    require_writable(&state)?;
-    if storage::delete_webhook(&state.pool, &chain_id, id).await? {
+    let scope = caller(&extensions)?;
+    if storage::delete_webhook(&state.pool, &chain_id, id, scope.scope(&chain_id)?).await? {
         Ok(StatusCode::NO_CONTENT)
     } else {
         Err(ApiError::NotFound(format!("no webhook {id} on {chain_id}")))
-    }
-}
-
-fn require_writable(state: &AppState) -> Result<(), ApiError> {
-    if state.webhooks_writable {
-        Ok(())
-    } else {
-        Err(ApiError::Forbidden(
-            "webhooks need --auth-token: an open API must not be made to POST anywhere".into(),
-        ))
     }
 }
 
@@ -337,7 +344,7 @@ pub async fn dispatch(
         {
             return;
         }
-        let hooks = match storage::list_webhooks(&pool, &chain_id).await {
+        let hooks = match storage::list_webhooks(&pool, &chain_id, None).await {
             Ok(hooks) => hooks,
             Err(err) => {
                 tracing::warn!(%chain_id, %err, "webhooks: listing hooks failed");
@@ -391,6 +398,7 @@ pub async fn dispatch(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::api_keys::Caller;
     use crate::tests::{lazy_state, rest_chain};
     use axum::body::Body;
     use axum::http::Request;
@@ -492,7 +500,7 @@ mod tests {
     #[tokio::test]
     async fn registration_is_refused_without_auth() {
         let state = lazy_state(vec![rest_chain(ingestion::NetworkView::default())]);
-        let app = crate::router(state.pool.clone(), state.chains.to_vec(), "0", false);
+        let app = crate::router(state.pool.clone(), state.chains.to_vec(), "0");
         let resp = app
             .oneshot(
                 Request::post("/v1/chains/test-chain/webhooks")
@@ -507,12 +515,56 @@ mod tests {
         assert_eq!(resp.status(), 403);
     }
 
+    /// A key is confined to its address: another address is 403 before any
+    /// validation or Postgres; its own (or none, which defaults to it) gets
+    /// through to validation.
+    #[tokio::test]
+    async fn a_key_registers_only_for_its_own_address() {
+        let state = lazy_state(vec![rest_chain(ingestion::NetworkView::default())]);
+        let app = crate::router(state.pool.clone(), state.chains.to_vec(), "0");
+        let key = Caller::Key(storage::ApiKeyRow {
+            id: 1,
+            chain_id: "test-chain".into(),
+            key_hash: String::new(),
+            label: "issuer".into(),
+            address: "arx1issuer".into(),
+            rps: None,
+            enabled: true,
+            created_at: 0,
+        });
+        for (body, status) in [
+            (
+                r#"{"url":"http://r/","secret":"0123456789abcdef","address":"arx1other"}"#,
+                403,
+            ),
+            // Own address, bad secret: past the scope gate, into validation.
+            (
+                r#"{"url":"http://r/","secret":"short","address":"arx1issuer"}"#,
+                400,
+            ),
+            (r#"{"url":"http://r/","secret":"short"}"#, 400),
+        ] {
+            let resp = app
+                .clone()
+                .oneshot(
+                    Request::post("/v1/chains/test-chain/webhooks")
+                        .extension(key.clone())
+                        .header("content-type", "application/json")
+                        .body(Body::from(body))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), status, "{body}");
+        }
+    }
+
     /// Validation runs before Postgres is touched, so it is testable on the
     /// lazy pool.
     #[tokio::test]
     async fn registration_rejects_bad_input() {
         let state = lazy_state(vec![rest_chain(ingestion::NetworkView::default())]);
-        let app = crate::router(state.pool.clone(), state.chains.to_vec(), "0", true);
+        let app = crate::router(state.pool.clone(), state.chains.to_vec(), "0");
         for body in [
             r#"{"url":"ftp://receiver/","secret":"0123456789abcdef"}"#,
             r#"{"url":"http://receiver/","secret":"short"}"#,
@@ -522,6 +574,7 @@ mod tests {
                 .clone()
                 .oneshot(
                     Request::post("/v1/chains/test-chain/webhooks")
+                        .extension(Caller::Operator)
                         .header("content-type", "application/json")
                         .body(Body::from(body))
                         .unwrap(),
