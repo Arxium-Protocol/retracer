@@ -204,6 +204,13 @@ where
             }
         }
     }))
+    // Load-bearing, not cosmetic: axum's default emits an SSE comment every
+    // 15s, and a proxy in front of a client may close a connection that has
+    // been silent for ~100s (Cloudflare returns 524 at about that point).
+    // `actions/stream` on a quiet chain sends nothing for hours, so this
+    // heartbeat is the only thing keeping such a stream open through one.
+    // Raising the interval past ~90s would break idle streams behind a proxy
+    // while looking harmless here.
     .keep_alive(KeepAlive::default())
 }
 
