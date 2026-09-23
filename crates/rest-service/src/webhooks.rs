@@ -20,7 +20,7 @@
 //! receiver is nothing to recover from: the next wake pages from the cursor.
 
 use super::api_keys::caller;
-use super::sse::{ActionEvent, DroppedEvent, action_matches_address};
+use super::sse::{DroppedEvent, action_matches_address};
 use super::{ApiError, ApiResult, AppState};
 use axum::extract::{Path, State};
 use axum::http::{Extensions, StatusCode};
@@ -32,7 +32,7 @@ use sqlx::PgPool;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use storage::{BlockRow, WebhookRow};
+use storage::{ActionRow, BlockRow, WebhookRow};
 use tokio::sync::broadcast;
 use utoipa::ToSchema;
 
@@ -177,7 +177,7 @@ pub(super) fn routes() -> Router<AppState> {
 #[serde(tag = "event")]
 enum Delivery {
     #[serde(rename = "action")]
-    Action(ActionEvent),
+    Action(ActionRow),
     #[serde(rename = "dropped")]
     Dropped(DroppedEvent),
 }
@@ -185,7 +185,7 @@ enum Delivery {
 impl Delivery {
     fn id(&self) -> String {
         match self {
-            Delivery::Action(e) => format!("{}:{}", e.action.block_height, e.action.index_in_block),
+            Delivery::Action(a) => format!("{}:{}", a.block_height, a.index_in_block),
             Delivery::Dropped(e) => format!("{}:{}", e.dropped.block_height, e.dropped.signature),
         }
     }
@@ -213,12 +213,7 @@ fn deliveries(
                 .actions
                 .iter()
                 .filter(|a| address.is_none_or(|addr| action_matches_address(extractor, a, addr)))
-                .map(|a| {
-                    Delivery::Action(ActionEvent {
-                        action: a.clone(),
-                        block_timestamp: block.timestamp,
-                    })
-                }),
+                .map(|a| Delivery::Action(a.clone())),
         );
     }
     if hook.events.iter().any(|e| e == EVENT_DROPPED) {
@@ -437,6 +432,7 @@ mod tests {
                     kind: "Transfer".into(),
                     from_address: "arx1issuer".into(),
                     payload: serde_json::json!({}),
+                    block_timestamp: 1_700_000_009,
                 },
                 ActionRow {
                     action_hash: "a1".into(),
@@ -445,6 +441,7 @@ mod tests {
                     kind: "Transfer".into(),
                     from_address: "arx1other".into(),
                     payload: serde_json::json!({}),
+                    block_timestamp: 1_700_000_009,
                 },
             ],
             dropped: vec![DroppedRow {

@@ -276,6 +276,7 @@ curl "$C/blocks/1042"                                             # by height, o
 curl "$C/actions?limit=20&before_height=1042&before_index=0"      # next page of actions
 curl "$C/actions/<action_hash>"
 curl "$C/accounts/<address>/actions?role=to"                      # history where the address received
+curl "$C/accounts/<address>/actions?role=from,to"                 # sent and received, one page
 curl "$C/accounts/<address>"                                      # balance, nonce, holdings, stakes at tip
 curl "$C/accounts/<address>?at=1000"                              # the same as of block 1000
 curl "$C/assets/<asset>/holders?limit=100"                        # cap table, keyset-paged with after=
@@ -439,7 +440,11 @@ name = "Transfer"
 ```
 
 `GET /v1/chains/{chain}/accounts/{addr}/actions?role=to` now returns transfers
-*received* by that address, not just sent.
+*received* by that address, not just sent. `role` takes a comma-separated
+list (up to 8), so `role=from,to` is a wallet's whole Activity in one newest-first
+page, with a self-transfer listed once. Every action row, here and on every
+other endpoint and stream, carries `block_timestamp` (Unix seconds), so a
+dated history needs no per-block lookups.
 
 **Any other field** can be indexed for filtering:
 

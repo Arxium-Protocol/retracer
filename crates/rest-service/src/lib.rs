@@ -840,6 +840,8 @@ struct ActionPage {
     limit: Option<i64>,
     before_height: Option<i64>,
     before_index: Option<i32>,
+    /// Account history only: which roles, comma-separated (`from,to` for
+    /// sent and received in one page). Absent means `from`.
     role: Option<String>,
     kind: Option<String>,
     /// A projected payload path, `$.asset` — must be declared for `kind` in
@@ -964,6 +966,7 @@ async fn get_account_actions(
 ) -> ApiResult<Vec<storage::ActionRow>> {
     check_address(state.chain(&chain_id)?, &address)?;
     let limit = clamp_limit(page.limit)?;
+    let roles = parse_roles(page.role.as_deref())?;
     Ok(Json(
         storage::get_account_actions(
             &state.pool,
@@ -971,7 +974,7 @@ async fn get_account_actions(
             &address,
             limit,
             page.cursor()?,
-            page.role.as_deref(),
+            &roles,
         )
         .await?,
     ))
@@ -1608,6 +1611,29 @@ async fn search(
 /// Absent means the default page; zero or negative is a caller mistake worth
 /// reporting rather than silently reinterpreting, since a client computing a
 /// limit and arriving at 0 wants to know.
+/// Most roles one history request may merge. Each is one index walk, so this
+/// bounds the query, not the answer.
+const MAX_ROLES: usize = 8;
+
+/// `role=from,to` → `["from", "to"]`. Absent means sender history.
+fn parse_roles(role: Option<&str>) -> Result<Vec<&str>, ApiError> {
+    let Some(role) = role else {
+        return Ok(Vec::new());
+    };
+    let roles: Vec<&str> = role.split(',').map(str::trim).collect();
+    if roles.iter().any(|r| r.is_empty()) {
+        return Err(ApiError::BadRequest(
+            "role must be a comma-separated list of role names".into(),
+        ));
+    }
+    if roles.len() > MAX_ROLES {
+        return Err(ApiError::BadRequest(format!(
+            "at most {MAX_ROLES} roles per request"
+        )));
+    }
+    Ok(roles)
+}
+
 fn clamp_limit(limit: Option<i64>) -> Result<i64, ApiError> {
     match limit {
         None => Ok(MAX_PAGE_SIZE),
@@ -1623,6 +1649,20 @@ mod tests {
     use super::*;
     use std::convert::Infallible;
     use std::future::pending;
+
+    #[test]
+    fn roles_parse_as_a_list() {
+        assert_eq!(
+            parse_roles(None).ok(),
+            Some(vec![]),
+            "absent means sender history"
+        );
+        assert_eq!(parse_roles(Some("to")).ok(), Some(vec!["to"]));
+        assert_eq!(parse_roles(Some("from, to")).ok(), Some(vec!["from", "to"]));
+        assert!(parse_roles(Some("from,,to")).is_err());
+        assert!(parse_roles(Some("")).is_err());
+        assert!(parse_roles(Some(&["to"; MAX_ROLES + 1].join(","))).is_err());
+    }
     use std::time::Instant;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 

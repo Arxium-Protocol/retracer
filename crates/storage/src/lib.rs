@@ -246,8 +246,8 @@ pub async fn list_actions(
         None => String::new(),
     };
     let sql = format!(
-        "SELECT action_hash, block_height, index_in_block, kind, from_address, payload
-         FROM actions
+        "SELECT {ACTION_COLUMNS}
+         FROM actions a
          WHERE chain_id = $1
            AND ($2::BIGINT IS NULL
                 OR (block_height, index_in_block) < ($2::BIGINT, $3::INT))
@@ -1288,6 +1288,7 @@ pub fn block_row_from_wire<B: IndexableBlock>(block: &B) -> Result<BlockRow> {
                 kind,
                 from_address: action.sender(),
                 payload,
+                block_timestamp: block.timestamp() as i64,
             })
         })
         .collect::<Result<Vec<_>>>()?;
@@ -1326,7 +1327,17 @@ pub struct ActionRow {
     pub kind: String,
     pub from_address: String,
     pub payload: serde_json::Value,
+    /// Its block's timestamp, Unix seconds. An action has no time of its own,
+    /// and a client showing dated history would otherwise fetch every block
+    /// in the page after the page: one round trip per row.
+    pub block_timestamp: i64,
 }
+
+/// An action row's columns, `actions` aliased `a`. The timestamp is a lookup
+/// on `blocks`' primary key, so it costs one index probe per returned row
+/// (at most a page's worth) whatever the chain's length.
+const ACTION_COLUMNS: &str = "a.action_hash, a.block_height, a.index_in_block, a.kind, a.from_address, a.payload,
+       (SELECT b.timestamp FROM blocks b WHERE b.chain_id = a.chain_id AND b.height = a.block_height) AS block_timestamp";
 
 #[derive(Debug, Clone, serde::Serialize, utoipa::ToSchema)]
 pub struct BlockRow {
@@ -1375,10 +1386,10 @@ fn count_undecoded(actions: &[ActionRow]) -> usize {
 }
 
 async fn actions_for_block(pool: &PgPool, chain_id: &str, height: i64) -> Result<Vec<ActionRow>> {
-    Ok(sqlx::query_as::<_, ActionRow>(
-        "SELECT action_hash, block_height, index_in_block, kind, from_address, payload
-         FROM actions WHERE chain_id = $1 AND block_height = $2 ORDER BY index_in_block",
-    )
+    Ok(sqlx::query_as::<_, ActionRow>(&format!(
+        "SELECT {ACTION_COLUMNS}
+         FROM actions a WHERE chain_id = $1 AND block_height = $2 ORDER BY index_in_block"
+    ))
     .bind(chain_id)
     .bind(height)
     .fetch_all(pool)
@@ -1477,10 +1488,10 @@ pub async fn get_action_by_hash(
     action_hash: &str,
 ) -> Result<Option<ActionRow>> {
     let action_hash = canonicalize_hash(action_hash);
-    Ok(sqlx::query_as::<_, ActionRow>(
-        "SELECT action_hash, block_height, index_in_block, kind, from_address, payload
-         FROM actions WHERE chain_id = $1 AND action_hash = $2",
-    )
+    Ok(sqlx::query_as::<_, ActionRow>(&format!(
+        "SELECT {ACTION_COLUMNS}
+         FROM actions a WHERE chain_id = $1 AND action_hash = $2"
+    ))
     .bind(chain_id)
     .bind(&action_hash)
     .fetch_optional(pool)
@@ -1490,10 +1501,17 @@ pub async fn get_action_by_hash(
 /// Newest-first page of `address`'s action history — mirrors the node's own
 /// `GET /accounts/:address/actions` cursor shape (plan.md §5).
 ///
-/// `role` is `None`/`Some("from")` for the original sender-only history
-/// (unchanged, sourced from `account_actions`); any other role queries the
-/// Tier A `action_addresses` index instead (address-extraction plan §6) —
-/// e.g. `role = "to"` for "received".
+/// `roles` picks which history: `from` is the sender history (sourced from
+/// `account_actions`), any other role queries the Tier A `action_addresses`
+/// index (address-extraction plan §6), e.g. `to` for "received". Empty means
+/// `from`. Several roles are merged into one page, so a wallet asks for
+/// `["from", "to"]` once instead of twice and merging the pages itself.
+///
+/// Each role is its own branch that walks its index newest-first and stops at
+/// `limit`, and the branches are merged: a query over "any role" at once
+/// could not use the `(address, role, height)` index in order, and would read
+/// an address's whole history to sort it. `UNION` also drops the action a
+/// self-transfer puts in both `from` and `to`.
 ///
 /// Ordering carries an `index_in_block` tiebreak so two calls with the same
 /// arguments return the same order, and the cursor is a `(height, index)`
@@ -1505,49 +1523,60 @@ pub async fn get_account_actions(
     address: &str,
     limit: i64,
     before: Option<(i64, i32)>,
-    role: Option<&str>,
+    roles: &[&str],
 ) -> Result<Vec<ActionRow>> {
     let (before_height, before_index) = match before {
         Some((h, i)) => (Some(h), Some(i)),
         None => (None, None),
     };
-    match role {
-        None | Some("from") => Ok(sqlx::query_as(
-            "SELECT a.action_hash, a.block_height, a.index_in_block, a.kind, a.from_address, a.payload
-               FROM account_actions aa
-               JOIN actions a ON a.chain_id = aa.chain_id AND a.action_hash = aa.action_hash
-               WHERE aa.chain_id = $1 AND aa.address = $2
-                 AND ($3::BIGINT IS NULL
-                      OR (aa.block_height, a.index_in_block) < ($3::BIGINT, $4::INT))
-               ORDER BY aa.block_height DESC, a.index_in_block DESC
-               LIMIT $5",
-        )
+    let roles: &[&str] = if roles.is_empty() { &["from"] } else { roles };
+    // $1 chain, $2 address, $3/$4 cursor, $5 limit, then one bind per
+    // non-sender role. Role names are always bound, never interpolated.
+    let mut role_binds = Vec::new();
+    let branches: Vec<String> = roles
+        .iter()
+        .map(|&role| {
+            if role == "from" {
+                format!(
+                    "(SELECT {ACTION_COLUMNS}
+                        FROM account_actions aa
+                        JOIN actions a ON a.chain_id = aa.chain_id AND a.action_hash = aa.action_hash
+                       WHERE aa.chain_id = $1 AND aa.address = $2
+                         AND ($3::BIGINT IS NULL
+                              OR (aa.block_height, a.index_in_block) < ($3::BIGINT, $4::INT))
+                       ORDER BY aa.block_height DESC, a.index_in_block DESC
+                       LIMIT $5)"
+                )
+            } else {
+                role_binds.push(role);
+                let n = 5 + role_binds.len();
+                format!(
+                    "(SELECT {ACTION_COLUMNS}
+                        FROM action_addresses ad
+                        JOIN actions a ON a.chain_id = ad.chain_id AND a.action_hash = ad.action_hash
+                       WHERE ad.chain_id = $1 AND ad.address = $2 AND ad.role = ${n}
+                         AND ($3::BIGINT IS NULL
+                              OR (ad.block_height, a.index_in_block) < ($3::BIGINT, $4::INT))
+                       ORDER BY ad.block_height DESC, a.index_in_block DESC
+                       LIMIT $5)"
+                )
+            }
+        })
+        .collect();
+    let sql = format!(
+        "SELECT * FROM ({}) h ORDER BY block_height DESC, index_in_block DESC LIMIT $5",
+        branches.join(" UNION ")
+    );
+    let mut query = sqlx::query_as(&sql)
         .bind(chain_id)
         .bind(address)
         .bind(before_height)
         .bind(before_index)
-        .bind(limit)
-        .fetch_all(pool)
-        .await?),
-        Some(role) => Ok(sqlx::query_as(
-            "SELECT a.action_hash, a.block_height, a.index_in_block, a.kind, a.from_address, a.payload
-               FROM action_addresses ad
-               JOIN actions a ON a.chain_id = ad.chain_id AND a.action_hash = ad.action_hash
-               WHERE ad.chain_id = $1 AND ad.address = $2 AND ad.role = $3
-                 AND ($4::BIGINT IS NULL
-                      OR (ad.block_height, a.index_in_block) < ($4::BIGINT, $5::INT))
-               ORDER BY ad.block_height DESC, a.index_in_block DESC
-               LIMIT $6",
-        )
-        .bind(chain_id)
-        .bind(address)
-        .bind(role)
-        .bind(before_height)
-        .bind(before_index)
-        .bind(limit)
-        .fetch_all(pool)
-        .await?),
+        .bind(limit);
+    for role in role_binds {
+        query = query.bind(role);
     }
+    Ok(query.fetch_all(pool).await?)
 }
 
 /// The first block in which `address` appears in any role — as sender
@@ -2161,12 +2190,12 @@ pub async fn get_blocks_in_range(
     // One query for the whole page's actions. On this chain that is usually
     // zero rows — 8 actions across 207k heights — so the page cost is
     // dominated by the block rows, not the actions.
-    let actions: Vec<ActionRow> = sqlx::query_as(
-        "SELECT action_hash, block_height, index_in_block, kind, from_address, payload
-           FROM actions
+    let actions: Vec<ActionRow> = sqlx::query_as(&format!(
+        "SELECT {ACTION_COLUMNS}
+           FROM actions a
           WHERE chain_id = $1 AND block_height >= $2 AND block_height <= $3
-          ORDER BY block_height, index_in_block",
-    )
+          ORDER BY block_height, index_in_block"
+    ))
     .bind(chain_id)
     .bind(lo)
     .bind(hi)
