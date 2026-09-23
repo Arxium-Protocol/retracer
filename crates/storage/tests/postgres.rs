@@ -1171,6 +1171,61 @@ async fn state_reads_resolve_as_of_height() {
     );
 }
 
+#[tokio::test]
+async fn asset_audit_transfers_use_baseline_kinds_and_pre_transfer_state() {
+    let pool = skip_without_db!();
+    let chain = chain_id("audit-transfers");
+    let alice = addr(1);
+    let bob = addr(2);
+
+    for height in 0..=1i64 {
+        sqlx::query(
+            "INSERT INTO blocks (chain_id, height, hash, parent_hash, timestamp, round)
+             VALUES ($1, $2, $3, 'parent', $4, 0)",
+        )
+        .bind(&chain)
+        .bind(height)
+        .bind(format!("block-{height}"))
+        .bind(1_700_000_000 + height)
+        .execute(&pool)
+        .await
+        .expect("block");
+    }
+    for (holder, frozen) in [(&alice, true), (&bob, false)] {
+        sqlx::query(
+            "INSERT INTO asset_holder_states (chain_id, asset, holder, height, state)
+             VALUES ($1, 'gold', $2, 0, $3)",
+        )
+        .bind(&chain)
+        .bind(holder)
+        .bind(serde_json::json!({"frozen": frozen}))
+        .execute(&pool)
+        .await
+        .expect("holder state");
+    }
+    sqlx::query(
+        "INSERT INTO actions (chain_id, action_hash, block_height, index_in_block, kind, from_address, payload)
+         VALUES ($1, 'transfer', 1, 0, 'TransferAsset', $2, $3),
+                ($1, 'issue', 1, 1, 'IssueAsset', 'issuer', $3)",
+    )
+    .bind(&chain)
+    .bind(&alice)
+    .bind(serde_json::json!({"asset": "gold", "to": bob, "amount": "18446744073709551616"}))
+    .execute(&pool)
+    .await
+    .expect("actions");
+
+    let rows = storage::list_asset_audit_transfers(&pool, &chain, "gold")
+        .await
+        .expect("audit transfers");
+    assert_eq!(rows.len(), 1, "non-transfer asset actions are excluded");
+    assert_eq!(rows[0].from.as_deref(), Some(alice.as_str()));
+    assert_eq!(rows[0].to.as_deref(), Some(bob.as_str()));
+    assert_eq!(rows[0].amount.as_deref(), Some("18446744073709551616"));
+    assert_eq!(rows[0].from_state.as_ref().unwrap()["frozen"], true);
+    assert_eq!(rows[0].to_state.as_ref().unwrap()["frozen"], false);
+}
+
 /// Registration is an upsert keyed on URL that re-arms a disabled hook;
 /// the cursor moves only through `webhook_delivered`; `webhook_failed`
 /// starts the failing clock once and disables past the window.

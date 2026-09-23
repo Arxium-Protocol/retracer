@@ -1795,6 +1795,126 @@ pub struct HolderRow {
     pub jurisdiction: Option<String>,
 }
 
+/// One asset transfer suitable for an audit export. `from_state` and
+/// `to_state` are deliberately resolved at `block_height - 1`: the report
+/// records the compliance decision context that existed before the transfer,
+/// not a state change the transfer may itself have caused.
+#[derive(Debug, Clone, serde::Serialize, utoipa::ToSchema)]
+pub struct AuditTransferRow {
+    pub action_hash: String,
+    pub block_height: i64,
+    pub index_in_block: i32,
+    pub block_hash: String,
+    pub timestamp: i64,
+    pub kind: String,
+    pub from: Option<String>,
+    pub to: Option<String>,
+    pub amount: Option<String>,
+    #[schema(value_type = Option<Object>)]
+    pub from_state: Option<serde_json::Value>,
+    #[schema(value_type = Option<Object>)]
+    pub to_state: Option<serde_json::Value>,
+}
+
+/// The baseline asset-moving action kinds provided by CoreChain. A deployment
+/// with custom payloads can still use the generic action history; this audit
+/// export intentionally does not guess that a custom action moves an asset.
+pub const BASELINE_ASSET_TRANSFER_KINDS: [&str; 3] =
+    ["TransferAsset", "ForcedTransfer", "IssuerForcedTransfer"];
+
+/// Every baseline transfer of `asset`, oldest first. The action payload keeps
+/// the canonical amount text, avoiding a lossy numeric conversion for u128s.
+pub async fn list_asset_audit_transfers(
+    pool: &PgPool,
+    chain_id: &str,
+    asset: &str,
+) -> Result<Vec<AuditTransferRow>> {
+    let rows: Vec<(
+        String,
+        i64,
+        i32,
+        String,
+        i64,
+        String,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<serde_json::Value>,
+        Option<serde_json::Value>,
+    )> = sqlx::query_as(
+        "SELECT a.action_hash, a.block_height, a.index_in_block, b.hash, b.timestamp, a.kind,
+                CASE WHEN a.kind = 'TransferAsset' THEN a.from_address ELSE a.payload ->> 'from' END,
+                a.payload ->> 'to', a.payload ->> 'amount', from_state.state, to_state.state
+         FROM actions a
+         JOIN blocks b ON b.chain_id = a.chain_id AND b.height = a.block_height
+         LEFT JOIN LATERAL (
+             SELECT state FROM asset_holder_states
+             WHERE chain_id = a.chain_id AND asset = $2
+               AND holder = CASE WHEN a.kind = 'TransferAsset' THEN a.from_address ELSE a.payload ->> 'from' END
+               AND height < a.block_height
+             ORDER BY height DESC LIMIT 1
+         ) from_state ON TRUE
+         LEFT JOIN LATERAL (
+             SELECT state FROM asset_holder_states
+             WHERE chain_id = a.chain_id AND asset = $2 AND holder = a.payload ->> 'to'
+               AND height < a.block_height
+             ORDER BY height DESC LIMIT 1
+         ) to_state ON TRUE
+         WHERE a.chain_id = $1 AND a.kind = ANY($3)
+           AND a.payload ->> 'asset' = $2
+         ORDER BY a.block_height, a.index_in_block",
+    )
+    .bind(chain_id)
+    .bind(asset)
+    .bind(&BASELINE_ASSET_TRANSFER_KINDS[..])
+    .fetch_all(pool)
+    .await?;
+
+    Ok(rows
+        .into_iter()
+        .map(
+            |(
+                action_hash,
+                block_height,
+                index_in_block,
+                block_hash,
+                timestamp,
+                kind,
+                from,
+                to,
+                amount,
+                from_state,
+                to_state,
+            )| {
+                AuditTransferRow {
+                    action_hash,
+                    block_height,
+                    index_in_block,
+                    block_hash,
+                    timestamp,
+                    kind,
+                    from,
+                    to,
+                    amount,
+                    from_state,
+                    to_state,
+                }
+            },
+        )
+        .collect())
+}
+
+/// A complete holder snapshot for an audit export. Unlike the interactive
+/// holder endpoint this is unpaged so the exported artifact is self-contained.
+pub async fn list_asset_audit_holders(
+    pool: &PgPool,
+    chain_id: &str,
+    asset: &str,
+    at: i64,
+) -> Result<Vec<HolderRow>> {
+    get_asset_holders(pool, chain_id, asset, at, None, None, i64::MAX).await
+}
+
 /// A validator's current status, voting power in the newest epoch set that
 /// lists it, and every status change on record. `None` when neither table
 /// has heard of the address.

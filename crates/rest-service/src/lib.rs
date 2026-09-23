@@ -13,7 +13,7 @@
 
 use anyhow::Context;
 use axum::extract::{Path, Query, State};
-use axum::http::StatusCode;
+use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Json, Router};
@@ -23,6 +23,7 @@ mod sse;
 pub mod webhooks;
 use futures::stream::{self, StreamExt};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
@@ -204,7 +205,8 @@ impl AppState {
         get_account_actions, get_account_first_seen, list_proposers, get_validator_uptime, search,
         health, readiness, metrics,
         sse::stream_blocks, sse::stream_actions, sse::stream_dropped,
-        get_account, get_asset_holders, get_validator, list_attestors, list_dropped_actions,
+         get_account, get_asset_holders, get_validator, list_attestors, list_dropped_actions,
+         get_asset_audit_transfers, get_asset_audit_holders,
         webhooks::register, webhooks::list, webhooks::remove,
         api_keys::create, api_keys::list, api_keys::remove,
     ),
@@ -267,6 +269,14 @@ pub fn router(pool: PgPool, chains: Vec<RestChain>, min_node_version: &'static s
         .route(
             "/v1/chains/{chain_id}/assets/{asset}/holders",
             get(get_asset_holders),
+        )
+        .route(
+            "/v1/chains/{chain_id}/assets/{asset}/audit/transfers",
+            get(get_asset_audit_transfers),
+        )
+        .route(
+            "/v1/chains/{chain_id}/assets/{asset}/audit/holders",
+            get(get_asset_audit_holders),
         )
         .route(
             "/v1/chains/{chain_id}/validators/{address}",
@@ -1057,6 +1067,182 @@ async fn get_asset_holders(
     ))
 }
 
+// ---------------------------------------------------------------- audit exports
+
+#[derive(Deserialize, IntoParams)]
+struct AuditFormat {
+    /// `json` (default) or `csv`.
+    format: Option<String>,
+    /// Holder state as of this height; the indexed tip when absent. Only used
+    /// by the holder snapshot export.
+    at: Option<i64>,
+}
+
+#[derive(Clone, Copy)]
+enum ExportFormat {
+    Json,
+    Csv,
+}
+
+impl AuditFormat {
+    fn format(&self) -> Result<ExportFormat, ApiError> {
+        match self.format.as_deref().unwrap_or("json") {
+            "json" => Ok(ExportFormat::Json),
+            "csv" => Ok(ExportFormat::Csv),
+            _ => Err(ApiError::BadRequest("format must be json or csv".into())),
+        }
+    }
+}
+
+#[derive(Serialize, ToSchema)]
+struct AuditMetadata {
+    chain_id: String,
+    asset_ref: String,
+    /// Transfer kinds included in this baseline export.
+    baseline_transfer_kinds: Vec<&'static str>,
+    /// Snapshot height for holder exports; omitted for transfer history.
+    as_of_height: Option<i64>,
+}
+
+#[derive(Serialize, ToSchema)]
+struct AuditExport<T: Serialize> {
+    metadata: AuditMetadata,
+    records: Vec<T>,
+}
+
+fn csv_cell(value: &str) -> String {
+    format!("\"{}\"", value.replace('"', "\"\""))
+}
+
+fn audit_response(body: String, format: ExportFormat, filename: &str) -> Response {
+    let hash = hex::encode(Sha256::digest(body.as_bytes()));
+    let content_type = match format {
+        ExportFormat::Json => "application/json",
+        ExportFormat::Csv => "text/csv; charset=utf-8",
+    };
+    (
+        [
+            (header::CONTENT_TYPE, content_type),
+            (header::CONTENT_DISPOSITION, filename),
+            (
+                header::HeaderName::from_static("x-retracer-audit-sha256"),
+                hash.as_str(),
+            ),
+        ],
+        body,
+    )
+        .into_response()
+}
+
+#[utoipa::path(get, path = "/v1/chains/{chain_id}/assets/{asset}/audit/transfers", tag = "accounts", params(("chain_id" = String, Path), ("asset" = String, Path, description = "The asset's AssetRef"), AuditFormat), responses((status = 200, description = "Baseline asset transfers with compliance state as of H-1; JSON or CSV, with X-Retracer-Audit-SHA256", body = AuditExport<storage::AuditTransferRow>), (status = 400, body = ErrorBody), (status = 404, body = ErrorBody)))]
+async fn get_asset_audit_transfers(
+    State(state): State<AppState>,
+    Path((chain_id, asset)): Path<(String, String)>,
+    Query(query): Query<AuditFormat>,
+) -> Result<Response, ApiError> {
+    state.chain(&chain_id)?;
+    let format = query.format()?;
+    let records = storage::list_asset_audit_transfers(&state.pool, &chain_id, &asset).await?;
+    let metadata = AuditMetadata {
+        chain_id,
+        asset_ref: asset,
+        baseline_transfer_kinds: storage::BASELINE_ASSET_TRANSFER_KINDS.to_vec(),
+        as_of_height: None,
+    };
+    let body = match format {
+        ExportFormat::Json => serde_json::to_string(&AuditExport { metadata, records })
+            .map_err(anyhow::Error::from)?,
+        ExportFormat::Csv => {
+            let mut out = "action_hash,block_height,index_in_block,block_hash,timestamp,kind,from,to,amount,from_state_h_minus_1,to_state_h_minus_1\n".to_string();
+            for row in records {
+                let values = [
+                    row.action_hash,
+                    row.block_height.to_string(),
+                    row.index_in_block.to_string(),
+                    row.block_hash,
+                    row.timestamp.to_string(),
+                    row.kind,
+                    row.from.unwrap_or_default(),
+                    row.to.unwrap_or_default(),
+                    row.amount.unwrap_or_default(),
+                    row.from_state.map(|v| v.to_string()).unwrap_or_default(),
+                    row.to_state.map(|v| v.to_string()).unwrap_or_default(),
+                ];
+                out.push_str(
+                    &values
+                        .iter()
+                        .map(|value| csv_cell(value))
+                        .collect::<Vec<_>>()
+                        .join(","),
+                );
+                out.push('\n');
+            }
+            out
+        }
+    };
+    let filename = match format {
+        ExportFormat::Json => "attachment; filename=\"audit-transfers.json\"",
+        ExportFormat::Csv => "attachment; filename=\"audit-transfers.csv\"",
+    };
+    Ok(audit_response(body, format, filename))
+}
+
+#[utoipa::path(get, path = "/v1/chains/{chain_id}/assets/{asset}/audit/holders", tag = "accounts", params(("chain_id" = String, Path), ("asset" = String, Path, description = "The asset's AssetRef"), AuditFormat), responses((status = 200, description = "Complete holder snapshot; JSON or CSV, with X-Retracer-Audit-SHA256", body = AuditExport<storage::HolderRow>), (status = 400, body = ErrorBody), (status = 404, body = ErrorBody)))]
+async fn get_asset_audit_holders(
+    State(state): State<AppState>,
+    Path((chain_id, asset)): Path<(String, String)>,
+    Query(query): Query<AuditFormat>,
+) -> Result<Response, ApiError> {
+    state.chain(&chain_id)?;
+    let format = query.format()?;
+    // Resolve an omitted `at` to the cursor so the artifact identifies the
+    // exact snapshot it captured instead of merely saying "tip".
+    let at = match query.at {
+        Some(height) => AsOf { at: Some(height) }.height()?,
+        None => storage::get_cursor(&state.pool, &chain_id)
+            .await?
+            .unwrap_or(i64::MAX),
+    };
+    let records = storage::list_asset_audit_holders(&state.pool, &chain_id, &asset, at).await?;
+    let metadata = AuditMetadata {
+        chain_id,
+        asset_ref: asset,
+        baseline_transfer_kinds: storage::BASELINE_ASSET_TRANSFER_KINDS.to_vec(),
+        as_of_height: (at != i64::MAX).then_some(at),
+    };
+    let body = match format {
+        ExportFormat::Json => serde_json::to_string(&AuditExport { metadata, records })
+            .map_err(anyhow::Error::from)?,
+        ExportFormat::Csv => {
+            let mut out =
+                "holder,balance,balance_height,compliance_state,jurisdiction\n".to_string();
+            for row in records {
+                let values = [
+                    row.holder,
+                    row.balance,
+                    row.height.to_string(),
+                    row.state.map(|v| v.to_string()).unwrap_or_default(),
+                    row.jurisdiction.unwrap_or_default(),
+                ];
+                out.push_str(
+                    &values
+                        .iter()
+                        .map(|value| csv_cell(value))
+                        .collect::<Vec<_>>()
+                        .join(","),
+                );
+                out.push('\n');
+            }
+            out
+        }
+    };
+    let filename = match format {
+        ExportFormat::Json => "attachment; filename=\"audit-holders.json\"",
+        ExportFormat::Csv => "attachment; filename=\"audit-holders.csv\"",
+    };
+    Ok(audit_response(body, format, filename))
+}
+
 #[utoipa::path(get, path = "/v1/chains/{chain_id}/validators/{address}", tag = "validators", params(("chain_id" = String, Path), ("address" = String, Path)), responses((status = 200, description = "Current status, voting power in the newest set listing it, and every status change", body = storage::ValidatorRow), (status = 400, body = ErrorBody), (status = 404, description = "Unknown chain, or the address never had validator state", body = ErrorBody)))]
 async fn get_validator(
     State(state): State<AppState>,
@@ -1609,6 +1795,35 @@ mod tests {
         );
         assert!(clamp_limit(Some(0)).is_err());
         assert!(clamp_limit(Some(-1)).is_err());
+    }
+
+    #[test]
+    fn audit_format_and_csv_cells_are_unambiguous() {
+        assert!(matches!(
+            AuditFormat {
+                format: None,
+                at: None
+            }
+            .format(),
+            Ok(ExportFormat::Json)
+        ));
+        assert!(matches!(
+            AuditFormat {
+                format: Some("csv".into()),
+                at: None
+            }
+            .format(),
+            Ok(ExportFormat::Csv)
+        ));
+        assert!(
+            AuditFormat {
+                format: Some("xml".into()),
+                at: None
+            }
+            .format()
+            .is_err()
+        );
+        assert_eq!(csv_cell("a,\"b\""), "\"a,\"\"b\"\"\"");
     }
 
     #[test]

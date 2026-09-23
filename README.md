@@ -211,6 +211,8 @@ GET  /v1/chains/{chain}/validators/uptime?from=&to=
 
 GET  /v1/chains/{chain}/accounts/{address}?at=
 GET  /v1/chains/{chain}/assets/{asset}/holders?at=&jurisdiction=&after=&limit=
+GET  /v1/chains/{chain}/assets/{asset}/audit/transfers?format=json|csv
+GET  /v1/chains/{chain}/assets/{asset}/audit/holders?at=&format=json|csv
 GET  /v1/chains/{chain}/validators/{address}
 GET  /v1/chains/{chain}/attestors?at=
 GET  /v1/chains/{chain}/actions/dropped?sender=&before_height=&before_signature=&limit=
@@ -227,6 +229,13 @@ Amounts are decimal strings — the chain's u128 doesn't fit a JSON number.
 State is only as complete as the effects the node served: blocks indexed
 from a node older than the effects record have no state rows, and
 `dropped` is only ever populated by the producing node.
+
+The two asset audit exports are complete, deterministic records rather than
+paged explorer views. They return JSON by default or CSV with `format=csv`,
+set `Content-Disposition` for download, and include the SHA-256 of the exact
+response body in `X-Retracer-Audit-SHA256`. Transfer exports cover the baseline
+`TransferAsset`, `ForcedTransfer`, and `IssuerForcedTransfer` kinds and resolve
+each party's compliance state strictly before the transfer block (H-1).
 
 `/health` is process liveness only. `/ready` returns 200 when PostgreSQL
 answers within a fixed timeout — that is, when reads work — and 503 otherwise.
