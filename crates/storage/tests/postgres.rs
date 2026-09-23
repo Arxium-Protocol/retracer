@@ -474,7 +474,7 @@ async fn read_queries_return_what_was_written() {
     assert_eq!(full.actions.len(), 2);
 
     let sender_actions =
-        storage::get_account_actions(&pool, &chain, &addr(1).to_string(), 10, None, None)
+        storage::get_account_actions(&pool, &chain, &addr(1).to_string(), 10, None, &[])
             .await
             .expect("account actions");
     assert_eq!(sender_actions.len(), 1);
@@ -708,7 +708,7 @@ async fn kind_field_filter_and_reindex() {
         .expect("reindex again");
     assert_eq!(again, 0);
 
-    let received = storage::get_account_actions(&pool, &chain, &to, 10, None, Some("to"))
+    let received = storage::get_account_actions(&pool, &chain, &to, 10, None, &["to"])
         .await
         .expect("received");
     assert_eq!(received.len(), 2);
@@ -1427,5 +1427,105 @@ async fn api_keys_round_trip() {
         !storage::delete_api_key(&pool, &chain, key.id)
             .await
             .expect("delete")
+    );
+}
+
+/// A wallet's Activity: sent and received in one page, each row dated by its
+/// block, a self-transfer once, and the cursor walking the merged history.
+#[tokio::test]
+async fn account_history_merges_roles_and_dates_every_row() {
+    let pool = skip_without_db!();
+    let chain = chain_id("history");
+    let path = std::env::temp_dir().join(format!("retracer_history_{}.toml", std::process::id()));
+    std::fs::write(
+        &path,
+        r#"
+        [[kind]]
+        name = "Transfer"
+          [[kind.roles]]
+          path = "$.to"
+          role = "to"
+        "#,
+    )
+    .expect("write schema");
+    let extractor =
+        AddressExtractor::new(KindSchema::load(&path).expect("load schema"), Vec::new());
+
+    let me = addr(1);
+    let pay = |from: u8, sig: &str, to: String| {
+        action(from, Some(sig), TestPayload::Transfer { to, amount: 1 })
+    };
+    // h1: I send. h2: I receive, and an unrelated transfer. h3: to myself.
+    let b1 = block(1, "0x00", vec![pay(1, "sent", addr(2))]);
+    let b2 = block(
+        2,
+        &b1.hash(),
+        vec![pay(3, "unrelated", addr(4)), pay(2, "received", me.clone())],
+    );
+    let b3 = block(3, &b2.hash(), vec![pay(1, "self", me.clone())]);
+    for b in [&b1, &b2, &b3] {
+        storage::insert_block(&pool, &chain, b, &extractor)
+            .await
+            .expect("insert");
+    }
+
+    let page = |limit, before, roles: &'static [&'static str]| {
+        let (pool, chain, me) = (pool.clone(), chain.clone(), me.clone());
+        async move {
+            storage::get_account_actions(&pool, &chain, &me, limit, before, roles)
+                .await
+                .expect("history")
+        }
+    };
+    let hashes = |rows: &[storage::ActionRow]| {
+        rows.iter()
+            .map(|r| r.action_hash.clone())
+            .collect::<Vec<_>>()
+    };
+
+    let both = page(10, None, &["from", "to"]).await;
+    assert_eq!(
+        hashes(&both),
+        ["self", "received", "sent"],
+        "newest first, self-transfer once"
+    );
+    for row in &both {
+        assert_eq!(
+            row.block_timestamp,
+            1_700_000_000 + row.block_height,
+            "{} dated by its block",
+            row.action_hash
+        );
+    }
+
+    // Single roles are unchanged.
+    assert_eq!(hashes(&page(10, None, &[]).await), ["self", "sent"]);
+    assert_eq!(hashes(&page(10, None, &["to"]).await), ["self", "received"]);
+
+    // The cursor pages through the merged history without skips or repeats.
+    let first = page(2, None, &["from", "to"]).await;
+    assert_eq!(hashes(&first), ["self", "received"]);
+    let last = &first[1];
+    let rest = page(
+        2,
+        Some((last.block_height, last.index_in_block)),
+        &["from", "to"],
+    )
+    .await;
+    assert_eq!(hashes(&rest), ["sent"]);
+
+    // Every other read of an action carries the timestamp too.
+    let by_hash = storage::get_action_by_hash(&pool, &chain, "received")
+        .await
+        .expect("by hash")
+        .expect("found");
+    assert_eq!(by_hash.block_timestamp, 1_700_000_002);
+    let listed = storage::list_actions(&pool, &chain, 10, None, None)
+        .await
+        .expect("list");
+    assert!(
+        listed
+            .iter()
+            .all(|r| r.block_timestamp == 1_700_000_000 + r.block_height)
     );
 }

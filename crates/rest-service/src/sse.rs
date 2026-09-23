@@ -73,22 +73,11 @@ pub(super) async fn stream_blocks(
     })))
 }
 
-/// One `actions/stream` event: the action row plus the timestamp of the block
-/// it landed in, which the row itself does not carry and which a consumer
-/// turning actions into dated notifications needs — without it, the wallet
-/// would be back to tailing blocks just to learn the time.
-#[derive(Serialize, ToSchema)]
-pub(super) struct ActionEvent {
-    #[serde(flatten)]
-    pub action: ActionRow,
-    pub block_timestamp: i64,
-}
-
 /// The same tail as `blocks/stream`, flattened to one event per action. An
 /// empty block emits nothing, which is what makes this the right feed for a
 /// wallet backend that only reacts to actions: it no longer tails every
 /// block on the chain to find the few that carry one.
-#[utoipa::path(get, path = "/v1/chains/{chain_id}/actions/stream", tag = "actions", params(("chain_id" = String, Path), ActionStreamQuery), responses((status = 200, description = "`text/event-stream`, one `ActionEvent` per event, `id` = `height:index`", body = ActionEvent, content_type = "text/event-stream"), (status = 404, body = super::ErrorBody)))]
+#[utoipa::path(get, path = "/v1/chains/{chain_id}/actions/stream", tag = "actions", params(("chain_id" = String, Path), ActionStreamQuery), responses((status = 200, description = "`text/event-stream`, one `ActionRow` per event, `id` = `height:index`", body = ActionRow, content_type = "text/event-stream"), (status = 404, body = super::ErrorBody)))]
 pub(super) async fn stream_actions(
     State(state): State<AppState>,
     Path(chain_id): Path<String>,
@@ -105,38 +94,28 @@ pub(super) async fn stream_actions(
     let extractor = chain.address_extractor.clone();
     let address = query.address;
     let blocks = block_stream(&state, &chain_id, query.from_height).await?;
+    // Each row carries its block's timestamp, which a consumer turning actions
+    // into dated notifications needs; without it the wallet would be back to
+    // tailing blocks just to learn the time.
     let actions = blocks.flat_map(move |block| {
-        let block_timestamp = block.timestamp;
         let extractor = extractor.clone();
         let address = address.clone();
-        stream::iter(
-            block
-                .actions
-                .into_iter()
-                .filter(move |action| {
-                    address
-                        .as_deref()
-                        .is_none_or(|a| action_matches_address(&extractor, action, a))
-                })
-                .map(move |action| ActionEvent {
-                    action,
-                    block_timestamp,
-                }),
-        )
+        stream::iter(block.actions.into_iter().filter(move |action| {
+            address
+                .as_deref()
+                .is_none_or(|a| action_matches_address(&extractor, action, a))
+        }))
     });
-    Ok(sse(actions.map(|event| {
+    Ok(sse(actions.map(|action| {
         Event::default()
-            .id(format!(
-                "{}:{}",
-                event.action.block_height, event.action.index_in_block
-            ))
-            .json_data(event)
+            .id(format!("{}:{}", action.block_height, action.index_in_block))
+            .json_data(action)
     })))
 }
 
 /// One `actions/dropped/stream` event: the rejection plus the timestamp of
 /// the block the producer was building when it refused the action, for the
-/// same reason `ActionEvent` carries one.
+/// same reason an `ActionRow` carries one.
 #[derive(Serialize, ToSchema)]
 pub(super) struct DroppedEvent {
     #[serde(flatten)]
@@ -350,6 +329,7 @@ mod tests {
                     kind: "Transfer".into(),
                     from_address: "arx1from".into(),
                     payload: serde_json::json!({}),
+                    block_timestamp: 1_700_000_000 + height,
                 })
                 .collect(),
             dropped: Vec::new(),
