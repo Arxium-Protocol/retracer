@@ -1014,8 +1014,8 @@ async fn state_reads_resolve_as_of_height() {
             "holder_states": [{"asset": "gold", "holder": addr(1), "state": {"frozen": true}}],
             "stakes": [{"master": addr(1), "validator": addr(9), "allocation": null}],
             "validator_statuses": {addr(9): {"Jailed": {"until_epoch": 3}}},
-            "dropped": [{"signature": "d1", "sender": addr(2), "reason": "balance"},
-                        {"signature": "d2", "sender": addr(1), "reason": "sig"}],
+            "dropped": [{"signature": "d1", "sender": addr(2), "reason": "balance: gold"},
+                        {"signature": "d2", "sender": addr(1), "reason": "sig: silver"}],
         })),
     ];
     let mut parent = "0x0".to_string();
@@ -1118,14 +1118,14 @@ async fn state_reads_resolve_as_of_height() {
     );
 
     // Dropped: newest first, sender filter, keyset paging.
-    let all = storage::list_dropped_actions(&pool, &chain, None, None, 10)
+    let all = storage::list_dropped_actions(&pool, &chain, None, None, None, 10)
         .await
         .expect("dropped");
     assert_eq!(
         all.iter().map(|d| d.signature.as_str()).collect::<Vec<_>>(),
         ["d2", "d1", "d0"]
     );
-    let alice_only = storage::list_dropped_actions(&pool, &chain, Some(&addr(1)), None, 10)
+    let alice_only = storage::list_dropped_actions(&pool, &chain, Some(&addr(1)), None, None, 10)
         .await
         .expect("dropped");
     assert_eq!(
@@ -1135,7 +1135,7 @@ async fn state_reads_resolve_as_of_height() {
             .collect::<Vec<_>>(),
         ["d2", "d0"]
     );
-    let after_d2 = storage::list_dropped_actions(&pool, &chain, None, Some((1, "d2")), 10)
+    let after_d2 = storage::list_dropped_actions(&pool, &chain, None, None, Some((1, "d2")), 10)
         .await
         .expect("dropped");
     assert_eq!(
@@ -1144,6 +1144,30 @@ async fn state_reads_resolve_as_of_height() {
             .map(|d| d.signature.as_str())
             .collect::<Vec<_>>(),
         ["d1", "d0"]
+    );
+    let gold = storage::list_dropped_actions(&pool, &chain, None, Some("gold"), None, 10)
+        .await
+        .expect("dropped");
+    assert_eq!(
+        gold.iter()
+            .map(|d| d.signature.as_str())
+            .collect::<Vec<_>>(),
+        ["d1"],
+        "asset filtering is a reason text match"
+    );
+    let alice_silver = storage::list_dropped_actions(
+        &pool,
+        &chain,
+        Some(&addr(1)),
+        Some("silver"),
+        Some((1, "d2")),
+        10,
+    )
+    .await
+    .expect("dropped");
+    assert!(
+        alice_silver.is_empty(),
+        "asset filtering retains the sender and cursor constraints"
     );
 }
 

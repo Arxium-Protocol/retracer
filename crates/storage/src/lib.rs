@@ -1953,12 +1953,14 @@ pub struct ValidatorStatusChange {
     pub status: Option<serde_json::Value>,
 }
 
-/// Actions the producer rejected, newest first, optionally one sender's,
-/// keyset-paged on `(block_height, signature)` descending.
+/// Actions the producer rejected, newest first, optionally one sender's or
+/// reasons containing an asset text, keyset-paged on `(block_height, signature)`
+/// descending.
 pub async fn list_dropped_actions(
     pool: &PgPool,
     chain_id: &str,
     sender: Option<&str>,
+    asset: Option<&str>,
     before: Option<(i64, &str)>,
     limit: i64,
 ) -> Result<Vec<DroppedRow>> {
@@ -1966,12 +1968,14 @@ pub async fn list_dropped_actions(
     Ok(sqlx::query_as::<_, (i64, String, String, String)>(
         "SELECT block_height, signature, sender, reason FROM dropped_actions
          WHERE chain_id = $1
-           AND ($2::TEXT IS NULL OR sender = $2)
-           AND (block_height < $3 OR (block_height = $3 AND signature < $4))
-         ORDER BY block_height DESC, signature DESC LIMIT $5",
+            AND ($2::TEXT IS NULL OR sender = $2)
+            AND ($3::TEXT IS NULL OR reason LIKE '%' || $3 || '%')
+            AND (block_height < $4 OR (block_height = $4 AND signature < $5))
+         ORDER BY block_height DESC, signature DESC LIMIT $6",
     )
     .bind(chain_id)
     .bind(sender)
+    .bind(asset)
     .bind(before_height)
     .bind(before_sig)
     .bind(limit)

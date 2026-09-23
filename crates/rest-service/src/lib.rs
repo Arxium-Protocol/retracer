@@ -1085,6 +1085,10 @@ async fn list_attestors(
 struct DroppedPage {
     /// Only actions this address sent.
     sender: Option<String>,
+    /// Only reasons containing this asset text.
+    ///
+    /// ponytail: text match until ingestion adds an indexed asset column.
+    asset: Option<String>,
     limit: Option<i64>,
     before_height: Option<i64>,
     before_signature: Option<String>,
@@ -1115,6 +1119,7 @@ async fn list_dropped_actions(
             &state.pool,
             &chain_id,
             page.sender.as_deref(),
+            page.asset.as_deref(),
             before,
             limit,
         )
@@ -1456,6 +1461,17 @@ mod tests {
                 "{route} is not in the OpenAPI spec"
             );
         }
+    }
+
+    #[test]
+    fn dropped_actions_openapi_documents_optional_asset_filter() {
+        let spec = serde_json::to_value(ApiDoc::openapi()).expect("OpenAPI serializes");
+        let params = spec["paths"]["/v1/chains/{chain_id}/actions/dropped"]["get"]["parameters"]
+            .as_array()
+            .expect("dropped actions parameters");
+        assert!(params.iter().any(|param| {
+            param["name"] == "asset" && param["in"] == "query" && param["required"] == false
+        }));
     }
 
     pub(super) fn rest_chain(network_view: ingestion::NetworkView) -> RestChain {
