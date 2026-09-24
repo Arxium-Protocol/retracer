@@ -118,8 +118,8 @@ can also come from a `.env` file (copy `.env.example`) via
 | `--finality-depth` | `250` | Fallback rollback limit, used only when the node reports no finality |
 | `--write-pool-size` | `4` | Postgres connections for the writer |
 | `--read-pool-size` | `16` | Postgres connections for reads |
-| `--auth-token` | none | Shared secret required as `Authorization: Bearer <token>` on every request (`/health` and `/ready` stay open); API keys minted with it are accepted too. Unset = the API stays open, same as today, and webhook registration is refused |
-| `--rate-limit-rps` | none | Per-IP request budget; a key with its own `rps` is budgeted by key instead. Unset = no rate limiting |
+| `--auth-token` | none | Shared secret required as `Authorization: Bearer <token>` on every request (`/health` and `/ready` stay open). Unset = the API stays open, same as today, and webhook registration is refused |
+| `--rate-limit-rps` | none | Per-IP request budget. Unset = no rate limiting |
 | `--trusted-proxies` | none | Comma-separated IPs/CIDRs (e.g. `10.0.0.8,10.0.0.0/8`) whose `X-Forwarded-For` the limiter may believe. Unset = the socket peer is always the client; only set addresses you operate |
 | `--rest-bind` | `127.0.0.1` | Interface the API listens on |
 
@@ -350,9 +350,6 @@ Each delivery is one JSON body — the SSE event with an added
 | `X-Retracer-Timestamp` | unix seconds when sent |
 | `X-Retracer-Signature` | `sha256=` + hex HMAC-SHA256 of `"<timestamp>.<body>"` under the secret |
 
-An API key (below) may register hooks only for its own address — `address`
-defaults to it — and lists/deletes only those; the operator token sees all.
-
 Delivery is at-least-once, in chain order, one hook at a time: a hook's
 cursor (`cursor_height`) advances only once every event of a block answered
 2xx, so a receiver that is down is replayed from Postgres when it returns.
@@ -360,26 +357,6 @@ Failures back off up to a minute; after three days of continuous failure the
 hook is disabled (`enabled: false`, `last_error` says why) — re-`POST` it to
 re-arm. Rejections (`dropped`) are only known to a Retracer following the
 *producing* node.
-
-### API keys
-
-So more than one issuer can use a Retracer that has webhooks on it. A key is
-a second kind of bearer besides `--auth-token`, confined to one address on
-one chain — its webhooks, nothing else's — and optionally carrying its own
-request budget instead of the per-IP one. Keys are minted with the operator
-token only; there is no self-serve signup.
-
-```bash
-curl -s -X POST -H "Authorization: Bearer $TOKEN" -H 'content-type: application/json' \
-  localhost:8080/v1/chains/corechain-devnet/api-keys \
-  -d '{"label":"Acme back office","address":"arx1issuer...","rps":20}'
-# → {"id":1,"label":"Acme back office","address":"arx1issuer...","rps":20,...,"key":"rk_..."}
-```
-
-The `key` is shown once; only its SHA-256 is stored. `GET .../api-keys`
-lists them (no keys), `DELETE .../api-keys/{id}` revokes one. A revoked or
-unknown key is 401 like a wrong token. Keys are per chain: one used on
-another chain's routes is 403.
 
 ---
 

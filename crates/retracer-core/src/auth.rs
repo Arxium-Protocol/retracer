@@ -1,7 +1,5 @@
-//! Optional bearer-token auth and per-IP rate limiting for the REST surface,
-//! plus per-caller API keys (`rest_service::api_keys`): a bearer that is not
-//! the operator token is looked up as a key, and a key with its own `rps`
-//! is limited by key id rather than by IP. Off by default (`None` token / `None` rate limit), which
+//! Optional bearer-token auth and per-IP rate limiting for both the gRPC and
+//! REST surfaces. Off by default (`None` token / `None` rate limit), which
 //! preserves today's trusted-consumer behavior with zero config — this only
 //! changes anything when an operator opts in via `--auth-token`/
 //! `--rate-limit-rps` (or the matching env vars).
@@ -12,7 +10,6 @@
 //! second one — same shape, ported to axum middleware.
 
 use std::collections::HashMap;
-use std::hash::Hash;
 use std::net::IpAddr;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -21,7 +18,6 @@ use axum::extract::{ConnectInfo, Request, State};
 use axum::http::{StatusCode, header};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
-use rest_service::api_keys::Caller;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use subtle::ConstantTimeEq;
@@ -32,14 +28,14 @@ const RATE_LIMIT_WINDOW: Duration = Duration::from_secs(60);
 // enough that this map crosses the threshold on nearly every request.
 const RATE_LIMIT_SWEEP_THRESHOLD: usize = 10_000;
 
-/// Fixed-window request counter per key — an IP for anonymous callers, an
-/// API key id for keyed ones (each with its own budget).
-pub struct RateLimiter<K = IpAddr> {
+/// Fixed-window per-IP request counter, shared between the REST middleware
+/// and the gRPC interceptor.
+pub struct RateLimiter {
     max_per_window: u32,
-    hits: Mutex<HashMap<K, (Instant, u32)>>,
+    hits: Mutex<HashMap<IpAddr, (Instant, u32)>>,
 }
 
-impl<K: Hash + Eq + Copy> RateLimiter<K> {
+impl RateLimiter {
     pub fn new(max_per_window: u32) -> Self {
         RateLimiter {
             max_per_window,
@@ -47,12 +43,7 @@ impl<K: Hash + Eq + Copy> RateLimiter<K> {
         }
     }
 
-    pub fn allow(&self, key: K) -> bool {
-        self.allow_up_to(key, self.max_per_window)
-    }
-
-    /// `allow` with a budget chosen per call, for keys that carry their own.
-    pub fn allow_up_to(&self, ip: K, max_per_window: u32) -> bool {
+    pub fn allow(&self, ip: IpAddr) -> bool {
         let mut hits = self.hits.lock().unwrap_or_else(|e| e.into_inner());
         let now = Instant::now();
 
@@ -65,7 +56,7 @@ impl<K: Hash + Eq + Copy> RateLimiter<K> {
             *entry = (now, 0);
         }
         entry.1 += 1;
-        entry.1 <= max_per_window
+        entry.1 <= self.max_per_window
     }
 }
 
@@ -203,12 +194,6 @@ pub struct GuardConfig {
     pub token: Option<Arc<String>>,
     pub rate_limiter: Option<Arc<RateLimiter>>,
     pub trusted_proxies: Option<Arc<TrustedProxies>>,
-    /// Where API keys are looked up. `None` = only the operator token is a
-    /// valid bearer. Only meaningful with `token` set: keys are minted by
-    /// the operator, so an open API has none.
-    pub keys: Option<sqlx::PgPool>,
-    /// Budgets for keys that carry their own `rps`; the ceiling is per call.
-    pub key_limiter: Arc<RateLimiter<i64>>,
 }
 
 impl GuardConfig {
@@ -218,15 +203,7 @@ impl GuardConfig {
             rate_limiter: rate_limit_rps
                 .map(|rps| Arc::new(RateLimiter::new(rps.saturating_mul(60)))),
             trusted_proxies: None,
-            keys: None,
-            key_limiter: Arc::new(RateLimiter::new(0)),
         }
-    }
-
-    /// Accept API keys from this database besides the operator token.
-    pub fn with_api_keys(mut self, pool: sqlx::PgPool) -> Self {
-        self.keys = Some(pool);
-        self
     }
 
     /// Trust `X-Forwarded-For` from these proxies when attributing rate-limit
@@ -252,15 +229,10 @@ fn rate_limit_exempt(path: &str) -> bool {
 
 /// axum middleware. Both probes bypass authentication, but only `/health`
 /// bypasses rate limiting; repeated readiness checks still consume capacity.
-///
-/// With a token configured, every non-exempt request is either the operator
-/// (the token itself) or an API key; the resolved [`Caller`] rides in the
-/// request extensions for the handlers that are scoped by it. A key with
-/// its own `rps` is budgeted by key id; any other caller by IP as before.
 pub async fn rest_guard(
     State(guard): State<GuardConfig>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
-    mut req: Request,
+    req: Request,
     next: Next,
 ) -> Response {
     let path = req.uri().path();
@@ -274,36 +246,8 @@ pub async fn rest_guard(
             .headers()
             .get(header::AUTHORIZATION)
             .and_then(|v| v.to_str().ok());
-        let caller = if token_matches(token, header_value) {
-            Caller::Operator
-        } else {
-            let bearer = header_value.and_then(|v| v.strip_prefix("Bearer "));
-            match (bearer, &guard.keys) {
-                (Some(bearer), Some(pool)) => {
-                    match rest_service::api_keys::authenticate(pool, bearer).await {
-                        Ok(Some(caller)) => caller,
-                        Ok(None) => return StatusCode::UNAUTHORIZED.into_response(),
-                        Err(err) => {
-                            tracing::error!("API key lookup failed: {err:#}");
-                            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-                        }
-                    }
-                }
-                _ => return StatusCode::UNAUTHORIZED.into_response(),
-            }
-        };
-        if let Caller::Key(key) = &caller
-            && let Some(rps) = key.rps
-            && !guard
-                .key_limiter
-                .allow_up_to(key.id, (rps.max(0) as u32).saturating_mul(60))
-        {
-            return StatusCode::TOO_MANY_REQUESTS.into_response();
-        }
-        let keyed_budget = matches!(&caller, Caller::Key(k) if k.rps.is_some());
-        req.extensions_mut().insert(caller);
-        if keyed_budget {
-            return next.run(req).await;
+        if !token_matches(token, header_value) {
+            return StatusCode::UNAUTHORIZED.into_response();
         }
     }
     if let Some(limiter) = &guard.rate_limiter {
@@ -338,16 +282,6 @@ mod tests {
         assert!(limiter.allow(ip));
         assert!(limiter.allow(ip));
         assert!(!limiter.allow(ip));
-    }
-
-    /// Keyed budgets: each key id counts alone, against its own ceiling.
-    #[test]
-    fn key_limiter_budgets_each_key_separately() {
-        let limiter: RateLimiter<i64> = RateLimiter::new(0);
-        assert!(limiter.allow_up_to(1, 1));
-        assert!(!limiter.allow_up_to(1, 1));
-        assert!(limiter.allow_up_to(2, 3));
-        assert!(limiter.allow_up_to(2, 3));
     }
 
     #[test]
