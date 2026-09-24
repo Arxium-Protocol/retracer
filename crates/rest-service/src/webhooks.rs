@@ -106,7 +106,17 @@ pub(super) async fn register(
         .await?
         .unwrap_or(-1);
     let cursor = match body.from_height {
-        Some(from) => from as i64 - 1,
+        // Past the tip there is nothing to replay; a huge u64 would also wrap
+        // to a negative cursor.
+        Some(from) => match i64::try_from(from) {
+            Ok(from) if from <= tip + 1 => from - 1,
+            _ => {
+                return Err(ApiError::BadRequest(format!(
+                    "from_height must be at most {}, the next block",
+                    tip + 1
+                )));
+            }
+        },
         None => tip,
     };
     let row = storage::upsert_webhook(
@@ -274,35 +284,38 @@ async fn post(
     Ok(())
 }
 
-/// Everything one hook owes between its cursor and the tip. Stops at the
-/// first failed delivery, leaving the cursor on the last fully delivered
-/// block.
-async fn drain(
+/// One page of what a hook owes between its cursor and the tip. Stops at
+/// the first failed delivery, leaving the cursor on the last fully delivered
+/// block. `Ok(true)` means more is owed.
+async fn drain_page(
     pool: &PgPool,
     http: &reqwest::Client,
     chain_id: &str,
     extractor: &storage::AddressExtractor,
-    hook: &WebhookRow,
+    hook: &mut WebhookRow,
     tip: i64,
-) -> anyhow::Result<()> {
-    let mut next = hook.cursor_height + 1;
-    while next <= tip {
-        let page =
-            storage::get_blocks_in_range(pool, chain_id, next, tip, storage::BLOCK_PAGE).await?;
-        let Some(last) = page.last().map(|b| b.height) else {
-            return Ok(());
-        };
-        for block in &page {
-            for delivery in deliveries(hook, extractor, block) {
-                post(http, hook, chain_id, &delivery)
-                    .await
-                    .map_err(|e| e.context(format!("delivering {}", delivery.id())))?;
-            }
-            storage::webhook_delivered(pool, hook.id, block.height).await?;
+) -> anyhow::Result<bool> {
+    let page = storage::get_blocks_in_range(
+        pool,
+        chain_id,
+        hook.cursor_height + 1,
+        tip,
+        storage::BLOCK_PAGE,
+    )
+    .await?;
+    let Some(last) = page.last().map(|b| b.height) else {
+        return Ok(false);
+    };
+    for block in &page {
+        for delivery in deliveries(hook, extractor, block) {
+            post(http, hook, chain_id, &delivery)
+                .await
+                .map_err(|e| e.context(format!("delivering {}", delivery.id())))?;
         }
-        next = last + 1;
+        storage::webhook_delivered(pool, hook.id, block.height).await?;
+        hook.cursor_height = block.height;
     }
-    Ok(())
+    Ok(last < tip)
 }
 
 /// Per-chain delivery loop; runs until the block broadcast closes.
@@ -310,8 +323,9 @@ async fn drain(
 /// Hooks are delivered one after another on each wake. A receiver that
 /// times out costs the others at most `DELIVERY_TIMEOUT` per wake before it
 /// is backed off.
-// ponytail: sequential across hooks; give each hook its own task if one
-// chain ever carries enough hooks for a slow receiver to delay the rest.
+// ponytail: sequential across hooks, round-robin by page; give each hook its
+// own task if one chain ever carries enough hooks for a slow receiver to
+// delay the rest.
 pub async fn dispatch(
     pool: PgPool,
     chain_id: String,
@@ -332,7 +346,7 @@ pub async fn dispatch(
         {
             return;
         }
-        let hooks = match storage::list_webhooks(&pool, &chain_id).await {
+        let mut hooks = match storage::list_webhooks(&pool, &chain_id).await {
             Ok(hooks) => hooks,
             Err(err) => {
                 tracing::warn!(%chain_id, %err, "webhooks: listing hooks failed");
@@ -351,34 +365,45 @@ pub async fn dispatch(
             }
         };
         let now = Instant::now();
-        for hook in hooks.iter().filter(|h| h.enabled && h.cursor_height < tip) {
-            if backoff.get(&hook.id).is_some_and(|(_, until)| *until > now) {
-                continue;
-            }
-            match drain(&pool, &http, &chain_id, &extractor, hook, tip).await {
-                Ok(()) => {
-                    backoff.remove(&hook.id);
-                }
-                Err(err) => {
-                    let fails = backoff.get(&hook.id).map_or(0, |(n, _)| *n) + 1;
-                    let wait = (Duration::from_secs(1) * 2u32.saturating_pow(fails.min(6)))
-                        .min(MAX_BACKOFF);
-                    backoff.insert(hook.id, (fails, now + wait));
-                    tracing::warn!(%chain_id, hook = hook.id, url = %hook.url, retry_in = ?wait, "webhook delivery failed: {err:#}");
-                    let now_secs = now_secs();
-                    if let Err(err) = storage::webhook_failed(
-                        &pool,
-                        hook.id,
-                        &format!("{err:#}"),
-                        now_secs,
-                        now_secs - MAX_FAILING,
-                    )
-                    .await
-                    {
-                        tracing::warn!(%chain_id, hook = hook.id, %err, "webhooks: recording failure failed");
+        let mut pending: Vec<&mut WebhookRow> = hooks
+            .iter_mut()
+            .filter(|h| h.enabled && h.cursor_height < tip)
+            .filter(|h| backoff.get(&h.id).is_none_or(|(_, until)| *until <= now))
+            .collect();
+        // One page per hook per round, so a hook replaying from genesis
+        // shares the loop with the live ones instead of holding it.
+        while !pending.is_empty() {
+            let mut more = Vec::new();
+            for hook in pending {
+                match drain_page(&pool, &http, &chain_id, &extractor, hook, tip).await {
+                    Ok(owed) => {
+                        backoff.remove(&hook.id);
+                        if owed {
+                            more.push(hook);
+                        }
+                    }
+                    Err(err) => {
+                        let fails = backoff.get(&hook.id).map_or(0, |(n, _)| *n) + 1;
+                        let wait = (Duration::from_secs(1) * 2u32.saturating_pow(fails.min(6)))
+                            .min(MAX_BACKOFF);
+                        backoff.insert(hook.id, (fails, Instant::now() + wait));
+                        tracing::warn!(%chain_id, hook = hook.id, url = %hook.url, retry_in = ?wait, "webhook delivery failed: {err:#}");
+                        let now_secs = now_secs();
+                        if let Err(err) = storage::webhook_failed(
+                            &pool,
+                            hook.id,
+                            &format!("{err:#}"),
+                            now_secs,
+                            now_secs - MAX_FAILING,
+                        )
+                        .await
+                        {
+                            tracing::warn!(%chain_id, hook = hook.id, %err, "webhooks: recording failure failed");
+                        }
                     }
                 }
             }
+            pending = more;
         }
     }
 }
