@@ -2325,99 +2325,9 @@ pub async fn upsert_webhook(
     .await?)
 }
 
-/// `owner` = only hooks filtered to that address — what an API key scoped
-/// to it may see. `None` = every hook on the chain (the operator).
-pub async fn list_webhooks(
-    pool: &PgPool,
-    chain_id: &str,
-    owner: Option<&str>,
-) -> Result<Vec<WebhookRow>> {
+pub async fn list_webhooks(pool: &PgPool, chain_id: &str) -> Result<Vec<WebhookRow>> {
     Ok(sqlx::query_as(&format!(
-        "SELECT {WEBHOOK_COLUMNS} FROM webhooks
-          WHERE chain_id = $1 AND ($2::TEXT IS NULL OR address = $2)
-          ORDER BY id"
-    ))
-    .bind(chain_id)
-    .bind(owner)
-    .fetch_all(pool)
-    .await?)
-}
-
-/// `true` if a row was deleted. `owner` as in [`list_webhooks`]: a scoped
-/// caller cannot delete a hook it cannot see.
-pub async fn delete_webhook(
-    pool: &PgPool,
-    chain_id: &str,
-    id: i64,
-    owner: Option<&str>,
-) -> Result<bool> {
-    Ok(sqlx::query(
-        "DELETE FROM webhooks
-          WHERE chain_id = $1 AND id = $2 AND ($3::TEXT IS NULL OR address = $3)",
-    )
-    .bind(chain_id)
-    .bind(id)
-    .bind(owner)
-    .execute(pool)
-    .await?
-    .rows_affected()
-        > 0)
-}
-
-// ------------------------------------------------------------------ api keys
-
-/// An API key as `api_keys` stores it: the hash, never the key.
-#[derive(Debug, Clone, serde::Serialize, sqlx::FromRow, utoipa::ToSchema)]
-pub struct ApiKeyRow {
-    pub id: i64,
-    pub chain_id: String,
-    #[serde(skip)]
-    pub key_hash: String,
-    pub label: String,
-    /// The one address this key acts for.
-    pub address: String,
-    /// Own request budget, per second; `None` = the per-IP default.
-    pub rps: Option<i32>,
-    pub enabled: bool,
-    pub created_at: i64,
-}
-
-const API_KEY_COLUMNS: &str = "id, chain_id, key_hash, label, address, rps, enabled, created_at";
-
-pub async fn insert_api_key(
-    pool: &PgPool,
-    chain_id: &str,
-    key_hash: &str,
-    label: &str,
-    address: &str,
-    rps: Option<i32>,
-) -> Result<ApiKeyRow> {
-    Ok(sqlx::query_as(&format!(
-        "INSERT INTO api_keys (chain_id, key_hash, label, address, rps)
-         VALUES ($1, $2, $3, $4, $5) RETURNING {API_KEY_COLUMNS}"
-    ))
-    .bind(chain_id)
-    .bind(key_hash)
-    .bind(label)
-    .bind(address)
-    .bind(rps)
-    .fetch_one(pool)
-    .await?)
-}
-
-/// The enabled key with this hash, if any — the authentication lookup.
-pub async fn get_api_key_by_hash(pool: &PgPool, key_hash: &str) -> Result<Option<ApiKeyRow>> {
-    Ok(sqlx::query_as(&format!(
-        "SELECT {API_KEY_COLUMNS} FROM api_keys WHERE key_hash = $1 AND enabled"
-    ))
-    .bind(key_hash)
-    .fetch_optional(pool)
-    .await?)
-}
-
-pub async fn list_api_keys(pool: &PgPool, chain_id: &str) -> Result<Vec<ApiKeyRow>> {
-    Ok(sqlx::query_as(&format!(
-        "SELECT {API_KEY_COLUMNS} FROM api_keys WHERE chain_id = $1 ORDER BY id"
+        "SELECT {WEBHOOK_COLUMNS} FROM webhooks WHERE chain_id = $1 ORDER BY id"
     ))
     .bind(chain_id)
     .fetch_all(pool)
@@ -2425,9 +2335,9 @@ pub async fn list_api_keys(pool: &PgPool, chain_id: &str) -> Result<Vec<ApiKeyRo
 }
 
 /// `true` if a row was deleted.
-pub async fn delete_api_key(pool: &PgPool, chain_id: &str, id: i64) -> Result<bool> {
+pub async fn delete_webhook(pool: &PgPool, chain_id: &str, id: i64) -> Result<bool> {
     Ok(
-        sqlx::query("DELETE FROM api_keys WHERE chain_id = $1 AND id = $2")
+        sqlx::query("DELETE FROM webhooks WHERE chain_id = $1 AND id = $2")
             .bind(chain_id)
             .bind(id)
             .execute(pool)

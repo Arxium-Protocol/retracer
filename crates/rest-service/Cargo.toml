@@ -24,7 +24,6 @@ utoipa-redoc = { version = "6", features = ["axum"] }
 hmac = "0.12"
 sha2 = "0.10"
 hex = "0.4"
-rand = "0.8"
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["io-util", "net"] }

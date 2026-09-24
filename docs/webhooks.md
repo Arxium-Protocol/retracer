@@ -63,17 +63,10 @@ What is deliberately not here: a management UI, per-hook payload templates,
 a delivery log beyond `last_error`/`failing_since`, fan-out through a broker.
 Add each when someone asks for it.
 
-## Phase 3 — per-caller API keys (tenancy)
+## Tenancy lives in Retracer Cloud
 
-Implemented. One shared `--auth-token` meant every holder could list and
-delete every issuer's hooks. `api_keys` (`0008_api_keys.sql`): a key is a
-bearer confined to one address on one chain, SHA-256 stored, raw key shown
-once, minted by the operator token only. The guard
-(`retracer-core::auth::rest_guard`) resolves a bearer to a `Caller`
-(`Operator` | `Key`) in the request extensions; webhook handlers scope
-register/list/delete to the key's address; a key with `rps` is budgeted by
-key id, others by IP as before. Not asset-scoped on purpose: identity and
-budgets belong to a caller, and address scope already implies its assets.
-No cache on the key lookup (one indexed read per keyed request) — add a
-short TTL map if it ever shows in Postgres load.
-
+Per-caller API keys were built here (address-scoped hooks, per-key `rps`) and
+removed before release: the cloud gateway already owns keys, plans, budgets
+and usage, and two key systems are two things to secure. Hook management
+stays operator-only (`--auth-token`); the cloud will register hooks on an
+account's behalf once it can prove the account owns the watched address.
