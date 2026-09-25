@@ -18,6 +18,12 @@
 //!
 //! The broadcast is a wake-up signal here, not the data path, so a lagged
 //! receiver is nothing to recover from: the next wake pages from the cursor.
+//!
+//! On a chain whose node reports finality, delivery stops at the finalized
+//! height, so nothing a hook receives can be orphaned by a fork — an issuer
+//! acts on a refusal that will not be un-refused, and `height:index` ids stay
+//! unique. Without finality it runs to the indexed tip, and `rollback_to`
+//! rewinds the cursors of hooks that got ahead of a fork.
 
 use super::sse::{DroppedEvent, action_matches_address};
 use super::{ApiError, ApiResult, AppState};
@@ -32,7 +38,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use storage::{ActionRow, BlockRow, WebhookRow};
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, watch};
 use utoipa::ToSchema;
 
 const EVENT_ACTION: &str = "action";
@@ -312,10 +318,21 @@ async fn drain_page(
                 .await
                 .map_err(|e| e.context(format!("delivering {}", delivery.id())))?;
         }
-        storage::webhook_delivered(pool, hook.id, block.height).await?;
+        if !storage::webhook_delivered(pool, hook.id, block.height, &block.hash).await? {
+            // Rolled back mid-page; the next wake re-reads the cursor.
+            return Ok(false);
+        }
         hook.cursor_height = block.height;
     }
     Ok(last < tip)
+}
+
+/// How far hooks may be delivered: the indexed tip, capped at the node's
+/// finalized height when it reports one.
+fn deliverable_tip(indexed: i64, finalized: Option<u64>) -> i64 {
+    finalized.map_or(indexed, |f| {
+        indexed.min(i64::try_from(f).unwrap_or(i64::MAX))
+    })
 }
 
 /// Per-chain delivery loop; runs until the block broadcast closes.
@@ -331,6 +348,7 @@ pub async fn dispatch(
     chain_id: String,
     extractor: Arc<storage::AddressExtractor>,
     mut blocks: broadcast::Receiver<BlockRow>,
+    mut network: watch::Receiver<ingestion::NetworkView>,
 ) {
     let http = reqwest::Client::builder()
         .timeout(DELIVERY_TIMEOUT)
@@ -340,11 +358,18 @@ pub async fn dispatch(
     // process runs: a restart retries everything immediately, which is fine.
     let mut backoff: HashMap<i64, (u32, Instant)> = HashMap::new();
     loop {
-        // A block, a lag, or the idle tick: all mean "look at the cursors".
-        if let Ok(Err(broadcast::error::RecvError::Closed)) =
-            tokio::time::timeout(IDLE_WAKE, blocks.recv()).await
-        {
-            return;
+        // A block, a lag, new finality, or the idle tick: all mean "look at
+        // the cursors".
+        tokio::select! {
+            block = blocks.recv() => {
+                if let Err(broadcast::error::RecvError::Closed) = block {
+                    return;
+                }
+            }
+            // Once the sender is gone this branch is skipped (not spun on);
+            // the block broadcast decides when to stop.
+            Ok(()) = network.changed() => {}
+            _ = tokio::time::sleep(IDLE_WAKE) => {}
         }
         let mut hooks = match storage::list_webhooks(&pool, &chain_id).await {
             Ok(hooks) => hooks,
@@ -357,7 +382,7 @@ pub async fn dispatch(
             continue;
         }
         let tip = match storage::get_cursor(&pool, &chain_id).await {
-            Ok(Some(tip)) => tip,
+            Ok(Some(tip)) => deliverable_tip(tip, network.borrow().finalized_height),
             Ok(None) => continue,
             Err(err) => {
                 tracing::warn!(%chain_id, %err, "webhooks: reading tip failed");
@@ -472,6 +497,15 @@ mod tests {
 
     /// The filter and event selection match the SSE routes, and the ids are
     /// the SSE `id:`s so a receiver can dedupe across both.
+    #[test]
+    fn delivery_stops_at_finalized_height_when_the_node_reports_one() {
+        assert_eq!(deliverable_tip(10, None), 10);
+        assert_eq!(deliverable_tip(10, Some(7)), 7);
+        // Finality can run ahead of what is indexed; never deliver past that.
+        assert_eq!(deliverable_tip(10, Some(12)), 10);
+        assert_eq!(deliverable_tip(10, Some(u64::MAX)), 10);
+    }
+
     #[test]
     fn deliveries_follow_the_hooks_filter_in_stream_order() {
         let extractor = storage::AddressExtractor::tier_a_only(storage::KindSchema::empty());

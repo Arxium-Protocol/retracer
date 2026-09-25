@@ -709,6 +709,7 @@ impl Runner {
             config.chain_id.clone(),
             address_extractor.clone(),
             blocks_tx.subscribe(),
+            network_view.clone(),
         );
         self.tasks.push(tokio::spawn(async move {
             dispatch.await;

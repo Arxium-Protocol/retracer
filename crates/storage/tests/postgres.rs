@@ -1237,6 +1237,18 @@ async fn webhooks_round_trip_cursor_and_failure_bookkeeping() {
         .await
         .expect("register chain");
     let events = vec!["action".to_string(), "dropped".to_string()];
+    // The cursor only advances onto blocks that are still indexed.
+    let extractor = AddressExtractor::tier_a_only(KindSchema::empty());
+    let mut hashes = Vec::new();
+    let mut parent = "0x0".to_string();
+    for height in 0..3u64 {
+        let b = block(height, &parent, vec![]);
+        parent = b.hash();
+        hashes.push(parent.clone());
+        storage::insert_block(&pool, &chain, &b, &extractor)
+            .await
+            .expect("insert block");
+    }
 
     let hook = storage::upsert_webhook(
         &pool,
@@ -1245,13 +1257,13 @@ async fn webhooks_round_trip_cursor_and_failure_bookkeeping() {
         "secret-0123456789",
         Some("arx1x"),
         &events,
-        41,
+        0,
     )
     .await
     .expect("insert");
     assert_eq!(
         (hook.cursor_height, hook.enabled, hook.failing_since),
-        (41, true, None)
+        (0, true, None)
     );
     assert_eq!(
         storage::list_webhooks(&pool, &chain)
@@ -1261,9 +1273,11 @@ async fn webhooks_round_trip_cursor_and_failure_bookkeeping() {
         1
     );
 
-    storage::webhook_delivered(&pool, hook.id, 45)
-        .await
-        .expect("delivered");
+    assert!(
+        storage::webhook_delivered(&pool, hook.id, 1, &hashes[1])
+            .await
+            .expect("delivered")
+    );
     // First failure at t=100 starts the clock; a later one keeps it; one
     // whose window (`disable_before`) has passed the clock disables.
     storage::webhook_failed(&pool, hook.id, "503", 100, 0)
@@ -1280,7 +1294,7 @@ async fn webhooks_round_trip_cursor_and_failure_bookkeeping() {
             h.last_error.as_deref(),
             h.enabled
         ),
-        (45, Some(100), Some("504"), true)
+        (1, Some(100), Some("504"), true)
     );
     storage::webhook_failed(&pool, hook.id, "504", 300, 150)
         .await
@@ -1288,14 +1302,32 @@ async fn webhooks_round_trip_cursor_and_failure_bookkeeping() {
     assert!(!storage::list_webhooks(&pool, &chain).await.expect("list")[0].enabled);
 
     // Success clears the clock; re-registering the same URL re-arms.
-    storage::webhook_delivered(&pool, hook.id, 46)
-        .await
-        .expect("delivered");
+    assert!(
+        storage::webhook_delivered(&pool, hook.id, 2, &hashes[2])
+            .await
+            .expect("delivered")
+    );
     let h = &storage::list_webhooks(&pool, &chain).await.expect("list")[0];
     assert_eq!(
         (h.failing_since, h.last_error.as_deref(), h.enabled),
         (None, None, false)
     );
+
+    // A fork un-indexing height 2 rewinds the cursor, and a delivery of the
+    // orphaned block that finishes afterwards can't push it forward again.
+    storage::rollback_to(&pool, &chain, 1)
+        .await
+        .expect("rollback");
+    assert!(
+        !storage::webhook_delivered(&pool, hook.id, 2, &hashes[2])
+            .await
+            .expect("delivered")
+    );
+    assert_eq!(
+        storage::list_webhooks(&pool, &chain).await.expect("list")[0].cursor_height,
+        1
+    );
+
     let again = storage::upsert_webhook(
         &pool,
         &chain,

@@ -682,6 +682,23 @@ pub async fn rollback_to(pool: &PgPool, chain_id: &str, height: i64) -> Result<u
         .await?
         .rows_affected();
 
+    // Webhooks that already delivered orphaned heights must re-deliver the
+    // replacement blocks. After the blocks delete on purpose: a delivery that
+    // is still running holds a share lock on its block (see
+    // `webhook_delivered`), so this waits for it and then rewinds it too.
+    // Only reachable on a chain whose node reports no finality; otherwise
+    // delivery stops at the finalized height and never gets ahead of a fork.
+    // ponytail: receivers aren't told the orphaned events are gone, and
+    // replacement ids reuse `height:index`. Add a retraction event if such a
+    // chain ever carries webhooks that matter.
+    sqlx::query(
+        "UPDATE webhooks SET cursor_height = $2 WHERE chain_id = $1 AND cursor_height > $2",
+    )
+    .bind(chain_id)
+    .bind(height)
+    .execute(&mut *tx)
+    .await?;
+
     // A rollback past genesis means nothing is indexed any more, which is the
     // absence of a cursor rather than a cursor of -1 — `get_cursor`'s callers
     // distinguish "never ingested" from "at height 0", and writing a negative
@@ -2348,16 +2365,25 @@ pub async fn delete_webhook(pool: &PgPool, chain_id: &str, id: i64) -> Result<bo
 }
 
 /// A block fully delivered: advance the cursor and mark the hook healthy.
-pub async fn webhook_delivered(pool: &PgPool, id: i64, height: i64) -> Result<()> {
-    sqlx::query(
+/// `false` if a rollback removed the block while it was being delivered; the
+/// cursor stays where `rollback_to` put it.
+pub async fn webhook_delivered(pool: &PgPool, id: i64, height: i64, hash: &str) -> Result<bool> {
+    // FOR SHARE makes a concurrent `rollback_to` wait until this commits
+    // (then rewind the cursor itself), or this see the block already gone.
+    Ok(sqlx::query(
         "UPDATE webhooks SET cursor_height = $2, failing_since = NULL, last_error = NULL
-          WHERE id = $1",
+          WHERE id = $1 AND EXISTS (
+            SELECT 1 FROM blocks
+             WHERE chain_id = webhooks.chain_id AND height = $2 AND hash = $3
+               FOR SHARE)",
     )
     .bind(id)
     .bind(height)
+    .bind(hash)
     .execute(pool)
-    .await?;
-    Ok(())
+    .await?
+    .rows_affected()
+        > 0)
 }
 
 /// A delivery failed: keep the cursor, record why, start the failing clock

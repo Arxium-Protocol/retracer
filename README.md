@@ -339,6 +339,11 @@ curl -s -X POST -H "Authorization: Bearer $TOKEN" -H 'content-type: application/
   `DELETE .../webhooks/{id}` removes one. `POST` with an existing URL
   replaces its secret and filter and re-enables it.
 
+Only finalized blocks are delivered when the node reports finality (CoreChain
+does), so a receiver never acts on an event a fork later removes; events arrive
+about one status poll (~5s) after finality. On a chain without finality,
+delivery runs to the indexed tip and a fork re-delivers from the fork point.
+
 Each delivery is one JSON body — the SSE event with an added
 `"event": "action" | "dropped"` — and these headers:
 
