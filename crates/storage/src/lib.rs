@@ -1449,13 +1449,9 @@ pub async fn get_block_by_height(
 /// raw strings would make `/blocks/by-hash/AABB...` silently 404 against a
 /// block actually stored as `0xaabb...`.
 ///
-/// `actions.action_hash` is usually a hex signature the same way, but not
-/// always: an unsigned/system-injected action has no signature to key on,
-/// so `insert_block` falls back to `"{height}:{index}"` (see its
-/// `identity()` comment) — not a hash at all, and never subject to this
-/// case/prefix ambiguity. Only a value that actually decodes as hex is
-/// normalized; anything else (including that fallback) passes through
-/// untouched, so a positional identity still matches itself exactly.
+/// Action signatures can be stored as bare hex (CoreChain's `hex::encode`)
+/// or prefixed hex. Action lookups try both stored forms below. Positional
+/// identities (`"{height}:{index}"`) are not hex and remain untouched.
 fn canonicalize_hash(hash: &str) -> String {
     let hex = hash
         .strip_prefix("0x")
@@ -1466,6 +1462,19 @@ fn canonicalize_hash(hash: &str) -> String {
     } else {
         hash.to_string()
     }
+}
+
+// Blocks are always stored with 0x; CoreChain action signatures are stored
+// without it. Keep the prefixed form as a second candidate for other chains
+// and existing rows, while leaving positional identities unchanged.
+fn action_lookup_keys(hash: &str) -> (String, String) {
+    let canonical = canonicalize_hash(hash);
+    let bare = canonical
+        .strip_prefix("0x")
+        .filter(|hex| !hex.is_empty() && hex.bytes().all(|b| b.is_ascii_hexdigit()))
+        .unwrap_or(&canonical)
+        .to_string();
+    (bare, canonical)
 }
 
 pub async fn get_block_by_hash(
@@ -1504,13 +1513,15 @@ pub async fn get_action_by_hash(
     chain_id: &str,
     action_hash: &str,
 ) -> Result<Option<ActionRow>> {
-    let action_hash = canonicalize_hash(action_hash);
+    let (bare, canonical) = action_lookup_keys(action_hash);
     Ok(sqlx::query_as::<_, ActionRow>(&format!(
         "SELECT {ACTION_COLUMNS}
-         FROM actions a WHERE chain_id = $1 AND action_hash = $2"
+         FROM actions a WHERE chain_id = $1 AND action_hash IN ($2, $3)
+         ORDER BY (action_hash = $2) DESC LIMIT 1"
     ))
     .bind(chain_id)
-    .bind(&action_hash)
+    .bind(&bare)
+    .bind(&canonical)
     .fetch_optional(pool)
     .await?)
 }
@@ -2416,6 +2427,21 @@ pub async fn webhook_failed(
 mod tests {
     use super::*;
     use crate::testing::{TestAction, TestBlock};
+
+    #[test]
+    fn action_lookup_accepts_bare_and_prefixed_signatures() {
+        for hash in ["deadbeef", "0xdeadbeef", "0XDEADBEEF"] {
+            assert_eq!(
+                action_lookup_keys(hash),
+                ("deadbeef".into(), "0xdeadbeef".into())
+            );
+        }
+        assert_eq!(action_lookup_keys("1:2"), ("1:2".into(), "1:2".into()));
+        assert_eq!(
+            action_lookup_keys("0x1:2"),
+            ("0x1:2".into(), "0x1:2".into())
+        );
+    }
 
     fn action(signature: Option<&str>) -> TestAction {
         TestAction {

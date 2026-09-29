@@ -763,11 +763,9 @@ async fn kind_field_filter_and_reindex() {
     std::fs::remove_file(&path).ok();
 }
 
-/// `get_block_by_hash`/`get_action_by_hash` normalize the lookup argument
-/// before querying (see `canonicalize_hash`), so a differently cased or
-/// `0x`-less query still finds a value stored canonically — true for a
-/// block hash (always `block.hash()`'s output) and for a signed action's
-/// hash (its signature, always `hex::encode`'s lowercase output). An
+/// `get_block_by_hash` normalizes the lookup argument to prefixed hex;
+/// `get_action_by_hash` accepts both bare signatures produced by CoreChain
+/// and prefixed signatures. An
 /// unsigned action's positional `"{height}:{index}"` identity is not a hash
 /// and must still match itself byte-for-byte — normalization must not touch it.
 #[tokio::test]
@@ -787,6 +785,7 @@ async fn by_hash_lookups_ignore_case_and_prefix_but_leave_non_hex_identities_alo
         vec![
             action(1, Some("0xabcdef"), TestPayload::Noop),
             action(2, None, TestPayload::Noop),
+            action(3, Some("deadbeef"), TestPayload::Noop),
         ],
     );
     storage::insert_block(&pool, &chain, &b1, &extractor)
@@ -830,6 +829,16 @@ async fn by_hash_lookups_ignore_case_and_prefix_but_leave_non_hex_identities_alo
         .expect("query")
         .expect("signed action present without an explicit 0x prefix");
     assert_eq!(signed_no_prefix.action_hash, "0xabcdef");
+
+    // CoreChain signs with `hex::encode`, so the action list contains bare
+    // hashes. Both list links and pasted prefixed hashes must resolve.
+    for hash in ["deadbeef", "0xdeadbeef", "0XDEADBEEF"] {
+        let action = storage::get_action_by_hash(&pool, &chain, hash)
+            .await
+            .expect("query")
+            .expect("bare signature present");
+        assert_eq!(action.action_hash, "deadbeef");
+    }
 
     // The unsigned action's positional identity is "1:1" — not hex, so it
     // must be looked up byte-for-byte, and a case/prefix change to it is a
