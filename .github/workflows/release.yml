@@ -178,10 +178,13 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends protobuf-compiler
 
+      # x86-64-v2, not the runner's CPU, so the binary runs on the devnet's
+      # Haswell hosts (no ADX). Same flags as arxd's release (Trello A-33).
       - name: Build retracerd (release)
         shell: bash
         env:
           RETRACER_VERSION: ${{ github.ref_name }}
+          RUSTFLAGS: -C target-cpu=x86-64-v2
         run: cargo build --release --locked -p retracerd
 
       - name: Package binary
