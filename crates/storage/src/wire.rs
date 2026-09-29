@@ -85,6 +85,11 @@ pub struct BlockEffects {
     pub attestor_deregistrations: Vec<String>,
     #[serde(default)]
     pub dropped: Vec<DroppedEffect>,
+    /// Not from the node's effects record: heights the RPC reader confirmed
+    /// (`GET /blocks/{h}` → `settlement: "disputed"`) lost an execution
+    /// dispute this block adjudicated. See `ingestion::rpc`.
+    #[serde(default)]
+    pub disputed_blocks: Vec<u64>,
 }
 
 #[derive(Clone, Debug, serde::Deserialize)]

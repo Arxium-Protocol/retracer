@@ -1456,3 +1456,45 @@ async fn account_history_merges_roles_and_dates_every_row() {
             .all(|r| r.block_timestamp == 1_700_000_000 + r.block_height)
     );
 }
+
+/// `disputed_blocks` on a later block's effects flags the earlier block, and
+/// every read path carries the flag.
+#[tokio::test]
+async fn disputed_blocks_flag_the_earlier_block() {
+    let pool = skip_without_db!();
+    let chain = chain_id("disputed");
+    let extractor = AddressExtractor::tier_a_only(KindSchema::empty());
+
+    let b0 = block(0, "0x0", vec![]);
+    storage::insert_block(&pool, &chain, &b0, &extractor)
+        .await
+        .expect("genesis");
+    let mut b1 = block(1, &b0.hash(), vec![]);
+    b1.effects = Some(
+        serde_json::from_value(serde_json::json!({"height": 1, "disputed_blocks": [0]}))
+            .expect("effects decode"),
+    );
+    storage::insert_block(&pool, &chain, &b1, &extractor)
+        .await
+        .expect("block 1");
+
+    let summaries = storage::list_blocks(&pool, &chain, 10, None)
+        .await
+        .expect("list_blocks");
+    assert_eq!(
+        summaries
+            .iter()
+            .map(|b| (b.height, b.disputed))
+            .collect::<Vec<_>>(),
+        vec![(1, false), (0, true)]
+    );
+    let row = storage::get_block_by_height(&pool, &chain, 0)
+        .await
+        .expect("get_block_by_height")
+        .expect("block 0");
+    assert!(row.disputed);
+    let range = storage::get_blocks_in_range(&pool, &chain, 0, 1, 10)
+        .await
+        .expect("get_blocks_in_range");
+    assert!(range[0].disputed && !range[1].disputed);
+}
