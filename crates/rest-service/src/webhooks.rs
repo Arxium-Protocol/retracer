@@ -466,6 +466,8 @@ mod tests {
             timestamp: 1_700_000_009,
             proposer: None,
             undecoded_action_count: 0,
+            settlement: None,
+            disputed: false,
             actions: vec![
                 ActionRow {
                     action_hash: "a0".into(),

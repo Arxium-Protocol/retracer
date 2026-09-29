@@ -321,6 +321,8 @@ mod tests {
             timestamp: 1_700_000_000 + height,
             proposer: None,
             undecoded_action_count: 0,
+            settlement: None,
+            disputed: false,
             actions: (0..actions as i32)
                 .map(|index_in_block| ActionRow {
                     action_hash: format!("a-{height}-{index_in_block}"),

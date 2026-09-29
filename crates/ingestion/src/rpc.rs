@@ -48,6 +48,10 @@ struct Status {
     version: Option<String>,
     tip_height: u64,
     finalized_height: Option<u64>,
+    #[serde(default)]
+    final_watermark: Option<u64>,
+    #[serde(default)]
+    settled_height: Option<u64>,
 }
 
 struct Client {
@@ -107,6 +111,44 @@ fn check_version(status: &Status) -> Result<()> {
     Ok(())
 }
 
+/// Heights this block's effects record an upheld execution dispute against
+/// (an `evidence` entry whose `disputed` header is set) that the node
+/// confirms are the kept block — `settlement: "disputed"`. Asked rather
+/// than assumed: the dispute names a header, and the culprit's block at that
+/// height is often one the chain never kept (Arxium Trello 179). Rare — one
+/// request per upheld dispute — and retried until the node answers, since a
+/// dispute missed here is never looked at again. A pruned block (404) can't
+/// be confirmed and is skipped.
+async fn confirmed_disputes(client: &Client, effects: &serde_json::Value) -> Vec<u64> {
+    let heights = effects["evidence"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|e| !e["disputed"].is_null())
+        .filter_map(|e| e["height"].as_u64());
+    let mut confirmed = Vec::new();
+    for height in heights {
+        let block = loop {
+            match client
+                .get_optional::<serde_json::Value>(&format!("/blocks/{height}"))
+                .await
+            {
+                Ok(block) => break block,
+                Err(err) => {
+                    warn!(height, "disputed block unavailable: {err:#}");
+                    tokio::time::sleep(ERROR_BACKOFF).await;
+                }
+            }
+        };
+        match block {
+            Some(block) if block["settlement"] == "disputed" => confirmed.push(height),
+            Some(_) => {}
+            None => warn!(height, "disputed block pruned by the node; not flagged"),
+        }
+    }
+    confirmed
+}
+
 pub async fn run<B>(
     config: RpcConfig,
     block_tx: Sender<B>,
@@ -154,6 +196,8 @@ where
             status_peer_count: 1,
             tip_height: Some(status.tip_height),
             finalized_height: status.finalized_height,
+            final_watermark: status.final_watermark,
+            settled_height: status.settled_height,
             last_status_at: Some(Instant::now()),
         });
 
@@ -210,7 +254,11 @@ where
                 "node returned height {height}, expected {next}"
             );
             match effects_by_height.remove(&height) {
-                Some(effects) => block.set_effects(effects)?,
+                Some(mut effects) => {
+                    let disputed = confirmed_disputes(&client, &effects).await;
+                    effects["disputed_blocks"] = disputed.into();
+                    block.set_effects(effects)?
+                }
                 None if !missing_effects_warned => {
                     warn!(
                         height,
@@ -362,6 +410,8 @@ mod tests {
             version: v.map(str::to_owned),
             tip_height: 0,
             finalized_height: None,
+            final_watermark: None,
+            settled_height: None,
         };
         assert!(check_version(&status(None)).is_err());
         assert!(check_version(&status(Some("0.1.0"))).is_err());

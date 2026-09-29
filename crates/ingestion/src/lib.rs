@@ -44,6 +44,11 @@ pub struct NetworkView {
     /// Highest height the node holds a finality certificate for. `None` on a
     /// chain that doesn't run finality voting, or before the node answers.
     pub finalized_height: Option<u64>,
+    /// Contiguously certified floor, and that minus the challenge window
+    /// (FINAL, PoE v5 §3.3). `None` before the node answers, or from a node
+    /// too old to report them.
+    pub final_watermark: Option<u64>,
+    pub settled_height: Option<u64>,
     /// Most recent status answer.
     pub last_status_at: Option<Instant>,
 }
@@ -88,6 +93,8 @@ mod tests {
             status_peer_count: 1,
             tip_height: Some(3),
             finalized_height: None,
+            final_watermark: None,
+            settled_height: None,
             last_status_at: Some(Instant::now()),
         };
         assert!(fresh.has_fresh_status());

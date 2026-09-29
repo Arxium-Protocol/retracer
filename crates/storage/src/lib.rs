@@ -181,10 +181,12 @@ pub async fn list_blocks(
     limit: i64,
     before: Option<i64>,
 ) -> Result<Vec<BlockSummary>> {
-    let rows: Vec<(i64, String, String, i64, Option<String>, i64)> = sqlx::query_as(
+    #[allow(clippy::type_complexity)]
+    let rows: Vec<(i64, String, String, i64, Option<String>, i64, bool)> = sqlx::query_as(
         "SELECT b.height, b.hash, b.parent_hash, b.timestamp, b.proposer,
                 (SELECT COUNT(*) FROM actions a
-                  WHERE a.chain_id = b.chain_id AND a.block_height = b.height) AS action_count
+                  WHERE a.chain_id = b.chain_id AND a.block_height = b.height) AS action_count,
+                b.disputed
          FROM blocks b
          WHERE b.chain_id = $1 AND ($2::BIGINT IS NULL OR b.height < $2)
          ORDER BY b.height DESC
@@ -199,13 +201,17 @@ pub async fn list_blocks(
     Ok(rows
         .into_iter()
         .map(
-            |(height, hash, parent_hash, timestamp, proposer, action_count)| BlockSummary {
-                height,
-                hash,
-                parent_hash,
-                timestamp,
-                proposer,
-                action_count,
+            |(height, hash, parent_hash, timestamp, proposer, action_count, disputed)| {
+                BlockSummary {
+                    height,
+                    hash,
+                    parent_hash,
+                    timestamp,
+                    proposer,
+                    action_count,
+                    settlement: None,
+                    disputed,
+                }
             },
         )
         .collect())
@@ -461,6 +467,39 @@ pub struct BlockSummary {
     /// block indexed before migration 0003 — see that file.
     pub proposer: Option<String>,
     pub action_count: i64,
+    /// `pending` / `attested` / `final` / `disputed`, the node's
+    /// `settlement` — see [`settlement`]. Filled in by the serving layer,
+    /// which holds the node's watermarks; `None` straight out of storage.
+    pub settlement: Option<String>,
+    #[serde(skip)]
+    pub disputed: bool,
+}
+
+/// A block's settlement, the same states the node's block JSON reports
+/// (Arxium PoE v5 §3.3): `disputed` if it lost an execution dispute,
+/// `final` at or below `settled_height` (certified, challenge window
+/// closed), `attested` at or below `final_watermark` (certified, window
+/// still open), else `pending`.
+///
+/// ponytail: a block above the watermark that is certified on its own
+/// (past an uncertified gap) reads `pending` here where the node says
+/// `attested`; ask the node per block if that gap ever matters.
+pub fn settlement(
+    height: i64,
+    disputed: bool,
+    settled_height: Option<u64>,
+    final_watermark: Option<u64>,
+) -> &'static str {
+    let at_or_below = |mark: Option<u64>| mark.is_some_and(|m| height >= 0 && height as u64 <= m);
+    if disputed {
+        "disputed"
+    } else if at_or_below(settled_height) {
+        "final"
+    } else if at_or_below(final_watermark) {
+        "attested"
+    } else {
+        "pending"
+    }
 }
 
 /// The hash Retracer has stored for `height`, if any — used to validate
@@ -1183,6 +1222,18 @@ async fn insert_effects_in_tx(
         .await?;
     }
 
+    // ponytail: not undone by a rollback past `height` — CoreChain is
+    // fork-free (finality_depth 0) and a dispute is only ever recorded by a
+    // certified block; unset it in `rollback_to` if that ever changes.
+    if !effects.disputed_blocks.is_empty() {
+        let heights: Vec<i64> = effects.disputed_blocks.iter().map(|&h| h as i64).collect();
+        sqlx::query("UPDATE blocks SET disputed = true WHERE chain_id = $1 AND height = ANY($2)")
+            .bind(chain_id)
+            .bind(&heights[..])
+            .execute(&mut **tx)
+            .await?;
+    }
+
     if !effects.bls_keys.is_empty() {
         let address: Vec<_> = effects.bls_keys.iter().map(|k| k.address.clone()).collect();
         let effective: Vec<i64> = effects
@@ -1333,6 +1384,8 @@ pub fn block_row_from_wire<B: IndexableBlock>(block: &B) -> Result<BlockRow> {
         undecoded_action_count: count_undecoded(&actions),
         actions,
         dropped,
+        settlement: None,
+        disputed: false,
     })
 }
 
@@ -1376,6 +1429,11 @@ pub struct BlockRow {
     /// when empty so a chain without rejections serialises exactly as before.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub dropped: Vec<DroppedRow>,
+    /// Same as `BlockSummary::settlement`; absent on stream/webhook rows.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub settlement: Option<String>,
+    #[serde(skip)]
+    pub disputed: bool,
 }
 
 /// Rejections in `[from, to]`, ordered by height then signature — the order
@@ -1418,9 +1476,9 @@ pub async fn get_block_by_height(
     chain_id: &str,
     height: i64,
 ) -> Result<Option<BlockRow>> {
-    let Some((hash, parent_hash, timestamp, proposer)) =
-        sqlx::query_as::<_, (String, String, i64, Option<String>)>(
-            "SELECT hash, parent_hash, timestamp, proposer FROM blocks WHERE chain_id = $1 AND height = $2",
+    let Some((hash, parent_hash, timestamp, proposer, disputed)) =
+        sqlx::query_as::<_, (String, String, i64, Option<String>, bool)>(
+            "SELECT hash, parent_hash, timestamp, proposer, disputed FROM blocks WHERE chain_id = $1 AND height = $2",
         )
         .bind(chain_id)
         .bind(height)
@@ -1440,6 +1498,8 @@ pub async fn get_block_by_height(
         undecoded_action_count: count_undecoded(&actions),
         actions,
         dropped,
+        settlement: None,
+        disputed,
     }))
 }
 
@@ -1483,9 +1543,9 @@ pub async fn get_block_by_hash(
     hash: &str,
 ) -> Result<Option<BlockRow>> {
     let hash = canonicalize_hash(hash);
-    let Some((height, parent_hash, timestamp, proposer)) =
-        sqlx::query_as::<_, (i64, String, i64, Option<String>)>(
-            "SELECT height, parent_hash, timestamp, proposer FROM blocks WHERE chain_id = $1 AND hash = $2",
+    let Some((height, parent_hash, timestamp, proposer, disputed)) =
+        sqlx::query_as::<_, (i64, String, i64, Option<String>, bool)>(
+            "SELECT height, parent_hash, timestamp, proposer, disputed FROM blocks WHERE chain_id = $1 AND hash = $2",
         )
         .bind(chain_id)
         .bind(&hash)
@@ -1505,6 +1565,8 @@ pub async fn get_block_by_hash(
         undecoded_action_count: count_undecoded(&actions),
         actions,
         dropped,
+        settlement: None,
+        disputed,
     }))
 }
 
@@ -2197,8 +2259,8 @@ pub async fn get_blocks_in_range(
     to: i64,
     limit: i64,
 ) -> Result<Vec<BlockRow>> {
-    let rows: Vec<(i64, String, String, i64, Option<String>)> = sqlx::query_as(
-        "SELECT height, hash, parent_hash, timestamp, proposer
+    let rows: Vec<(i64, String, String, i64, Option<String>, bool)> = sqlx::query_as(
+        "SELECT height, hash, parent_hash, timestamp, proposer, disputed
            FROM blocks
           WHERE chain_id = $1 AND height >= $2 AND height <= $3
           ORDER BY height
@@ -2246,19 +2308,23 @@ pub async fn get_blocks_in_range(
 
     Ok(rows
         .into_iter()
-        .map(|(height, hash, parent_hash, timestamp, proposer)| {
-            let actions = by_height.remove(&height).unwrap_or_default();
-            BlockRow {
-                undecoded_action_count: count_undecoded(&actions),
-                actions,
-                dropped: dropped_by_height.remove(&height).unwrap_or_default(),
-                height,
-                hash,
-                parent_hash,
-                timestamp,
-                proposer,
-            }
-        })
+        .map(
+            |(height, hash, parent_hash, timestamp, proposer, disputed)| {
+                let actions = by_height.remove(&height).unwrap_or_default();
+                BlockRow {
+                    settlement: None,
+                    disputed,
+                    undecoded_action_count: count_undecoded(&actions),
+                    actions,
+                    dropped: dropped_by_height.remove(&height).unwrap_or_default(),
+                    height,
+                    hash,
+                    parent_hash,
+                    timestamp,
+                    proposer,
+                }
+            },
+        )
         .collect())
 }
 
@@ -2427,6 +2493,18 @@ pub async fn webhook_failed(
 mod tests {
     use super::*;
     use crate::testing::{TestAction, TestBlock};
+
+    #[test]
+    fn settlement_follows_the_node_watermarks_and_a_dispute_wins() {
+        let (settled, watermark) = (Some(10), Some(20));
+        assert_eq!(settlement(10, false, settled, watermark), "final");
+        assert_eq!(settlement(11, false, settled, watermark), "attested");
+        assert_eq!(settlement(20, false, settled, watermark), "attested");
+        assert_eq!(settlement(21, false, settled, watermark), "pending");
+        assert_eq!(settlement(5, true, settled, watermark), "disputed");
+        // A node too old to report either: nothing is claimed settled.
+        assert_eq!(settlement(0, false, None, None), "pending");
+    }
 
     #[test]
     fn action_lookup_accepts_bare_and_prefixed_signatures() {

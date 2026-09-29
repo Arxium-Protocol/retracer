@@ -815,11 +815,19 @@ async fn list_blocks(
     Path(chain_id): Path<String>,
     Query(page): Query<BlockPage>,
 ) -> ApiResult<Vec<storage::BlockSummary>> {
-    state.chain(&chain_id)?;
+    let chain = state.chain(&chain_id)?;
     let limit = clamp_limit(page.limit)?;
-    Ok(Json(
-        storage::list_blocks(&state.pool, &chain_id, limit, page.before).await?,
-    ))
+    let view = *chain.network_view.borrow();
+    let mut blocks = storage::list_blocks(&state.pool, &chain_id, limit, page.before).await?;
+    for block in &mut blocks {
+        block.settlement = Some(settlement(&view, block.height, block.disputed));
+    }
+    Ok(Json(blocks))
+}
+
+/// `storage::settlement` against the node's latest watermarks.
+fn settlement(view: &ingestion::NetworkView, height: i64, disputed: bool) -> String {
+    storage::settlement(height, disputed, view.settled_height, view.final_watermark).into()
 }
 
 /// `{height}` accepts a height or a block hash, the same either/or the gRPC
@@ -831,13 +839,18 @@ async fn get_block(
     State(state): State<AppState>,
     Path((chain_id, height)): Path<(String, String)>,
 ) -> ApiResult<storage::BlockRow> {
-    state.chain(&chain_id)?;
+    let chain = state.chain(&chain_id)?;
     let row = match height.parse::<i64>() {
         Ok(h) => storage::get_block_by_height(&state.pool, &chain_id, h).await?,
         Err(_) => storage::get_block_by_hash(&state.pool, &chain_id, &height).await?,
     };
-    row.map(Json)
-        .ok_or_else(|| ApiError::NotFound("block not found".into()))
+    let mut row = row.ok_or_else(|| ApiError::NotFound("block not found".into()))?;
+    row.settlement = Some(settlement(
+        &chain.network_view.borrow(),
+        row.height,
+        row.disputed,
+    ));
+    Ok(Json(row))
 }
 
 #[derive(Deserialize, IntoParams)]
@@ -1752,6 +1765,8 @@ mod tests {
             status_peer_count: 1,
             tip_height: Some(tip_height),
             finalized_height: None,
+            final_watermark: None,
+            settled_height: None,
             last_status_at: Some(Instant::now()),
         }
     }
@@ -2009,6 +2024,8 @@ mod tests {
             status_peer_count: 1,
             tip_height: Some(4),
             finalized_height: Some(3),
+            final_watermark: None,
+            settled_height: None,
             last_status_at: Some(Instant::now() - Duration::from_secs(60)),
         });
         let stale_report = readiness_report(true, &[stale], &statuses(Some(4)));
