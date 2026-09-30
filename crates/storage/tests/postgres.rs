@@ -1596,7 +1596,9 @@ async fn token_events_are_normalised_and_rolled_back() {
             token(serde_json::json!({"Burn": {"token": "t1", "amount": "1"}})),
             token(serde_json::json!({"RenounceMint": {"token": "t1"}})),
             // Create names no token ref, so it is not an event.
-            token(serde_json::json!({"Create": {"symbol": "X", "name": "X", "decimals": 0, "initial_supply": "1", "max_supply": null, "mintable": false}})),
+            token(
+                serde_json::json!({"Create": {"symbol": "X", "name": "X", "decimals": 0, "initial_supply": "1", "max_supply": null, "mintable": false}}),
+            ),
         ],
     );
     storage::insert_block(&pool, &chain, &b, &extractor)
@@ -1604,17 +1606,17 @@ async fn token_events_are_normalised_and_rolled_back() {
         .expect("insert_block");
 
     assert_eq!(count(&pool, "token_events", &chain).await, 5);
-    let (transfers, volume): (i64, String) = sqlx::query_as(
-        "SELECT transfers, transfer_volume::text FROM token_daily WHERE chain_id = $1 AND token = 't1'",
-    )
-    .bind(&chain)
-    .fetch_one(&pool)
-    .await
-    .expect("daily rollup");
+    // `block()` stamps 2023, so the day window must be wide enough to reach it.
+    let daily = storage::get_token_daily(&pool, &chain, "t1", 366 * 5)
+        .await
+        .expect("daily rollup");
+    let (transfers, volume) = (daily[0].transfers, daily[0].transfer_volume.clone());
     assert_eq!(transfers, 1);
     assert_eq!(volume, max, "u128 max survives NUMERIC(39,0)");
 
-    storage::rollback_to(&pool, &chain, -1).await.expect("rollback");
+    storage::rollback_to(&pool, &chain, -1)
+        .await
+        .expect("rollback");
     assert_eq!(count(&pool, "token_events", &chain).await, 0);
 }
 

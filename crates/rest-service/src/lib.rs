@@ -1804,6 +1804,55 @@ mod tests {
         }
     }
 
+    /// Bad input is refused before any query, so a lazy pool (never connects)
+    /// proves none was attempted; reaching Postgres would be a 500, not these.
+    #[tokio::test]
+    async fn token_activity_endpoints_reject_bad_input_before_the_database() {
+        let state = lazy_state(vec![rest_chain(ingestion::NetworkView::default())]);
+        let stats = |chain: &str, assets: String, days: Option<i64>| {
+            get_token_stats(
+                State(state.clone()),
+                Path(chain.to_string()),
+                Query(StatsQuery { assets, days }),
+            )
+        };
+        let many = vec!["a"; MAX_STATS_TOKENS + 1].join(",");
+        for assets in ["", " , ,", many.as_str()] {
+            assert!(matches!(
+                stats("test-chain", assets.into(), None).await,
+                Err(ApiError::BadRequest(_))
+            ));
+        }
+        for days in [0, -1, MAX_ROLLUP_DAYS + 1] {
+            assert!(matches!(
+                stats("test-chain", "a".into(), Some(days)).await,
+                Err(ApiError::BadRequest(_))
+            ));
+            assert!(matches!(
+                get_asset_daily(
+                    State(state.clone()),
+                    Path(("test-chain".into(), "a".into())),
+                    Query(DaysQuery { days: Some(days) }),
+                )
+                .await,
+                Err(ApiError::BadRequest(_))
+            ));
+        }
+        assert!(matches!(
+            get_asset_events(
+                State(state.clone()),
+                Path(("test-chain".into(), "a".into())),
+                Query(EventPage { limit: Some(0) }),
+            )
+            .await,
+            Err(ApiError::BadRequest(_))
+        ));
+        assert!(matches!(
+            stats("nope", "a".into(), None).await,
+            Err(ApiError::NotFound(_))
+        ));
+    }
+
     #[test]
     fn dropped_actions_openapi_documents_optional_asset_filter() {
         let spec = serde_json::to_value(ApiDoc::openapi()).expect("OpenAPI serializes");
