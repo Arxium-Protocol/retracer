@@ -283,6 +283,33 @@ pub struct ActionFilter<'a> {
     pub value: Option<&'a str>,
 }
 
+/// Asset-reference history, directly keyed by asset and position. The
+/// migration backfills existing payloads and ingestion projects new rows.
+pub async fn get_asset_actions(
+    pool: &PgPool,
+    chain_id: &str,
+    asset_ref: &str,
+    limit: i64,
+    before: Option<(i64, i32)>,
+) -> Result<Vec<ActionRow>> {
+    let (height, index) = before.map_or((None, None), |(h, i)| (Some(h), Some(i)));
+    Ok(sqlx::query_as::<_, ActionRow>(&format!(
+        "SELECT {ACTION_COLUMNS}
+         FROM asset_actions aa
+         JOIN actions a ON a.chain_id = aa.chain_id AND a.action_hash = aa.action_hash
+         WHERE aa.chain_id = $1 AND aa.asset_ref = $2
+           AND ($3::BIGINT IS NULL OR (aa.block_height, aa.index_in_block) < ($3::BIGINT, $4::INT))
+         ORDER BY aa.block_height DESC, aa.index_in_block DESC LIMIT $5"
+    ))
+    .bind(chain_id)
+    .bind(asset_ref)
+    .bind(height)
+    .bind(index)
+    .bind(limit)
+    .fetch_all(pool)
+    .await?)
+}
+
 /// Aggregates over the whole index.
 ///
 /// Five separate queries rather than one, because they touch different tables
@@ -1593,8 +1620,10 @@ pub async fn get_action_by_hash(
 ///
 /// `roles` picks which history: `from` is the sender history (sourced from
 /// `account_actions`), any other role queries the Tier A `action_addresses`
-/// index (address-extraction plan §6), e.g. `to` for "received". Empty means
-/// `from`. Several roles are merged into one page, so a wallet asks for
+/// index (address-extraction plan §6), e.g. `to` for "received". The alias
+/// `payload_from` queries the extracted `from` role, distinct from the sender
+/// history — essential for forced transfers signed by an issuer or governor.
+/// Empty means `from`. Several roles are merged into one page, so a wallet asks for
 /// `["from", "to"]` once instead of twice and merging the pages itself.
 ///
 /// Each role is its own branch that walks its index newest-first and stops at
@@ -1638,7 +1667,9 @@ pub async fn get_account_actions(
                        LIMIT $5)"
                 )
             } else {
-                role_binds.push(role);
+                // `from` is reserved for the signer history above. Give the
+                // payload `from` extraction its own public query name.
+                role_binds.push(if role == "payload_from" { "from" } else { role });
                 let n = 5 + role_binds.len();
                 format!(
                     "(SELECT {ACTION_COLUMNS}

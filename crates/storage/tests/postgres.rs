@@ -85,6 +85,114 @@ macro_rules! skip_without_db {
 }
 
 #[tokio::test]
+async fn asset_action_index_projects_nested_refs_pages_and_cascades() {
+    let pool = skip_without_db!();
+    let chain = chain_id("asset-actions");
+    let asset = format!("arxasset1{}", "q".repeat(58));
+    let payout = format!("arxasset1{}", "p".repeat(58));
+    let extractor = AddressExtractor::tier_a_only(KindSchema::empty());
+    let row = block(
+        1,
+        "0x00",
+        vec![
+            TestAction {
+                sender: addr(1),
+                signature: Some("asset-first".into()),
+                payload: serde_json::json!({"DistributeToHolders": {"asset": asset, "payout_asset": payout, "total": "1"}}),
+            },
+            TestAction {
+                sender: addr(1),
+                signature: Some("asset-second".into()),
+                payload: serde_json::json!({"Token": {"Transfer": {"token": asset, "to": addr(2), "amount": "1"}}}),
+            },
+            TestAction {
+                sender: addr(1),
+                signature: Some("asset-third".into()),
+                payload: serde_json::json!({"DistributeToHolders": {"asset": asset, "payout_asset": asset, "total": "1"}}),
+            },
+        ],
+    );
+    storage::insert_block(&pool, &chain, &row, &extractor)
+        .await
+        .expect("ingest");
+    let first = storage::get_asset_actions(&pool, &chain, &asset, 2, None)
+        .await
+        .expect("first page");
+    assert_eq!(first.len(), 2);
+    assert_eq!(first[0].action_hash, "asset-third");
+    assert_eq!(first[1].action_hash, "asset-second");
+    let second = storage::get_asset_actions(&pool, &chain, &asset, 2, Some((1, 1)))
+        .await
+        .expect("second page");
+    assert_eq!(second.len(), 1);
+    assert_eq!(second[0].action_hash, "asset-first");
+    assert_eq!(
+        storage::get_asset_actions(&pool, &chain, &payout, 10, None)
+            .await
+            .expect("payout history")
+            .len(),
+        1
+    );
+    assert!(
+        storage::get_asset_actions(&pool, "another-chain", &asset, 10, None)
+            .await
+            .expect("chain isolation")
+            .is_empty()
+    );
+    sqlx::query("DELETE FROM actions WHERE chain_id = $1")
+        .bind(&chain)
+        .execute(&pool)
+        .await
+        .expect("delete actions");
+    assert_eq!(
+        count(&pool, "asset_actions", &chain).await,
+        0,
+        "rollback must not leave asset history behind"
+    );
+}
+
+/// A payload `from` role is not the action's signer: a governor can force a
+/// transfer from someone else's balance. `payload_from` must query the
+/// action_addresses role while plain `from` keeps the sender history.
+#[tokio::test]
+async fn payload_from_role_is_distinct_from_sender_history() {
+    let pool = skip_without_db!();
+    let chain = chain_id("payload-from-role");
+    let sender = addr(1);
+    let holder = addr(2);
+    let row = block(
+        1,
+        "0x00",
+        vec![action(1, Some("forced"), TestPayload::Noop)],
+    );
+    let extractor = AddressExtractor::tier_a_only(KindSchema::empty());
+    storage::insert_block(&pool, &chain, &row, &extractor)
+        .await
+        .expect("insert");
+    sqlx::query("INSERT INTO action_addresses (chain_id, action_hash, address, role, block_height) VALUES ($1, $2, $3, 'from', 1)")
+        .bind(&chain)
+        .bind("forced")
+        .bind(&holder)
+        .execute(&pool)
+        .await
+        .expect("index extracted from");
+    let signed = storage::get_account_actions(&pool, &chain, &sender, 10, None, &["from"])
+        .await
+        .expect("sender history");
+    assert_eq!(signed.len(), 1);
+    let holder_signed = storage::get_account_actions(&pool, &chain, &holder, 10, None, &["from"])
+        .await
+        .expect("holder sender history");
+    assert!(holder_signed.is_empty());
+    let holder_affected =
+        storage::get_account_actions(&pool, &chain, &holder, 10, None, &["payload_from"])
+            .await
+            .expect("holder payload history");
+    assert_eq!(holder_affected.len(), 1);
+    assert_eq!(holder_affected[0].action_hash, "forced");
+}
+
+#[tokio::test]
 async fn migrations_are_idempotent() {
     let pool = skip_without_db!();
     // `pool()` already migrated once; a second run must be a no-op rather than

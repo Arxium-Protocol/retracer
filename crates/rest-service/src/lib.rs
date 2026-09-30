@@ -203,7 +203,7 @@ impl AppState {
     ),
     paths(
         list_chains, get_status, get_stats, list_blocks, get_block, list_actions, get_action,
-        get_account_actions, get_account_first_seen, list_proposers, get_validator_uptime, search,
+        get_account_actions, get_asset_actions, get_account_first_seen, list_proposers, get_validator_uptime, search,
         health, readiness, metrics,
         sse::stream_blocks, sse::stream_actions, sse::stream_dropped,
          get_account, get_asset_holders, get_validator, list_attestors, list_dropped_actions,
@@ -275,6 +275,10 @@ pub fn router(
         .route(
             "/v1/chains/{chain_id}/assets/{asset}/holders",
             get(get_asset_holders),
+        )
+        .route(
+            "/v1/chains/{chain_id}/assets/{asset}/actions",
+            get(get_asset_actions),
         )
         .route(
             "/v1/chains/{chain_id}/assets/{asset}/audit/transfers",
@@ -859,7 +863,9 @@ struct ActionPage {
     before_height: Option<i64>,
     before_index: Option<i32>,
     /// Account history only: which roles, comma-separated (`from,to` for
-    /// sent and received in one page). Absent means `from`.
+    /// sent and received in one page). `from` is the signer history;
+    /// `payload_from` selects the extracted `from` role for forced transfers.
+    /// Absent means `from`.
     role: Option<String>,
     kind: Option<String>,
     /// A projected payload path, `$.asset` — must be declared for `kind` in
@@ -995,6 +1001,19 @@ async fn get_account_actions(
             &roles,
         )
         .await?,
+    ))
+}
+
+#[utoipa::path(get, path = "/v1/chains/{chain_id}/assets/{asset}/actions", tag = "actions", params(("chain_id" = String, Path), ("asset" = String, Path), ActionPage), responses((status = 200, body = Vec<storage::ActionRow>), (status = 400, body = ErrorBody), (status = 404, body = ErrorBody)))]
+async fn get_asset_actions(
+    State(state): State<AppState>,
+    Path((chain_id, asset)): Path<(String, String)>,
+    Query(page): Query<ActionPage>,
+) -> ApiResult<Vec<storage::ActionRow>> {
+    state.chain(&chain_id)?;
+    let limit = clamp_limit(page.limit)?;
+    Ok(Json(
+        storage::get_asset_actions(&state.pool, &chain_id, &asset, limit, page.cursor()?).await?,
     ))
 }
 
