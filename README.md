@@ -211,6 +211,9 @@ GET  /v1/chains/{chain}/validators/uptime?from=&to=
 
 GET  /v1/chains/{chain}/accounts/{address}?at=
 GET  /v1/chains/{chain}/assets/{asset}/holders?at=&jurisdiction=&after=&limit=
+GET  /v1/chains/{chain}/assets/{asset}/events?limit=
+GET  /v1/chains/{chain}/assets/{asset}/daily?days=
+GET  /v1/chains/{chain}/token-stats?assets=a,b,c&days=
 GET  /v1/chains/{chain}/assets/{asset}/audit/transfers?format=json|csv
 GET  /v1/chains/{chain}/assets/{asset}/audit/holders?at=&format=json|csv
 GET  /v1/chains/{chain}/validators/{address}
@@ -226,6 +229,11 @@ status, voting power, status history, authorized operator, BLS key and
 equivocation slashes; the registered attestors; and the actions a producer
 rejected, with the reason. `at=` answers "as of block H" (default: tip).
 Amounts are decimal strings — the chain's u128 doesn't fit a JSON number.
+
+`events`, `daily` and `token-stats` read a token's mint/transfer/burn/renounce
+history (`token_events`): newest-first activity, per-UTC-day transfers, volume,
+mints and burns (quiet days are absent, not zero), and a batch form — transfers
+in the last 24h plus a per-day transfer series for up to 100 tokens at once.
 State is only as complete as the effects the node served: blocks indexed
 from a node older than the effects record have no state rows, and
 `dropped` is only ever populated by the producing node.

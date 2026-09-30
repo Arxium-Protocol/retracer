@@ -208,6 +208,7 @@ impl AppState {
         sse::stream_blocks, sse::stream_actions, sse::stream_dropped,
          get_account, get_asset_holders, get_validator, list_attestors, list_dropped_actions,
          get_asset_audit_transfers, get_asset_audit_holders,
+         get_asset_events, get_asset_daily, get_token_stats,
         webhooks::register, webhooks::list, webhooks::remove,
     ),
     tags(
@@ -276,6 +277,15 @@ pub fn router(
             "/v1/chains/{chain_id}/assets/{asset}/holders",
             get(get_asset_holders),
         )
+        .route(
+            "/v1/chains/{chain_id}/assets/{asset}/events",
+            get(get_asset_events),
+        )
+        .route(
+            "/v1/chains/{chain_id}/assets/{asset}/daily",
+            get(get_asset_daily),
+        )
+        .route("/v1/chains/{chain_id}/token-stats", get(get_token_stats))
         .route(
             "/v1/chains/{chain_id}/assets/{asset}/audit/transfers",
             get(get_asset_audit_transfers),
@@ -1085,6 +1095,93 @@ async fn get_asset_holders(
             limit,
         )
         .await?,
+    ))
+}
+
+// ---------------------------------------------------------------- token activity
+
+#[derive(Deserialize, IntoParams)]
+struct EventPage {
+    limit: Option<i64>,
+}
+
+#[utoipa::path(get, path = "/v1/chains/{chain_id}/assets/{asset}/events", tag = "accounts", params(("chain_id" = String, Path), ("asset" = String, Path, description = "The token's `AssetRef`"), EventPage), responses((status = 200, description = "Token mint/transfer/burn/renounce actions, newest first", body = Vec<storage::TokenEventRow>), (status = 400, body = ErrorBody), (status = 404, body = ErrorBody)))]
+async fn get_asset_events(
+    State(state): State<AppState>,
+    Path((chain_id, asset)): Path<(String, String)>,
+    Query(page): Query<EventPage>,
+) -> ApiResult<Vec<storage::TokenEventRow>> {
+    state.chain(&chain_id)?;
+    let limit = clamp_limit(page.limit)?;
+    Ok(Json(
+        storage::get_token_events(&state.pool, &chain_id, &asset, limit).await?,
+    ))
+}
+
+/// Longest window the rollup endpoints serve.
+const MAX_ROLLUP_DAYS: i64 = 366;
+
+#[derive(Deserialize, IntoParams)]
+struct DaysQuery {
+    /// Window in UTC days ending today. Default 30, max 366.
+    days: Option<i64>,
+}
+
+fn rollup_days(days: Option<i64>, default: i64) -> Result<i64, ApiError> {
+    match days.unwrap_or(default) {
+        n if (1..=MAX_ROLLUP_DAYS).contains(&n) => Ok(n),
+        _ => Err(ApiError::BadRequest(format!(
+            "days must be between 1 and {MAX_ROLLUP_DAYS}"
+        ))),
+    }
+}
+
+#[utoipa::path(get, path = "/v1/chains/{chain_id}/assets/{asset}/daily", tag = "accounts", params(("chain_id" = String, Path), ("asset" = String, Path, description = "The token's `AssetRef`"), DaysQuery), responses((status = 200, description = "Per-UTC-day transfers, volume, mints and burns, oldest first. Days with no events are absent.", body = Vec<storage::TokenDayRow>), (status = 400, body = ErrorBody), (status = 404, body = ErrorBody)))]
+async fn get_asset_daily(
+    State(state): State<AppState>,
+    Path((chain_id, asset)): Path<(String, String)>,
+    Query(q): Query<DaysQuery>,
+) -> ApiResult<Vec<storage::TokenDayRow>> {
+    state.chain(&chain_id)?;
+    let days = rollup_days(q.days, 30)?;
+    Ok(Json(
+        storage::get_token_daily(&state.pool, &chain_id, &asset, days).await?,
+    ))
+}
+
+/// Most tokens one batch call accepts.
+const MAX_STATS_TOKENS: usize = 100;
+
+#[derive(Deserialize, IntoParams)]
+struct StatsQuery {
+    /// Comma-separated `AssetRef`s, at most 100.
+    assets: String,
+    /// Sparkline window in UTC days. Default 14, max 366.
+    days: Option<i64>,
+}
+
+#[utoipa::path(get, path = "/v1/chains/{chain_id}/token-stats", tag = "accounts", params(("chain_id" = String, Path), StatsQuery), responses((status = 200, description = "One entry per requested token, in request order: transfers in the last 24h and per-day transfer counts", body = Vec<storage::TokenStats>), (status = 400, body = ErrorBody), (status = 404, body = ErrorBody)))]
+async fn get_token_stats(
+    State(state): State<AppState>,
+    Path(chain_id): Path<String>,
+    Query(q): Query<StatsQuery>,
+) -> ApiResult<Vec<storage::TokenStats>> {
+    state.chain(&chain_id)?;
+    let tokens: Vec<String> = q
+        .assets
+        .split(',')
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+        .map(str::to_string)
+        .collect();
+    if tokens.is_empty() || tokens.len() > MAX_STATS_TOKENS {
+        return Err(ApiError::BadRequest(format!(
+            "assets must list 1 to {MAX_STATS_TOKENS} tokens"
+        )));
+    }
+    let days = rollup_days(q.days, 14)?;
+    Ok(Json(
+        storage::get_token_stats(&state.pool, &chain_id, &tokens, days).await?,
     ))
 }
 
