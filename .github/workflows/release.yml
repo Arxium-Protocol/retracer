@@ -196,6 +196,12 @@ jobs:
           mkdir -p "dist/${out}"
           cp target/release/retracerd "dist/${out}/"
           cp kind_schema.toml "dist/${out}/"
+          # The migrations embedded in this binary, one sqlx version per line.
+          # Arxium-Ops' deploy gateway compares them with the database before
+          # it stops anything (a rollback cannot undo an applied migration).
+          find migrations -maxdepth 1 -name '*.sql' -printf '%f\n' \
+            | sed -E 's/^0*([0-9]+)_.*/\1/' | sort -n -u > "dist/${out}/migrations.txt"
+          grep -Eqx '[0-9]+' "dist/${out}/migrations.txt"
           tar -C dist -czf "dist/${out}.tar.gz" "${out}"
           rm -rf "dist/${out}"
 
