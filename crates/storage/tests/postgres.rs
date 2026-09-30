@@ -1233,6 +1233,33 @@ async fn asset_audit_transfers_use_baseline_kinds_and_pre_transfer_state() {
     assert_eq!(rows[0].amount.as_deref(), Some("18446744073709551616"));
     assert_eq!(rows[0].from_state.as_ref().unwrap()["frozen"], true);
     assert_eq!(rows[0].to_state.as_ref().unwrap()["frozen"], false);
+
+    // Token actions nest their variant; only a `Transfer` of this token counts.
+    sqlx::query(
+        "INSERT INTO actions (chain_id, action_hash, block_height, index_in_block, kind, from_address, payload)
+         VALUES ($1, 'token-send', 1, 2, 'Token', $2, $3),
+                ($1, 'token-mint', 1, 3, 'Token', $2, $4),
+                ($1, 'other-token', 1, 4, 'Token', $2, $5)",
+    )
+    .bind(&chain)
+    .bind(&alice)
+    .bind(serde_json::json!({"Transfer": {"token": "coin", "to": bob, "amount": "340282366920938463463374607431768211455"}}))
+    .bind(serde_json::json!({"Mint": {"token": "coin", "to": bob, "amount": "5"}}))
+    .bind(serde_json::json!({"Transfer": {"token": "other", "to": bob, "amount": "5"}}))
+    .execute(&pool)
+    .await
+    .expect("token actions");
+    let rows = storage::list_asset_audit_transfers(&pool, &chain, "coin")
+        .await
+        .expect("token audit transfers");
+    assert_eq!(rows.len(), 1, "only this token's transfers");
+    assert_eq!(rows[0].kind, "TokenTransfer");
+    assert_eq!(rows[0].from.as_deref(), Some(alice.as_str()));
+    assert_eq!(rows[0].to.as_deref(), Some(bob.as_str()));
+    assert_eq!(
+        rows[0].amount.as_deref(),
+        Some("340282366920938463463374607431768211455")
+    );
 }
 
 /// Registration is an upsert keyed on URL that re-arms a disabled hook;

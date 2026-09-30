@@ -1938,8 +1938,31 @@ pub struct AuditTransferRow {
 /// The baseline asset-moving action kinds provided by CoreChain. A deployment
 /// with custom payloads can still use the generic action history; this audit
 /// export intentionally does not guess that a custom action moves an asset.
-pub const BASELINE_ASSET_TRANSFER_KINDS: [&str; 3] =
-    ["TransferAsset", "ForcedTransfer", "IssuerForcedTransfer"];
+///
+/// `TokenTransfer` is not a stored kind: token actions are stored as kind
+/// `Token` with the variant nested (`{"Transfer":{"token","to","amount"}}`),
+/// and the export reports the `Transfer` ones under this name.
+pub const BASELINE_ASSET_TRANSFER_KINDS: [&str; 4] = [
+    "TransferAsset",
+    "ForcedTransfer",
+    "IssuerForcedTransfer",
+    "TokenTransfer",
+];
+
+/// One `list_asset_audit_transfers` row as SQL returns it, in select order.
+type AuditTransferTuple = (
+    String,
+    i64,
+    i32,
+    String,
+    i64,
+    String,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<serde_json::Value>,
+    Option<serde_json::Value>,
+);
 
 /// Every baseline transfer of `asset`, oldest first. The action payload keeps
 /// the canonical amount text, avoiding a lossy numeric conversion for u128s.
@@ -1948,40 +1971,34 @@ pub async fn list_asset_audit_transfers(
     chain_id: &str,
     asset: &str,
 ) -> Result<Vec<AuditTransferRow>> {
-    let rows: Vec<(
-        String,
-        i64,
-        i32,
-        String,
-        i64,
-        String,
-        Option<String>,
-        Option<String>,
-        Option<String>,
-        Option<serde_json::Value>,
-        Option<serde_json::Value>,
-    )> = sqlx::query_as(
-        "SELECT a.action_hash, a.block_height, a.index_in_block, b.hash, b.timestamp, a.kind,
-                CASE WHEN a.kind = 'TransferAsset' THEN a.from_address ELSE a.payload ->> 'from' END,
-                a.payload ->> 'to', a.payload ->> 'amount', from_state.state, to_state.state
-         FROM actions a
-         JOIN blocks b ON b.chain_id = a.chain_id AND b.height = a.block_height
+    let rows: Vec<AuditTransferTuple> = sqlx::query_as(
+        "WITH t AS (
+             SELECT chain_id, action_hash, block_height, index_in_block,
+                    CASE WHEN kind = 'Token' THEN 'TokenTransfer' ELSE kind END AS kind,
+                    CASE WHEN kind IN ('TransferAsset', 'Token') THEN from_address ELSE payload ->> 'from' END AS sender,
+                    CASE WHEN kind = 'Token' THEN payload -> 'Transfer' ELSE payload END AS p
+             FROM actions
+             WHERE chain_id = $1
+               AND ((kind = ANY($3) AND payload ->> 'asset' = $2)
+                    OR (kind = 'Token' AND payload -> 'Transfer' ->> 'token' = $2))
+         )
+         SELECT t.action_hash, t.block_height, t.index_in_block, b.hash, b.timestamp, t.kind,
+                t.sender, t.p ->> 'to', t.p ->> 'amount', from_state.state, to_state.state
+         FROM t
+         JOIN blocks b ON b.chain_id = t.chain_id AND b.height = t.block_height
          LEFT JOIN LATERAL (
              SELECT state FROM asset_holder_states
-             WHERE chain_id = a.chain_id AND asset = $2
-               AND holder = CASE WHEN a.kind = 'TransferAsset' THEN a.from_address ELSE a.payload ->> 'from' END
-               AND height < a.block_height
+             WHERE chain_id = t.chain_id AND asset = $2 AND holder = t.sender
+               AND height < t.block_height
              ORDER BY height DESC LIMIT 1
          ) from_state ON TRUE
          LEFT JOIN LATERAL (
              SELECT state FROM asset_holder_states
-             WHERE chain_id = a.chain_id AND asset = $2 AND holder = a.payload ->> 'to'
-               AND height < a.block_height
+             WHERE chain_id = t.chain_id AND asset = $2 AND holder = t.p ->> 'to'
+               AND height < t.block_height
              ORDER BY height DESC LIMIT 1
          ) to_state ON TRUE
-         WHERE a.chain_id = $1 AND a.kind = ANY($3)
-           AND a.payload ->> 'asset' = $2
-         ORDER BY a.block_height, a.index_in_block",
+         ORDER BY t.block_height, t.index_in_block",
     )
     .bind(chain_id)
     .bind(asset)
