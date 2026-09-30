@@ -1965,7 +1965,7 @@ pub async fn get_token_events(
     .await?)
 }
 
-/// One UTC day of a token's activity (`token_daily`).
+/// One UTC day of a token's activity.
 #[derive(Debug, Clone, serde::Serialize, sqlx::FromRow, utoipa::ToSchema)]
 pub struct TokenDayRow {
     /// `YYYY-MM-DD`, UTC.
@@ -1986,11 +1986,16 @@ pub async fn get_token_daily(
     days: i64,
 ) -> Result<Vec<TokenDayRow>> {
     Ok(sqlx::query_as(
-        "SELECT day::text AS day, transfers, transfer_volume::text AS transfer_volume, mints, burns
-         FROM token_daily
+        "SELECT (to_timestamp(block_time) AT TIME ZONE 'UTC')::date::text AS day,
+                COUNT(*) FILTER (WHERE event = 'transfer') AS transfers,
+                COALESCE(SUM(amount) FILTER (WHERE event = 'transfer'), 0)::text AS transfer_volume,
+                COUNT(*) FILTER (WHERE event = 'mint') AS mints,
+                COUNT(*) FILTER (WHERE event = 'burn') AS burns
+         FROM token_events
          WHERE chain_id = $1 AND token = $2
-           AND day > (now() AT TIME ZONE 'UTC')::date - $3::INT
-         ORDER BY day",
+           AND block_time >= extract(epoch FROM ((now() AT TIME ZONE 'UTC')::date - ($3::INT - 1))::timestamp AT TIME ZONE 'UTC')::BIGINT
+         GROUP BY 1
+         ORDER BY 1",
     )
     .bind(chain_id)
     .bind(token)
@@ -2033,10 +2038,12 @@ pub async fn get_token_stats(
     .fetch_all(pool)
     .await?;
     let daily: Vec<(String, String, i64)> = sqlx::query_as(
-        "SELECT token, day::text, transfers FROM token_daily
-         WHERE chain_id = $1 AND token = ANY($2) AND transfers > 0
-           AND day > (now() AT TIME ZONE 'UTC')::date - $3::INT
-         ORDER BY token, day",
+        "SELECT token, (to_timestamp(block_time) AT TIME ZONE 'UTC')::date::text, COUNT(*)
+         FROM token_events
+         WHERE chain_id = $1 AND token = ANY($2) AND event = 'transfer'
+           AND block_time >= extract(epoch FROM ((now() AT TIME ZONE 'UTC')::date - ($3::INT - 1))::timestamp AT TIME ZONE 'UTC')::BIGINT
+         GROUP BY 1, 2
+         ORDER BY 1, 2",
     )
     .bind(chain_id)
     .bind(tokens)
