@@ -1534,3 +1534,39 @@ async fn disputed_blocks_flag_the_earlier_block() {
         .expect("get_blocks_in_range");
     assert!(range[0].disputed && !range[1].disputed);
 }
+
+/// D-28: with the shipped schema, a token's recipient is in their `to`
+/// history. Token actions are one kind with the variant nested
+/// (`{"Token":{"Transfer":{..}}}`), so this goes through `split_kind` too.
+#[tokio::test]
+async fn token_recipients_are_in_their_received_history() {
+    let pool = skip_without_db!();
+    let chain = chain_id("token-recipients");
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../kind_schema.toml");
+    let extractor =
+        AddressExtractor::new(KindSchema::load(&path).expect("shipped schema"), Vec::new());
+    let bob = addr(2);
+    let token = |variant: serde_json::Value| TestAction {
+        sender: addr(1),
+        signature: None,
+        payload: serde_json::json!({ "Token": variant }),
+    };
+    let b = block(
+        0,
+        "0x0",
+        vec![
+            token(serde_json::json!({"Mint": {"token": "arxasset1x", "to": bob, "amount": 5}})),
+            token(serde_json::json!({"Transfer": {"token": "arxasset1x", "to": bob, "amount": 3}})),
+            token(serde_json::json!({"Burn": {"token": "arxasset1x", "amount": 1}})),
+        ],
+    );
+    storage::insert_block(&pool, &chain, &b, &extractor)
+        .await
+        .expect("insert_block");
+
+    let received = storage::get_account_actions(&pool, &chain, &bob, 10, None, &["to"])
+        .await
+        .expect("received");
+    assert_eq!(received.len(), 2, "Mint and Transfer, not Burn");
+    assert!(received.iter().all(|row| row.kind == "Token"));
+}

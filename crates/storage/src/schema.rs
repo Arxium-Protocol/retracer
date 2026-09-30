@@ -555,6 +555,24 @@ mod tests {
         );
     }
 
+    /// Token actions nest their variant, so the recipient sits one level down
+    /// and only Mint / Transfer carry one.
+    #[test]
+    fn the_shipped_schema_indexes_token_recipients() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../kind_schema.toml");
+        let schema = KindSchema::load(&path).unwrap();
+        for variant in ["Mint", "Transfer"] {
+            let payload = serde_json::json!({ variant: {"token": "arxasset1x", "to": "arx1bob", "amount": "5"} });
+            assert_eq!(
+                schema.resolve("Token", &payload),
+                vec![("arx1bob".to_string(), &Role::To)],
+                "{variant}"
+            );
+        }
+        let burn = serde_json::json!({"Burn": {"token": "arxasset1x", "amount": "5"}});
+        assert!(schema.resolve("Token", &burn).is_empty());
+    }
+
     #[test]
     fn rejects_unknown_role_strings() {
         let err = KindSchema::parse(
