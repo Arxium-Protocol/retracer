@@ -167,6 +167,21 @@ name = "IssueAssetTo"
   path = "$.to"
   role = "to"
 
+# Token circuit: one kind, `Token`, with the variant nested one level down
+# (`{"Transfer":{"token","to","amount"}}`). Only Mint and Transfer name a
+# party besides the sender; Create / Burn / RenounceMint don't. A path that
+# doesn't match this action's variant resolves to nothing and is skipped.
+[[kind]]
+name = "Token"
+
+  [[kind.roles]]
+  path = "$.Mint.to"
+  role = "to"
+
+  [[kind.roles]]
+  path = "$.Transfer.to"
+  role = "to"
+
 # RegisterAsset / IssueAsset / BurnAsset / SubmitExecutionFault / FreezeAsset /
 # UnfreezeAsset have no address-bearing payload fields — the sender (already
 # indexed via actions.from_address) is the only party. The ones that name an
