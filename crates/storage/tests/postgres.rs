@@ -583,7 +583,7 @@ async fn table_sizes_and_database_size_report_every_table() {
     let sizes = storage::table_sizes(&pool)
         .await
         .expect("table sizes query");
-    assert_eq!(sizes.len(), 6);
+    assert_eq!(sizes.len(), 7);
 
     let db_size = storage::database_size_bytes(&pool)
         .await
@@ -1569,4 +1569,105 @@ async fn token_recipients_are_in_their_received_history() {
         .expect("received");
     assert_eq!(received.len(), 2, "Mint and Transfer, not Burn");
     assert!(received.iter().all(|row| row.kind == "Token"));
+}
+
+/// Token actions land in `token_events` (one row per action naming a token),
+/// feed the daily view, and disappear on rollback.
+#[tokio::test]
+async fn token_events_are_normalised_and_rolled_back() {
+    let pool = skip_without_db!();
+    let chain = chain_id("token-events");
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../kind_schema.toml");
+    let extractor =
+        AddressExtractor::new(KindSchema::load(&path).expect("shipped schema"), Vec::new());
+    let token = |variant: serde_json::Value| TestAction {
+        sender: addr(1),
+        signature: None,
+        payload: serde_json::json!({ "Token": variant }),
+    };
+    let max = "340282366920938463463374607431768211455";
+    let b = block(
+        0,
+        "0x0",
+        vec![
+            token(serde_json::json!({"Mint": {"token": "t1", "to": addr(2), "amount": "5"}})),
+            token(serde_json::json!({"Transfer": {"token": "t1", "to": addr(2), "amount": max}})),
+            token(serde_json::json!({"Transfer": {"token": "t2", "to": addr(2), "amount": "1"}})),
+            token(serde_json::json!({"Burn": {"token": "t1", "amount": "1"}})),
+            token(serde_json::json!({"RenounceMint": {"token": "t1"}})),
+            // Create names no token ref, so it is not an event.
+            token(serde_json::json!({"Create": {"symbol": "X", "name": "X", "decimals": 0, "initial_supply": "1", "max_supply": null, "mintable": false}})),
+        ],
+    );
+    storage::insert_block(&pool, &chain, &b, &extractor)
+        .await
+        .expect("insert_block");
+
+    assert_eq!(count(&pool, "token_events", &chain).await, 5);
+    let (transfers, volume): (i64, String) = sqlx::query_as(
+        "SELECT transfers, transfer_volume::text FROM token_daily WHERE chain_id = $1 AND token = 't1'",
+    )
+    .bind(&chain)
+    .fetch_one(&pool)
+    .await
+    .expect("daily rollup");
+    assert_eq!(transfers, 1);
+    assert_eq!(volume, max, "u128 max survives NUMERIC(39,0)");
+
+    storage::rollback_to(&pool, &chain, -1).await.expect("rollback");
+    assert_eq!(count(&pool, "token_events", &chain).await, 0);
+}
+
+/// The token activity reads: newest-first events, daily rollup and the batch
+/// stats (zeroed entry for an unknown token, request order kept).
+#[tokio::test]
+async fn token_activity_reads() {
+    let pool = skip_without_db!();
+    let chain = chain_id("token-reads");
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../kind_schema.toml");
+    let extractor =
+        AddressExtractor::new(KindSchema::load(&path).expect("shipped schema"), Vec::new());
+    let token = |variant: serde_json::Value| TestAction {
+        sender: addr(1),
+        signature: None,
+        payload: serde_json::json!({ "Token": variant }),
+    };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let mut b = block(
+        0,
+        "0x0",
+        vec![
+            token(serde_json::json!({"Transfer": {"token": "t1", "to": addr(2), "amount": "7"}})),
+            token(serde_json::json!({"Transfer": {"token": "t1", "to": addr(3), "amount": "3"}})),
+            token(serde_json::json!({"Mint": {"token": "t1", "to": addr(2), "amount": "1"}})),
+        ],
+    );
+    b.timestamp = now;
+    storage::insert_block(&pool, &chain, &b, &extractor)
+        .await
+        .expect("insert_block");
+
+    let events = storage::get_token_events(&pool, &chain, "t1", 10)
+        .await
+        .expect("events");
+    assert_eq!(events.len(), 3);
+    assert!(events.iter().all(|e| e.block_time == now as i64));
+
+    let daily = storage::get_token_daily(&pool, &chain, "t1", 30)
+        .await
+        .expect("daily");
+    assert_eq!(daily.len(), 1);
+    assert_eq!((daily[0].transfers, daily[0].mints), (2, 1));
+    assert_eq!(daily[0].transfer_volume, "10");
+
+    let stats = storage::get_token_stats(&pool, &chain, &["none".into(), "t1".into()], 14)
+        .await
+        .expect("stats");
+    assert_eq!(stats[0].token, "none");
+    assert_eq!((stats[0].transfers_24h, stats[0].daily.len()), (0, 0));
+    assert_eq!(stats[1].transfers_24h, 2);
+    assert_eq!(stats[1].daily[0].transfers, 2);
 }

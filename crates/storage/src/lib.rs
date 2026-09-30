@@ -145,6 +145,7 @@ pub async fn table_sizes(pool: &PgPool) -> Result<Vec<TableSize>> {
         "blocks",
         "chains",
         "ingestion_cursor",
+        "token_events",
     ];
     let rows: Vec<(String, i64, i64)> = sqlx::query_as(
         "SELECT c.relname, pg_total_relation_size(c.oid), GREATEST(c.reltuples, 0)::BIGINT
@@ -692,6 +693,7 @@ pub async fn rollback_to(pool: &PgPool, chain_id: &str, height: i64) -> Result<u
 
     for sql in [
         "DELETE FROM action_addresses WHERE chain_id = $1 AND block_height > $2",
+        "DELETE FROM token_events WHERE chain_id = $1 AND block_height > $2",
         "DELETE FROM account_actions WHERE chain_id = $1 AND block_height > $2",
         "DELETE FROM actions WHERE chain_id = $1 AND block_height > $2",
         "DELETE FROM dropped_actions WHERE chain_id = $1 AND block_height > $2",
@@ -991,6 +993,30 @@ async fn insert_block_in_tx<B: IndexableBlock>(
         .bind(height)
         .bind(&writes.from_address[..])
         .bind(&writes.action_hash[..])
+        .execute(&mut **tx)
+        .await?;
+    }
+
+    // Token events derive from the `actions` rows just written, in SQL, so the
+    // payload shape is parsed in one place. Mirrors the backfill in
+    // migrations/0009_token_events.sql.
+    if !writes.action_hash.is_empty() {
+        sqlx::query(
+            "INSERT INTO token_events
+                 (chain_id, action_hash, token, event, from_address, to_address, amount, block_height, block_time)
+             SELECT a.chain_id, a.action_hash, v.body ->> 'token', lower(v.event), a.from_address,
+                    v.body ->> 'to', (v.body ->> 'amount')::numeric, a.block_height, $3
+             FROM actions a
+             CROSS JOIN LATERAL jsonb_each(
+                 CASE WHEN jsonb_typeof(a.payload) = 'object' THEN a.payload ELSE '{}'::jsonb END
+             ) AS v(event, body)
+             WHERE a.chain_id = $1 AND a.block_height = $2 AND a.kind = 'Token'
+               AND v.body ->> 'token' IS NOT NULL
+             ON CONFLICT DO NOTHING",
+        )
+        .bind(chain_id)
+        .bind(height)
+        .bind(block.timestamp() as i64)
         .execute(&mut **tx)
         .await?;
     }
@@ -1898,6 +1924,144 @@ pub async fn get_asset_holders(
         jurisdiction,
     })
     .collect())
+}
+
+/// One row of `token_events` (migration 0009).
+#[derive(Debug, Clone, serde::Serialize, sqlx::FromRow, utoipa::ToSchema)]
+pub struct TokenEventRow {
+    pub action_hash: String,
+    /// `mint`, `transfer`, `burn` or `renouncemint`.
+    pub event: String,
+    pub from_address: String,
+    /// Recipient; `null` for burn and renounce.
+    pub to_address: Option<String>,
+    /// Base units as a decimal string (a u128 overflows JSON numbers); `null`
+    /// for renounce.
+    pub amount: Option<String>,
+    pub block_height: i64,
+    /// Block timestamp, unix seconds.
+    pub block_time: i64,
+}
+
+/// A token's newest events first.
+pub async fn get_token_events(
+    pool: &PgPool,
+    chain_id: &str,
+    token: &str,
+    limit: i64,
+) -> Result<Vec<TokenEventRow>> {
+    Ok(sqlx::query_as(
+        "SELECT action_hash, event, from_address, to_address, amount::text AS amount,
+                block_height, block_time
+         FROM token_events
+         WHERE chain_id = $1 AND token = $2
+         ORDER BY block_height DESC, action_hash
+         LIMIT $3",
+    )
+    .bind(chain_id)
+    .bind(token)
+    .bind(limit)
+    .fetch_all(pool)
+    .await?)
+}
+
+/// One UTC day of a token's activity (`token_daily`).
+#[derive(Debug, Clone, serde::Serialize, sqlx::FromRow, utoipa::ToSchema)]
+pub struct TokenDayRow {
+    /// `YYYY-MM-DD`, UTC.
+    pub day: String,
+    pub transfers: i64,
+    /// Sum of transfer amounts, base units, decimal string.
+    pub transfer_volume: String,
+    pub mints: i64,
+    pub burns: i64,
+}
+
+/// Active days only, oldest first, covering today and the `days - 1` before
+/// it (UTC). Days with no events are absent, not zero rows.
+pub async fn get_token_daily(
+    pool: &PgPool,
+    chain_id: &str,
+    token: &str,
+    days: i64,
+) -> Result<Vec<TokenDayRow>> {
+    Ok(sqlx::query_as(
+        "SELECT day::text AS day, transfers, transfer_volume::text AS transfer_volume, mints, burns
+         FROM token_daily
+         WHERE chain_id = $1 AND token = $2
+           AND day > (now() AT TIME ZONE 'UTC')::date - $3::INT
+         ORDER BY day",
+    )
+    .bind(chain_id)
+    .bind(token)
+    .bind(days as i32)
+    .fetch_all(pool)
+    .await?)
+}
+
+#[derive(Debug, Clone, serde::Serialize, utoipa::ToSchema)]
+pub struct TokenDayCount {
+    pub day: String,
+    pub transfers: i64,
+}
+
+/// What the tokens list needs per row.
+#[derive(Debug, Clone, serde::Serialize, utoipa::ToSchema)]
+pub struct TokenStats {
+    pub token: String,
+    /// Transfers in the last 24 hours of wall-clock time.
+    pub transfers_24h: i64,
+    /// Transfers per active UTC day, oldest first; quiet days are absent.
+    pub daily: Vec<TokenDayCount>,
+}
+
+/// One entry per requested token, zeroed when it has no events.
+pub async fn get_token_stats(
+    pool: &PgPool,
+    chain_id: &str,
+    tokens: &[String],
+    days: i64,
+) -> Result<Vec<TokenStats>> {
+    let recent: Vec<(String, i64)> = sqlx::query_as(
+        "SELECT token, COUNT(*) FROM token_events
+         WHERE chain_id = $1 AND token = ANY($2) AND event = 'transfer'
+           AND block_time >= extract(epoch FROM now())::BIGINT - 86400
+         GROUP BY token",
+    )
+    .bind(chain_id)
+    .bind(tokens)
+    .fetch_all(pool)
+    .await?;
+    let daily: Vec<(String, String, i64)> = sqlx::query_as(
+        "SELECT token, day::text, transfers FROM token_daily
+         WHERE chain_id = $1 AND token = ANY($2) AND transfers > 0
+           AND day > (now() AT TIME ZONE 'UTC')::date - $3::INT
+         ORDER BY token, day",
+    )
+    .bind(chain_id)
+    .bind(tokens)
+    .bind(days as i32)
+    .fetch_all(pool)
+    .await?;
+
+    Ok(tokens
+        .iter()
+        .map(|token| TokenStats {
+            token: token.clone(),
+            transfers_24h: recent
+                .iter()
+                .find(|(t, _)| t == token)
+                .map_or(0, |(_, n)| *n),
+            daily: daily
+                .iter()
+                .filter(|(t, _, _)| t == token)
+                .map(|(_, day, transfers)| TokenDayCount {
+                    day: day.clone(),
+                    transfers: *transfers,
+                })
+                .collect(),
+        })
+        .collect())
 }
 
 #[derive(Debug, Clone, serde::Serialize, utoipa::ToSchema)]
