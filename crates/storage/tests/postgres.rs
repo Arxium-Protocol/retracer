@@ -1596,7 +1596,9 @@ async fn token_events_are_normalised_and_rolled_back() {
             token(serde_json::json!({"Burn": {"token": "t1", "amount": "1"}})),
             token(serde_json::json!({"RenounceMint": {"token": "t1"}})),
             // Create names no token ref, so it is not an event.
-            token(serde_json::json!({"Create": {"symbol": "X", "name": "X", "decimals": 0, "initial_supply": "1", "max_supply": null, "mintable": false}})),
+            token(
+                serde_json::json!({"Create": {"symbol": "X", "name": "X", "decimals": 0, "initial_supply": "1", "max_supply": null, "mintable": false}}),
+            ),
         ],
     );
     storage::insert_block(&pool, &chain, &b, &extractor)
@@ -1612,7 +1614,9 @@ async fn token_events_are_normalised_and_rolled_back() {
     assert_eq!(transfers, 1);
     assert_eq!(volume, max, "u128 max survives NUMERIC(39,0)");
 
-    storage::rollback_to(&pool, &chain, -1).await.expect("rollback");
+    storage::rollback_to(&pool, &chain, -1)
+        .await
+        .expect("rollback");
     assert_eq!(count(&pool, "token_events", &chain).await, 0);
 }
 
