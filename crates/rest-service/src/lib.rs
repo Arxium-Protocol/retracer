@@ -1122,9 +1122,26 @@ async fn get_asset_holders(
 #[derive(Deserialize, IntoParams)]
 struct EventPage {
     limit: Option<i64>,
+    /// Height/hash of the last event in the preceding page. Both required together.
+    before_height: Option<i64>,
+    after_hash: Option<String>,
 }
 
-#[utoipa::path(get, path = "/v1/chains/{chain_id}/assets/{asset}/events", tag = "accounts", params(("chain_id" = String, Path), ("asset" = String, Path, description = "The token's `AssetRef`"), EventPage), responses((status = 200, description = "Token mint/transfer/burn/renounce actions, newest first", body = Vec<storage::TokenEventRow>), (status = 400, body = ErrorBody), (status = 404, body = ErrorBody)))]
+impl EventPage {
+    fn cursor(&self) -> Result<Option<(i64, &str)>, ApiError> {
+        match (self.before_height, self.after_hash.as_deref()) {
+            (None, None) => Ok(None),
+            (Some(height), Some(hash)) if height >= 0 && !hash.is_empty() && hash.len() <= 256 => {
+                Ok(Some((height, hash)))
+            }
+            _ => Err(ApiError::BadRequest(
+                "before_height and a non-empty after_hash must be supplied together".into(),
+            )),
+        }
+    }
+}
+
+#[utoipa::path(get, path = "/v1/chains/{chain_id}/assets/{asset}/events", tag = "accounts", params(("chain_id" = String, Path), ("asset" = String, Path, description = "The token's `AssetRef`"), EventPage), responses((status = 200, description = "Token create/mint/transfer/burn/renounce actions, newest first with height/hash paging", body = Vec<storage::TokenEventRow>), (status = 400, body = ErrorBody), (status = 404, body = ErrorBody)))]
 async fn get_asset_events(
     State(state): State<AppState>,
     Path((chain_id, asset)): Path<(String, String)>,
@@ -1133,7 +1150,8 @@ async fn get_asset_events(
     state.chain(&chain_id)?;
     let limit = clamp_limit(page.limit)?;
     Ok(Json(
-        storage::get_token_events(&state.pool, &chain_id, &asset, limit).await?,
+        storage::get_token_events_page(&state.pool, &chain_id, &asset, limit, page.cursor()?)
+            .await?,
     ))
 }
 
@@ -1861,7 +1879,11 @@ mod tests {
             get_asset_events(
                 State(state.clone()),
                 Path(("test-chain".into(), "a".into())),
-                Query(EventPage { limit: Some(0) }),
+                Query(EventPage {
+                    limit: Some(0),
+                    before_height: None,
+                    after_hash: None
+                }),
             )
             .await,
             Err(ApiError::BadRequest(_))
@@ -1870,6 +1892,22 @@ mod tests {
             stats("nope", "a".into(), None).await,
             Err(ApiError::NotFound(_))
         ));
+    }
+
+    #[test]
+    fn token_event_cursor_requires_both_height_and_hash() {
+        let cursor = |height, hash: Option<&str>| EventPage {
+            limit: None,
+            before_height: height,
+            after_hash: hash.map(str::to_string),
+        };
+        assert!(matches!(cursor(None, None).cursor(), Ok(None)));
+        assert!(cursor(Some(1), None).cursor().is_err());
+        assert!(cursor(None, Some("hash")).cursor().is_err());
+        assert!(cursor(Some(-1), Some("hash")).cursor().is_err());
+        assert!(cursor(Some(1), Some("")).cursor().is_err());
+        let valid = cursor(Some(42), Some("hash"));
+        assert!(matches!(valid.cursor(), Ok(Some((42, "hash")))));
     }
 
     #[test]

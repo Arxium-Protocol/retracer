@@ -211,7 +211,7 @@ GET  /v1/chains/{chain}/validators/uptime?from=&to=
 
 GET  /v1/chains/{chain}/accounts/{address}?at=
 GET  /v1/chains/{chain}/assets/{asset}/holders?at=&jurisdiction=&after=&limit=
-GET  /v1/chains/{chain}/assets/{asset}/events?limit=
+GET  /v1/chains/{chain}/assets/{asset}/events?limit=&before_height=&after_hash=
 GET  /v1/chains/{chain}/assets/{asset}/daily?days=
 GET  /v1/chains/{chain}/token-stats?assets=a,b,c&days=
 GET  /v1/chains/{chain}/assets/{asset}/audit/transfers?format=json|csv
@@ -230,10 +230,18 @@ equivocation slashes; the registered attestors; and the actions a producer
 rejected, with the reason. `at=` answers "as of block H" (default: tip).
 Amounts are decimal strings — the chain's u128 doesn't fit a JSON number.
 
-`events`, `daily` and `token-stats` read a token's mint/transfer/burn/renounce
+`events`, `daily` and `token-stats` read a token's create/mint/transfer/burn/renounce
 history (`token_events`): newest-first activity, per-UTC-day transfers, volume,
 mints and burns (quiet days are absent, not zero), and a batch form — transfers
 in the last 24h plus a per-day transfer series for up to 100 tokens at once.
+Event paging keeps height descending and action hash ascending. Supply both
+`before_height` and `after_hash` from the last row of the preceding page to
+continue, including within the same block. The response remains a JSON array.
+Migration `0012_token_creation_and_paging.sql` backfills creation events from
+matching registration effects (same block, creator and symbol-derived slug)
+and records new creations transactionally. Initial supply is read from the
+Create action, not the registration's potentially updated supply. Creations
+do not increment transfer counts or volumes.
 State is only as complete as the effects the node served: blocks indexed
 from a node older than the effects record have no state rows, and
 `dropped` is only ever populated by the producing node.

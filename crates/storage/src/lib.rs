@@ -1026,7 +1026,8 @@ async fn insert_block_in_tx<B: IndexableBlock>(
 
     // Token events derive from the `actions` rows just written, in SQL, so the
     // payload shape is parsed in one place. Mirrors the backfill in
-    // migrations/0009_token_events.sql.
+    // migrations/0009_token_events.sql. Create has no ref in its payload;
+    // migration 0012 projects it when registration effects are inserted below.
     if !writes.action_hash.is_empty() {
         sqlx::query(
             "INSERT INTO token_events
@@ -1961,7 +1962,7 @@ pub async fn get_asset_holders(
 #[derive(Debug, Clone, serde::Serialize, sqlx::FromRow, utoipa::ToSchema)]
 pub struct TokenEventRow {
     pub action_hash: String,
-    /// `mint`, `transfer`, `burn` or `renouncemint`.
+    /// `create`, `mint`, `transfer`, `burn` or `renouncemint`.
     pub event: String,
     pub from_address: String,
     /// Recipient; `null` for burn and renounce.
@@ -1981,17 +1982,34 @@ pub async fn get_token_events(
     token: &str,
     limit: i64,
 ) -> Result<Vec<TokenEventRow>> {
+    get_token_events_page(pool, chain_id, token, limit, None).await
+}
+
+/// Strict keyset paging in existing newest-first order, including a hash
+/// tiebreak so events in the same block are neither skipped nor repeated.
+pub async fn get_token_events_page(
+    pool: &PgPool,
+    chain_id: &str,
+    token: &str,
+    limit: i64,
+    before: Option<(i64, &str)>,
+) -> Result<Vec<TokenEventRow>> {
+    let (height, hash) = before.map_or((None, None), |(h, s)| (Some(h), Some(s)));
     Ok(sqlx::query_as(
         "SELECT action_hash, event, from_address, to_address, amount::text AS amount,
                 block_height, block_time
          FROM token_events
          WHERE chain_id = $1 AND token = $2
+           AND ($4::BIGINT IS NULL OR block_height < $4
+                OR (block_height = $4 AND action_hash > $5::TEXT))
          ORDER BY block_height DESC, action_hash
          LIMIT $3",
     )
     .bind(chain_id)
     .bind(token)
     .bind(limit)
+    .bind(height)
+    .bind(hash)
     .fetch_all(pool)
     .await?)
 }

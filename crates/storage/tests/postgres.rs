@@ -1781,3 +1781,56 @@ async fn token_activity_reads() {
     assert_eq!(stats[1].transfers_24h, 2);
     assert_eq!(stats[1].daily[0].transfers, 2);
 }
+
+#[tokio::test]
+async fn token_creation_and_event_keyset_paging() {
+    let pool = skip_without_db!();
+    let chain = chain_id("token-create-page");
+    let extractor = AddressExtractor::tier_a_only(KindSchema::empty());
+    let token = "test-token";
+    let max = "340282366920938463463374607431768211455";
+    let mut b = block(
+        0,
+        "0x0",
+        vec![
+            TestAction {
+                sender: addr(1),
+                signature: Some("a-create".into()),
+                payload: serde_json::json!({"Token": {"Create": {"symbol": "USDC", "initial_supply": max}}}),
+            },
+            TestAction {
+                sender: addr(1),
+                signature: Some("b-transfer".into()),
+                payload: serde_json::json!({"Token": {"Transfer": {"token": token, "to": addr(2), "amount": "7"}}}),
+            },
+        ],
+    );
+    b.effects = Some(storage::BlockEffects {
+        asset_registrations: vec![
+            serde_json::json!({"asset_ref": token, "issuer": addr(1), "asset_id": "usdc"}),
+        ],
+        ..Default::default()
+    });
+    storage::insert_block(&pool, &chain, &b, &extractor)
+        .await
+        .expect("ingest token create");
+    let first = storage::get_token_events_page(&pool, &chain, token, 1, None)
+        .await
+        .expect("first page");
+    assert_eq!(first[0].event, "create");
+    assert_eq!(first[0].amount.as_deref(), Some(max));
+    assert_eq!(first[0].to_address.as_deref(), Some(addr(1).as_str()));
+    let second = storage::get_token_events_page(&pool, &chain, token, 1, Some((0, "a-create")))
+        .await
+        .expect("same-block continuation");
+    assert_eq!(second.len(), 1);
+    assert_eq!(second[0].action_hash, "b-transfer");
+    let end = storage::get_token_events_page(&pool, &chain, token, 1, Some((0, "b-transfer")))
+        .await
+        .expect("end of history");
+    assert!(end.is_empty());
+    storage::rollback_to(&pool, &chain, -1)
+        .await
+        .expect("rollback creation");
+    assert_eq!(count(&pool, "token_events", &chain).await, 0);
+}
