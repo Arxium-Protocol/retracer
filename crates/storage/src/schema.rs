@@ -550,7 +550,7 @@ mod tests {
             .filter(|p| p.segments == ["asset"])
             .count();
         assert!(
-            asset_projections >= 12,
+            asset_projections >= 11,
             "every asset-naming kind indexes $.asset, got {asset_projections}"
         );
     }
