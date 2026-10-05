@@ -73,25 +73,6 @@ name = "DeregisterAttestor"
   role = "other:attestor"
 
 [[kind]]
-name = "ForcedTransfer"
-
-  [[kind.index]]
-  path = "$.asset"
-  type = "text"
-
-  # Neither party signed the action — the governor did — so both are only
-  # discoverable through the payload. `from` is the holder whose balance was
-  # taken, which makes it the address most likely to be searched for after
-  # one of these lands.
-  [[kind.roles]]
-  path = "$.from"
-  role = "from"
-
-  [[kind.roles]]
-  path = "$.to"
-  role = "to"
-
-[[kind]]
 name = "SetHolderFrozen"
 
   [[kind.index]]
@@ -131,6 +112,10 @@ name = "IssuerForcedTransfer"
   path = "$.asset"
   type = "text"
 
+  # Neither party signed the action — the issuer did — so both are only
+  # discoverable through the payload. `from` is the holder whose balance was
+  # taken, which makes it the address most likely to be searched for after
+  # one of these lands.
   [[kind.roles]]
   path = "$.from"
   role = "from"
