@@ -1962,6 +1962,21 @@ mod tests {
         }
     }
 
+    /// The node caps `settled_height` below an open dispute; Retracer must
+    /// carry that through, so blocks above the cap read `attested`, not
+    /// `final`, and a disputed block is `disputed` whatever the watermarks say.
+    #[test]
+    fn settlement_follows_a_capped_settled_height() {
+        let view = ingestion::NetworkView {
+            final_watermark: Some(20),
+            settled_height: Some(5),
+            ..fresh_network(25)
+        };
+        assert_eq!(settlement(&view, 5, false), "final");
+        assert_eq!(settlement(&view, 6, false), "attested");
+        assert_eq!(settlement(&view, 6, true), "disputed");
+    }
+
     fn fresh_network(tip_height: u64) -> ingestion::NetworkView {
         ingestion::NetworkView {
             active_peer_count: 1,
