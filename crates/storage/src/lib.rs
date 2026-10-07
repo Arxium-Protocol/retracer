@@ -2162,11 +2162,8 @@ pub struct AuditTransferRow {
 /// `TokenTransfer` is not a stored kind: token actions are stored as kind
 /// `Token` with the variant nested (`{"Transfer":{"token","to","amount"}}`),
 /// and the export reports the `Transfer` ones under this name.
-pub const BASELINE_ASSET_TRANSFER_KINDS: [&str; 3] = [
-    "TransferAsset",
-    "IssuerForcedTransfer",
-    "TokenTransfer",
-];
+pub const BASELINE_ASSET_TRANSFER_KINDS: [&str; 3] =
+    ["TransferAsset", "IssuerForcedTransfer", "TokenTransfer"];
 
 /// One `list_asset_audit_transfers` row as SQL returns it, in select order.
 type AuditTransferTuple = (

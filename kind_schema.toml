@@ -58,18 +58,37 @@ name = "RevokeAttestation"
   path = "$.subject"
   role = "other:subject"
 
+# There is no admin role: attestors join by `ApplyAttestor` (sent by the
+# attestor's own multisig, so the sender is the party) plus a validator vote,
+# and leave by a removal vote. `RegisterAttestor`/`DeregisterAttestor` no
+# longer exist on the chain.
 [[kind]]
-name = "RegisterAttestor"
+name = "ApplyAttestor"
+
+  # The real-world name validators verify before voting.
+  [[kind.index]]
+  path = "$.name"
+  type = "text"
+
+# BlockAttestor (an attestor's emergency self-block) has no payload fields:
+# the sender is the attestor.
+
+# Governance proposals name the attestor they add, remove or unblock. The
+# action is externally tagged, like `Token`. Other proposal kinds carry no
+# address Retracer indexes.
+[[kind]]
+name = "SubmitProposal"
 
   [[kind.roles]]
-  path = "$.attestor"
+  path = "$.action.AddAttestor.attestor"
   role = "other:attestor"
 
-[[kind]]
-name = "DeregisterAttestor"
+  [[kind.roles]]
+  path = "$.action.RemoveAttestor.attestor"
+  role = "other:attestor"
 
   [[kind.roles]]
-  path = "$.attestor"
+  path = "$.action.UnblockAttestor.attestor"
   role = "other:attestor"
 
 [[kind]]

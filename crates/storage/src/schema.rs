@@ -672,6 +672,40 @@ mod tests {
         assert!(extractor.resolve("Stake", &payload).is_empty());
     }
 
+    /// Governance proposals name the attestor they add, remove or unblock;
+    /// the shipped schema puts that address in its history. Applying and
+    /// self-blocking carry no address (the sender is the attestor).
+    #[test]
+    fn shipped_schema_indexes_the_attestor_a_proposal_names() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../kind_schema.toml");
+        let extractor = AddressExtractor::tier_a_only(KindSchema::load(&path).unwrap());
+        for action in ["AddAttestor", "RemoveAttestor", "UnblockAttestor"] {
+            let payload = serde_json::json!({
+                "action": { action: { "attestor": "arx1attestor" } },
+                "description": "d",
+            });
+            assert_eq!(
+                extractor.resolve("SubmitProposal", &payload),
+                vec![(
+                    "arx1attestor".to_string(),
+                    Role::Other("attestor".to_string())
+                )],
+                "{action}"
+            );
+        }
+        // A proposal about something else names no attestor.
+        let spend = serde_json::json!({"action": {"TreasurySpend": {"to": "arx1x", "amount": 1}}});
+        assert!(extractor.resolve("SubmitProposal", &spend).is_empty());
+        // The removed admin kinds are gone from the schema.
+        for gone in ["RegisterAttestor", "DeregisterAttestor"] {
+            assert!(
+                extractor
+                    .resolve(gone, &serde_json::json!({"attestor": "arx1a"}))
+                    .is_empty()
+            );
+        }
+    }
+
     #[test]
     #[should_panic(expected = "both claim kind")]
     fn duplicate_tier_b_kind_claim_panics() {

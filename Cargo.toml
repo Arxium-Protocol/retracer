@@ -9,6 +9,9 @@ members = [
 resolver = "2"
 default-members = ["crates/retracerd"]
 
+[workspace.package]
+license = "Apache-2.0"
+
 [workspace.dependencies]
 ingestion = { path = "crates/ingestion" }
 storage = { path = "crates/storage" }
